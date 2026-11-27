@@ -1,0 +1,23 @@
+{
+  "source": "https://github.com/Dankosik/rust-service-template-rest",
+  "revision": "52835313ee80fef11793edd942b9e66c3b391f4c",
+  "license": "MIT",
+  "adapted": true,
+  "files": {
+    ".agents/skills/rust-coder/SKILL.md": "129896e9929b52963525fd063e1e983dc530c6980da539a5af6a9641b09218aa",
+    ".agents/skills/rust-coder/references/api-and-traits.md": "906b644f7627913dafb04b86090d26db7667eae6b91e737c48093d9a78579ca0",
+    ".agents/skills/rust-coder/references/error-chains.md": "039e942c37fb34dfa064c0fe90e9c7a3b0ff2dfb0d4db5210faaa72838d3274c",
+    ".agents/skills/rust-coder/references/hot-path-idioms.md": "2262c1bca1a52158d66e3933169b05c5c98ba3e66905756aa523b5314bc3c335",
+    ".agents/skills/rust-coder/references/ownership.md": "de091110a97576016f475c27ea6a5589687ac130ad94f5068c163249b6ba7f04",
+    ".agents/skills/rust-coder/references/representation.md": "67a7b32ce04bc95a5a906735edc12ec2722a6d7096d31dbe9735780be4a17992",
+    ".agents/skills/rust-config/SKILL.md": "47a494a890b6b6eb0033e87d53de91a43f6ff2105cb6d5fa42011e0870502744",
+    ".agents/skills/rust-dependencies/SKILL.md": "909d460ffaa6c7c5f952d2664d28583f143d1d51871e357b69089ecd62be0238",
+    ".agents/skills/rust-reliability/SKILL.md": "09a7874c65eb3218415fdb73beedcf508d6ad1c77faf79302c11f17db0821b35",
+    ".agents/skills/rust-review/SKILL.md": "a5bdaefac8d20a07ded53453e0e7d66e77b9a95d132921c9b29d86021a18789c",
+    ".agents/skills/rust-security/SKILL.md": "0a13f7f441d63dfa8629d53a04a85c1be718dc2b2385a334aa096e65c0ff8b36",
+    ".agents/skills/rust-structural-quality/SKILL.md": "58e566eed0b2e4f8ac18acf4d205847e1d80e9cb5cb19e71f1acba3b0cc5c4c5",
+    ".agents/skills/rust-structural-quality/references/deep-seams.md": "6bdcaf3fb7ff8c95eb0d3a13f0656599a3069be0816590fc254fea8a2315ade9",
+    ".agents/skills/rust-structural-quality/references/responsibility.md": "81a3e13859d07a44b959b2dcb8e3fcbe390b6f20b777b93253ead77495ebe515",
+    ".agents/skills/rust-verification/SKILL.md": "84ce82a80db8ac695c3ed2cb7f0789ca62b06bdb55160dd1f2f88d8e7e129a4f"
+  }
+}

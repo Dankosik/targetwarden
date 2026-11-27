@@ -72,10 +72,18 @@ def source_files(source, revision, retained_license=None):
     return files
 
 
+def _supplemental_files(root):
+    sup_path = root / ".agents/skills-service-template.json"
+    if not sup_path.is_file():
+        return set()
+    return set(json.loads(sup_path.read_text(encoding="utf-8"))["files"])
+
+
 def sync(root, source, revision, apply=False):
     manifest_path = safe_path(root, ".agents/skills-source.json")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    current_paths = {p.relative_to(root).as_posix() for p in (root / ".agents/skills").rglob("*") if p.is_file()}
+    supplemental = _supplemental_files(root)
+    current_paths = {p.relative_to(root).as_posix() for p in (root / ".agents/skills").rglob("*") if p.is_file()} - supplemental
     if current_paths != set(manifest["files"]):
         raise ValueError("local skill inventory has changed; preserve and reconcile those edits first")
     for relative, digest in manifest["files"].items():
@@ -91,6 +99,8 @@ def sync(root, source, revision, apply=False):
     license_path = safe_path(root, "LICENSE")
     retained_license = license_path.read_bytes() if license_path.exists() else None
     files = source_files(source, revision, retained_license)
+    if set(files) & supplemental:
+        raise ValueError("incoming skill path collides with supplemental pack")
     for relative in files:
         safe_path(root, relative)
     removed = sorted(set(manifest["files"]) - set(files))

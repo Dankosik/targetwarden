@@ -29,10 +29,16 @@ a mandatory stage. Useful combinations are allowed without loading every neighbo
 | Decision | Skill |
 | --- | --- |
 | Implement requested behavior | [rust-implement](../.agents/skills/rust-implement/SKILL.md) |
+| Write, edit, or refactor Rust modules cleanly | [rust-coder](../.agents/skills/rust-coder/SKILL.md) |
 | Representation, borrowing, traits, transformations | [rust-idiomatic](../.agents/skills/rust-idiomatic/SKILL.md) |
 | Responsibilities and useful module boundaries | [rust-design](../.agents/skills/rust-design/SKILL.md) |
+| Deletion test, seam depth, avoiding wrappers | [rust-structural-quality](../.agents/skills/rust-structural-quality/SKILL.md) |
+| Read-only code/diff falsification review | [rust-review](../.agents/skills/rust-review/SKILL.md) |
 | Grammar, configuration precedence, terminal/output interface | [rust-cli-interface](../.agents/skills/rust-cli-interface/SKILL.md) |
+| Configuration keys, defaults, TOML/env precedence | [rust-config](../.agents/skills/rust-config/SKILL.md) |
 | Error distinctions, diagnostics, partial success, status | [rust-errors](../.agents/skills/rust-errors/SKILL.md) |
+| Untrusted paths, symlinks, mounts, subprocess/escaping safety | [rust-security](../.agents/skills/rust-security/SKILL.md) |
+| Traversal/subprocess budgets, lock contention, `watch` drain | [rust-reliability](../.agents/skills/rust-reliability/SKILL.md) |
 | Byte flow, buffering, record boundaries, fallible I/O | [rust-io](../.agents/skills/rust-io/SKILL.md) |
 | File identity, traversal, replacement, preservation | [rust-filesystem](../.agents/skills/rust-filesystem/SKILL.md) |
 | Child arguments, pipes, termination, reaping | [rust-processes](../.agents/skills/rust-processes/SKILL.md) |
@@ -42,7 +48,9 @@ a mandatory stage. Useful combinations are allowed without loading every neighbo
 | An uncertain defect or causal explanation | [rust-debugging](../.agents/skills/rust-debugging/SKILL.md) |
 | Function/parser/I/O-double behavior | [rust-testing](../.agents/skills/rust-testing/SKILL.md) |
 | Executable wiring, status, real pipes or terminals | [rust-cli-testing](../.agents/skills/rust-cli-testing/SKILL.md) |
+| Verification boundaries and evidence claims | [rust-verification](../.agents/skills/rust-verification/SKILL.md) |
 | Cargo resolution, features, toolchain, build profile | [rust-build](../.agents/skills/rust-build/SKILL.md) |
+| Choosing crates vs custom code (`Cargo.toml` / `deny.toml`) | [rust-dependencies](../.agents/skills/rust-dependencies/SKILL.md) |
 | Artifact compatibility and delivery | [rust-distribution](../.agents/skills/rust-distribution/SKILL.md) |
 
 Repository contracts constrain reusable advice. Keep template-specific policy in
