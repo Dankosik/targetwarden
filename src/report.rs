@@ -3,7 +3,7 @@
 //! Allowed dependencies: `model`, `state`, `config`, `error`. Must never depend on
 //! `discover`, `execute`, or `platform`.
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
 use serde::Serialize;
@@ -112,7 +112,12 @@ pub(crate) fn write_inventory_report(
         incremental_dirs: 0,
     };
 
-    let mut target_reports = Vec::with_capacity(snapshot.targets.len());
+    let build_json_reports = matches!(format, OutputFormat::Json);
+    let mut target_reports = if build_json_reports {
+        Vec::with_capacity(snapshot.targets.len())
+    } else {
+        Vec::new()
+    };
     for &idx in &order {
         let target = &snapshot.targets[idx];
         let verdict = &verdicts[idx];
@@ -131,47 +136,45 @@ pub(crate) fn write_inventory_report(
         totals.v1_units = totals.v1_units.saturating_add(v1_count);
         totals.incremental_dirs = totals.incremental_dirs.saturating_add(inc_count);
 
-        let (verdict_label, reasons) = match verdict {
-            SafetyVerdict::Eligible => {
-                totals.eligible_count += 1;
-                ("eligible", Vec::new())
-            }
-            SafetyVerdict::SweepOnly { reasons, .. } => {
-                totals.sweep_only_count += 1;
-                (
+        match verdict {
+            SafetyVerdict::Eligible => totals.eligible_count += 1,
+            SafetyVerdict::SweepOnly { .. } => totals.sweep_only_count += 1,
+            SafetyVerdict::Protected(_) => totals.protected_count += 1,
+        }
+
+        if build_json_reports {
+            let (verdict_label, reasons) = match verdict {
+                SafetyVerdict::Eligible => ("eligible", Vec::new()),
+                SafetyVerdict::SweepOnly { reasons, .. } => (
                     "sweep_only",
                     reasons.iter().map(ReasonReport::SweepOnly).collect(),
-                )
-            }
-            SafetyVerdict::Protected(reasons) => {
-                totals.protected_count += 1;
-                (
+                ),
+                SafetyVerdict::Protected(reasons) => (
                     "protected",
                     reasons.iter().map(ReasonReport::Protected).collect(),
-                )
-            }
-        };
-
-        target_reports.push(TargetReport {
-            root: &target.root,
-            origin: target.origin,
-            layout: target.layout,
-            worktree_kind: target.worktree_kind,
-            allocated_bytes: target.allocated_bytes,
-            allocated_gib: round2(bytes_to_gib(target.allocated_bytes)),
-            last_activity_unix: target.last_activity_unix,
-            age_secs: snapshot
-                .captured_at_unix
-                .saturating_sub(target.last_activity_unix),
-            profile_count: target.profiles.len(),
-            v2_unit_count: v2_count,
-            v1_unit_count: v1_count,
-            incremental_dir_count: inc_count,
-            has_doc_dir: target.doc_dir.is_some(),
-            nested_target_roots: &target.nested_target_roots,
-            verdict: verdict_label,
-            reasons,
-        });
+                ),
+            };
+            target_reports.push(TargetReport {
+                root: &target.root,
+                origin: target.origin,
+                layout: target.layout,
+                worktree_kind: target.worktree_kind,
+                allocated_bytes: target.allocated_bytes,
+                allocated_gib: round2(bytes_to_gib(target.allocated_bytes)),
+                last_activity_unix: target.last_activity_unix,
+                age_secs: snapshot
+                    .captured_at_unix
+                    .saturating_sub(target.last_activity_unix),
+                profile_count: target.profiles.len(),
+                v2_unit_count: v2_count,
+                v1_unit_count: v1_count,
+                incremental_dir_count: inc_count,
+                has_doc_dir: target.doc_dir.is_some(),
+                nested_target_roots: &target.nested_target_roots,
+                verdict: verdict_label,
+                reasons,
+            });
+        }
     }
     totals.allocated_gib = round2(bytes_to_gib(totals.allocated_bytes));
 
@@ -200,18 +203,26 @@ pub(crate) fn write_inventory_report(
             write_json_line(&report, out)?;
         }
         OutputFormat::Text => {
-            write_inventory_text(snapshot, &order, verdicts, pressure, state, &totals, out)?;
+            let mut buf = BufWriter::new(out);
+            write_inventory_text(
+                snapshot, &order, verdicts, pressure, state, &totals, &mut buf,
+            )?;
         }
     }
     Ok(())
 }
 
 fn write_json_line<T: Serialize>(value: &T, out: &mut impl Write) -> Result<(), AppError> {
-    let mut bytes = serde_json::to_vec(value)
-        .map_err(|error| AppError::Output(std::io::Error::other(error)))?;
-    bytes.push(b'\n');
-    out.write_all(&bytes).map_err(AppError::Output)?;
-    out.flush().map_err(AppError::Output)?;
+    let mut buf = BufWriter::new(out);
+    serde_json::to_writer(&mut buf, value).map_err(|error| {
+        if error.is_io() {
+            AppError::Output(std::io::Error::from(error))
+        } else {
+            AppError::Output(std::io::Error::other(error))
+        }
+    })?;
+    buf.write_all(b"\n").map_err(AppError::Output)?;
+    buf.flush().map_err(AppError::Output)?;
     Ok(())
 }
 
@@ -465,6 +476,7 @@ pub(crate) fn write_reclaim_report(
             write_json_line(&report, out)?;
         }
         OutputFormat::Text => {
+            let mut out = BufWriter::new(out);
             writeln!(
                 out,
                 "Reclaim ({})  Free: {:.2} / {:.2} GiB  Pressure: {}  Hold: {}",
@@ -496,7 +508,7 @@ pub(crate) fn write_reclaim_report(
                 )
                 .map_err(AppError::Output)?;
                 for receipt in receipts {
-                    write_receipt_row(receipt, out)?;
+                    write_receipt_row(receipt, &mut out)?;
                 }
             }
             out.flush().map_err(AppError::Output)?;
@@ -530,6 +542,7 @@ pub(crate) fn write_history_report(
             write_json_line(&report, out)?;
         }
         OutputFormat::Text => {
+            let mut out = BufWriter::new(out);
             if receipts.is_empty() {
                 writeln!(out, "No reclamation actions recorded yet.").map_err(AppError::Output)?;
             } else {

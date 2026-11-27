@@ -91,6 +91,11 @@ pub(crate) fn render_plist(
     <integer>60</integer>
     <key>Nice</key>
     <integer>10</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MallocSpaceEfficient</key>
+        <string>1</string>
+    </dict>
     <key>StandardErrorPath</key>
     <string>{escaped_log}</string>
 </dict>
@@ -405,6 +410,7 @@ mod tests {
         assert!(xml.contains("<key>KeepAlive</key>\n    <true/>"));
         assert!(xml.contains("<key>ThrottleInterval</key>\n    <integer>60</integer>"));
         assert!(xml.contains("<key>Nice</key>\n    <integer>10</integer>"));
+        assert!(xml.contains("<key>MallocSpaceEfficient</key>\n        <string>1</string>"));
         assert!(xml.contains(expected_log));
 
         // `--watch-dry-run` appends `<string>--dry-run</string>` to ProgramArguments

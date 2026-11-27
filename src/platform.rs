@@ -4,14 +4,19 @@
 //!
 //! Allowed dependencies: `error`, `model`.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use compact_str::CompactString;
+use smallvec::SmallVec;
 
 use crate::error::AppError;
-use crate::model::{DiskStats, MountEntry, ProcessEntry, ProcessSnapshot};
+use crate::model::{
+    DiskStats, FastU64BuildHasher, MountEntry, PathPool, PathRef, ProcessEntry, ProcessSnapshot,
+};
 
 pub(crate) const DEFAULT_VOLUME_MOUNT: &str = "/System/Volumes/Data";
 
@@ -136,7 +141,8 @@ impl Platform for MacPlatform {
     }
 
     fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
-        let output = run_bounded_command(
+        let mut parser = LsofStreamParser::new();
+        let (status_code, stderr) = run_bounded_command_streaming(
             "/usr/sbin/lsof",
             &["-n", "-P", "-F0pcftn"],
             Some(Path::new("/")),
@@ -144,24 +150,25 @@ impl Platform for MacPlatform {
             std::time::Duration::from_secs(LSOF_TIMEOUT_SECS),
             LSOF_STDOUT_CAP,
             SUBPROCESS_STDERR_CAP,
+            |chunk| parser.feed(chunk),
         )
         .map_err(|error| AppError::ProcessSnapshot(error.to_string()))?;
 
-        if output.status_code != Some(0) {
+        if status_code != Some(0) {
             return Err(AppError::ProcessSnapshot(format!(
                 "lsof exited with status {:?}: {}",
-                output.status_code,
-                String::from_utf8_lossy(&output.stderr).trim()
+                status_code,
+                String::from_utf8_lossy(&stderr).trim()
             )));
         }
-        if !output.stderr.is_empty() {
+        if !stderr.is_empty() {
             return Err(AppError::ProcessSnapshot(format!(
                 "lsof wrote unexpected stderr: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                String::from_utf8_lossy(&stderr).trim()
             )));
         }
 
-        parse_lsof_output(&output.stdout, unix_now(), std::process::id())
+        parser.finish(unix_now(), std::process::id())
     }
 
     fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
@@ -304,10 +311,43 @@ fn run_bounded_command(
     stdout_cap: usize,
     stderr_cap: usize,
 ) -> Result<CommandOutput, AppError> {
+    let mut stdout = Vec::new();
+    let (status_code, stderr) = run_bounded_command_streaming(
+        program,
+        args,
+        cwd,
+        extra_env,
+        timeout,
+        stdout_cap,
+        stderr_cap,
+        |chunk| stdout.extend_from_slice(chunk),
+    )?;
+    Ok(CommandOutput {
+        status_code,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_command_streaming<F>(
+    program: &'static str,
+    args: &[&str],
+    cwd: Option<&Path>,
+    extra_env: &[(&str, &str)],
+    timeout: std::time::Duration,
+    stdout_cap: usize,
+    stderr_cap: usize,
+    mut on_stdout: F,
+) -> Result<(Option<i32>, Vec<u8>), AppError>
+where
+    F: FnMut(&[u8]),
+{
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
@@ -346,13 +386,10 @@ fn run_bounded_command(
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
 
-    for pipe in [stdout_pipe.as_ref().map(|p| p as &dyn std::os::fd::AsFd)]
-        .into_iter()
-        .flatten()
+    if let Some(pipe) = stdout_pipe.as_ref()
+        && let Ok(flags) = fcntl_getfl(pipe)
     {
-        if let Ok(flags) = fcntl_getfl(pipe) {
-            let _ = fcntl_setfl(pipe, flags | OFlags::NONBLOCK);
-        }
+        let _ = fcntl_setfl(pipe, flags | OFlags::NONBLOCK);
     }
     if let Some(pipe) = stderr_pipe.as_ref()
         && let Ok(flags) = fcntl_getfl(pipe)
@@ -361,9 +398,9 @@ fn run_bounded_command(
     }
 
     let deadline = Instant::now() + timeout;
-    let mut stdout = Vec::new();
+    let mut stdout_len: usize = 0;
     let mut stderr = Vec::new();
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = [0u8; 8 * 1024];
 
     while stdout_pipe.is_some() || stderr_pipe.is_some() {
         let now = Instant::now();
@@ -383,7 +420,7 @@ fn run_bounded_command(
         };
 
         let poll_outcome = {
-            let mut poll_fds: smallvec::SmallVec<[PollFd<'_>; 2]> = smallvec::SmallVec::new();
+            let mut poll_fds: SmallVec<[PollFd<'_>; 2]> = SmallVec::new();
             let stdout_slot = stdout_pipe.as_ref().map(|pipe| {
                 let idx = poll_fds.len();
                 poll_fds.push(PollFd::new(pipe, PollFlags::IN));
@@ -437,7 +474,8 @@ fn run_bounded_command(
                             break;
                         }
                         Ok(n) => {
-                            if stdout.len().saturating_add(n) > stdout_cap {
+                            let next_len = stdout_len.saturating_add(n);
+                            if next_len > stdout_cap {
                                 drop(stdout_pipe);
                                 drop(stderr_pipe);
                                 kill_and_reap(&mut child);
@@ -446,7 +484,8 @@ fn run_bounded_command(
                                     message: format!("stdout exceeded {stdout_cap} byte limit"),
                                 });
                             }
-                            stdout.extend_from_slice(&buf[..n]);
+                            stdout_len = next_len;
+                            on_stdout(&buf[..n]);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -508,14 +547,13 @@ fn run_bounded_command(
         }
     }
 
+    let mut yields = 0u8;
+    let mut backoff = Duration::from_micros(50);
+    let max_backoff = Duration::from_millis(2);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return Ok(CommandOutput {
-                    status_code: status.code(),
-                    stdout,
-                    stderr,
-                });
+                return Ok((status.code(), stderr));
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -525,7 +563,13 @@ fn run_bounded_command(
                         message: format!("timed out waiting for exit after {}s", timeout.as_secs()),
                     });
                 }
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                if yields < 2 {
+                    yields += 1;
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(backoff);
+                    backoff = (backoff * 2).min(max_backoff);
+                }
             }
             Err(error) => {
                 kill_and_reap(&mut child);
@@ -541,18 +585,114 @@ fn run_bounded_command(
 /// Strictly parse `/usr/sbin/lsof -n -P -F0pcftn` output.
 /// Fails closed on empty output, `fNOFD`, invalid escape sequences, malformed headers,
 /// or unexpected empty `n` fields outside `{PIPE, NPOLICY, NEXUS}`.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn parse_lsof_output(
     raw: &[u8],
     captured_at_unix: u64,
     self_pid: u32,
 ) -> Result<ProcessSnapshot, AppError> {
-    let mut processes: Vec<ProcessEntry> = Vec::new();
-    let mut current: Option<ProcessEntry> = None;
+    let mut parser = LsofStreamParser::new();
+    parser.feed(raw);
+    parser.finish(captured_at_unix, self_pid)
+}
 
-    for line in raw.split(|&byte| byte == b'\n') {
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct LsofStreamParser {
+    processes: Vec<ProcessEntry>,
+    open_path_refs: Vec<PathRef>,
+    path_pool: PathPool,
+    current: Option<ProcessEntry>,
+    pending: Vec<u8>,
+    decode_scratch: Vec<u8>,
+    /// Global cross-PID path interning table: maps FNV-1a hash -> `(PathRef, last_open_proc_seq)`.
+    /// Deduplicates shared system `.dylib`/framework paths across all PIDs (~43% smaller `PathPool`)
+    /// while also deduplicating duplicate open FDs within each PID via `proc_seq`.
+    interned_paths: HashMap<u64, SmallVec<[(PathRef, u32); 2]>, FastU64BuildHasher>,
+    proc_seq: u32,
+    error: Option<AppError>,
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl LsofStreamParser {
+    fn new() -> Self {
+        Self {
+            processes: Vec::with_capacity(256),
+            open_path_refs: Vec::with_capacity(4096),
+            path_pool: PathPool::with_capacity(256 * 1024),
+            current: None,
+            pending: Vec::new(),
+            decode_scratch: Vec::new(),
+            interned_paths: HashMap::with_capacity_and_hasher(1024, FastU64BuildHasher),
+            proc_seq: 0,
+            error: None,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        if self.error.is_some() || chunk.is_empty() {
+            return;
+        }
+        let mut rest = chunk;
+        if !self.pending.is_empty() {
+            if let Some(nl) = memchr::memchr(b'\n', rest) {
+                self.pending.extend_from_slice(&rest[..nl]);
+                let line = std::mem::take(&mut self.pending);
+                if let Err(err) = self.parse_line(&line) {
+                    self.error = Some(err);
+                    return;
+                }
+                self.pending = line;
+                self.pending.clear();
+                rest = &rest[nl + 1..];
+            } else {
+                self.pending.extend_from_slice(rest);
+                return;
+            }
+        }
+
+        while !rest.is_empty() {
+            if let Some(nl) = memchr::memchr(b'\n', rest) {
+                let line = &rest[..nl];
+                if let Err(err) = self.parse_line(line) {
+                    self.error = Some(err);
+                    return;
+                }
+                rest = &rest[nl + 1..];
+            } else {
+                self.pending.extend_from_slice(rest);
+                break;
+            }
+        }
+    }
+
+    fn finish(mut self, captured_at_unix: u64, self_pid: u32) -> Result<ProcessSnapshot, AppError> {
+        if let Some(err) = self.error {
+            return Err(err);
+        }
+        if !self.pending.is_empty() {
+            let tail = std::mem::take(&mut self.pending);
+            self.parse_line(&tail)?;
+        }
+        if let Some(entry) = self.current.take() {
+            self.processes.push(entry);
+        }
+        if self.processes.is_empty() {
+            return Err(AppError::ProcessSnapshot(
+                "lsof returned zero processes".to_owned(),
+            ));
+        }
+        Ok(ProcessSnapshot {
+            captured_at_unix,
+            self_pid,
+            processes: self.processes,
+            open_path_refs: self.open_path_refs,
+            path_pool: self.path_pool,
+        })
+    }
+
+    fn parse_line(&mut self, line: &[u8]) -> Result<(), AppError> {
         if line.is_empty() {
-            continue;
+            return Ok(());
         }
         let Some(trimmed) = line.strip_suffix(b"\0") else {
             return Err(AppError::ProcessSnapshot(
@@ -565,19 +705,20 @@ pub(crate) fn parse_lsof_output(
             ));
         }
 
-        let mut fields = trimmed.split(|&byte| byte == 0);
-        let Some(first) = fields.next() else {
-            return Err(AppError::ProcessSnapshot("empty lsof record".to_owned()));
-        };
+        let (first, mut field_rest) = split_next_nul(trimmed);
         let Some((&tag, rest)) = first.split_first() else {
             return Err(AppError::ProcessSnapshot("empty lsof field".to_owned()));
         };
 
         match tag {
             b'p' => {
-                if let Some(entry) = current.take() {
-                    processes.push(entry);
+                if let Some(entry) = self.current.take() {
+                    self.processes.push(entry);
                 }
+                self.proc_seq = self.proc_seq.checked_add(1).ok_or_else(|| {
+                    AppError::ProcessSnapshot("lsof exceeded process sequence capacity".to_owned())
+                })?;
+
                 let pid_str = std::str::from_utf8(rest).map_err(|_| {
                     AppError::ProcessSnapshot("lsof pid field is not valid UTF-8".to_owned())
                 })?;
@@ -591,15 +732,17 @@ pub(crate) fn parse_lsof_output(
                 }
 
                 let mut comm: Option<CompactString> = None;
-                for field in fields {
+                while let Some(rem) = field_rest {
+                    let (field, next_rest) = split_next_nul(rem);
+                    field_rest = next_rest;
                     let Some((&ftag, fval)) = field.split_first() else {
                         return Err(AppError::ProcessSnapshot(
                             "empty field in lsof process record".to_owned(),
                         ));
                     };
                     if ftag == b'c' {
-                        let decoded = decode_lsof_bytes(fval)?;
-                        comm = Some(CompactString::from(String::from_utf8_lossy(&decoded)));
+                        let decoded = decode_lsof_cow(fval, &mut self.decode_scratch)?;
+                        comm = Some(CompactString::from(String::from_utf8_lossy(decoded)));
                     } else {
                         return Err(AppError::ProcessSnapshot(format!(
                             "unexpected field tag `{}` in lsof process header",
@@ -613,16 +756,19 @@ pub(crate) fn parse_lsof_output(
                     ))
                 })?;
 
-                current = Some(ProcessEntry {
+                let open_paths_start = u32::try_from(self.open_path_refs.len()).unwrap_or(u32::MAX);
+                self.current = Some(ProcessEntry {
                     pid,
                     comm,
                     exe_path: None,
                     cwd: None,
-                    open_paths: Vec::new(),
+                    open_paths_start,
+                    open_paths_len: 0,
                 });
+                Ok(())
             }
             b'f' => {
-                let entry = current.as_mut().ok_or_else(|| {
+                let entry = self.current.as_mut().ok_or_else(|| {
                     AppError::ProcessSnapshot(
                         "lsof file descriptor record appeared before process header".to_owned(),
                     )
@@ -637,7 +783,9 @@ pub(crate) fn parse_lsof_output(
 
                 let mut file_type: Option<&[u8]> = None;
                 let mut name_raw: Option<&[u8]> = None;
-                for field in fields {
+                while let Some(rem) = field_rest {
+                    let (field, next_rest) = split_next_nul(rem);
+                    field_rest = next_rest;
                     let Some((&ftag, fval)) = field.split_first() else {
                         return Err(AppError::ProcessSnapshot(
                             "empty field in lsof fd record".to_owned(),
@@ -660,7 +808,7 @@ pub(crate) fn parse_lsof_output(
                     // `PROC_PIDLISTFDS` and `proc_pidfdinfo`, emitting `n<kind>: FD unavailable`.
                     let is_numeric_fd = !fd.is_empty() && fd.iter().all(u8::is_ascii_digit);
                     if is_numeric_fd && name_raw.is_some_and(|n| n.ends_with(b": FD unavailable")) {
-                        continue;
+                        return Ok(());
                     }
                     return Err(AppError::ProcessSnapshot(format!(
                         "lsof fd record missing `t` type field for pid {}",
@@ -669,9 +817,9 @@ pub(crate) fn parse_lsof_output(
                 };
 
                 let allowed_empty_name = matches!(ftype, b"PIPE" | b"NPOLICY" | b"NEXUS");
-                let decoded_name = match name_raw {
-                    Some(bytes) if !bytes.is_empty() => Some(decode_lsof_bytes(bytes)?),
-                    _ if allowed_empty_name => None,
+                let raw_name = match name_raw {
+                    Some(bytes) if !bytes.is_empty() => bytes,
+                    _ if allowed_empty_name => return Ok(()),
                     _ => {
                         return Err(AppError::ProcessSnapshot(format!(
                             "lsof emitted empty `n` field for unexpected type `{}` on pid {}",
@@ -681,108 +829,111 @@ pub(crate) fn parse_lsof_output(
                     }
                 };
 
-                if let Some(bytes) = decoded_name
-                    && bytes.starts_with(b"/")
-                {
-                    let path = bytes_to_pathbuf(bytes);
-                    if fd == b"cwd" {
-                        entry.cwd = Some(path);
-                    } else if fd == b"txt" && ftype == b"REG" {
-                        if entry.exe_path.is_none() {
-                            entry.exe_path = Some(path.clone());
+                let keep_type = fd == b"cwd" || ftype == b"REG" || ftype == b"DIR";
+                let may_start_with_slash = raw_name[0] == b'/' || raw_name[0] == b'\\';
+                if !keep_type || !may_start_with_slash {
+                    validate_lsof_escapes(raw_name)?;
+                    return Ok(());
+                }
+
+                let decoded = decode_lsof_cow(raw_name, &mut self.decode_scratch)?;
+                if !decoded.starts_with(b"/") {
+                    return Ok(());
+                }
+
+                let hash = fnv1a_bytes(decoded);
+                let bucket = self.interned_paths.entry(hash).or_default();
+                let found_idx = bucket
+                    .iter()
+                    .position(|&(r, _)| self.path_pool.bytes_eq(r, decoded));
+
+                if fd == b"cwd" {
+                    let path_ref = if let Some(idx) = found_idx {
+                        bucket[idx].0
+                    } else {
+                        let r = self.path_pool.try_push_bytes(decoded).ok_or_else(|| {
+                            AppError::ProcessSnapshot("lsof path pool exceeded 4 GiB".to_owned())
+                        })?;
+                        bucket.push((r, 0));
+                        r
+                    };
+                    entry.cwd = Some(path_ref);
+                } else {
+                    let is_txt_reg = fd == b"txt" && ftype == b"REG";
+                    if let Some(idx) = found_idx {
+                        let (existing_ref, last_seq) = &mut bucket[idx];
+                        let path_ref = *existing_ref;
+                        if is_txt_reg && entry.exe_path.is_none() {
+                            entry.exe_path = Some(path_ref);
                         }
-                        entry.open_paths.push(path);
-                    } else if ftype == b"REG" || ftype == b"DIR" {
-                        entry.open_paths.push(path);
+                        if *last_seq != self.proc_seq {
+                            *last_seq = self.proc_seq;
+                            self.open_path_refs.push(path_ref);
+                            entry.open_paths_len = entry.open_paths_len.saturating_add(1);
+                        }
+                    } else {
+                        let path_ref = self.path_pool.try_push_bytes(decoded).ok_or_else(|| {
+                            AppError::ProcessSnapshot("lsof path pool exceeded 4 GiB".to_owned())
+                        })?;
+                        if is_txt_reg && entry.exe_path.is_none() {
+                            entry.exe_path = Some(path_ref);
+                        }
+                        self.open_path_refs.push(path_ref);
+                        entry.open_paths_len = entry.open_paths_len.saturating_add(1);
+                        bucket.push((path_ref, self.proc_seq));
                     }
                 }
+                Ok(())
             }
-            other => {
-                return Err(AppError::ProcessSnapshot(format!(
-                    "unexpected lsof record prefix `{}`",
-                    char::from(other)
-                )));
-            }
+            other => Err(AppError::ProcessSnapshot(format!(
+                "unexpected lsof record prefix `{}`",
+                char::from(other)
+            ))),
         }
     }
-
-    if let Some(entry) = current {
-        processes.push(entry);
-    }
-
-    if processes.is_empty() {
-        return Err(AppError::ProcessSnapshot(
-            "lsof returned zero processes".to_owned(),
-        ));
-    }
-
-    Ok(ProcessSnapshot {
-        captured_at_unix,
-        self_pid,
-        processes,
-    })
 }
 
-/// Decode lsof escape sequences (`\\`, `\n`, `\r`, `\t`, `\b`, `\f`, `\a`, `\xHH`).
-/// Fails closed on any unrecognized or truncated escape.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) fn decode_lsof_bytes(raw: &[u8]) -> Result<Vec<u8>, AppError> {
-    if !raw.contains(&b'\\') {
-        return Ok(raw.to_vec());
+#[inline]
+fn split_next_nul(bytes: &[u8]) -> (&[u8], Option<&[u8]>) {
+    match memchr::memchr(0, bytes) {
+        Some(pos) => (&bytes[..pos], Some(&bytes[pos + 1..])),
+        None => (bytes, None),
     }
-    let mut out = Vec::with_capacity(raw.len());
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[inline]
+fn fnv1a_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+/// Validate lsof escape sequences in-place with zero heap allocations.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn validate_lsof_escapes(raw: &[u8]) -> Result<(), AppError> {
     let mut idx = 0;
-    while idx < raw.len() {
-        let byte = raw[idx];
-        if byte != b'\\' {
-            out.push(byte);
-            idx += 1;
-            continue;
-        }
-        idx += 1;
+    while let Some(rel) = memchr::memchr(b'\\', &raw[idx..]) {
+        idx += rel + 1;
         let Some(&next) = raw.get(idx) else {
             return Err(AppError::ProcessSnapshot(
                 "truncated escape sequence in lsof field".to_owned(),
             ));
         };
         match next {
-            b'\\' => {
-                out.push(b'\\');
-                idx += 1;
-            }
-            b'n' => {
-                out.push(b'\n');
-                idx += 1;
-            }
-            b'r' => {
-                out.push(b'\r');
-                idx += 1;
-            }
-            b't' => {
-                out.push(b'\t');
-                idx += 1;
-            }
-            b'b' => {
-                out.push(0x08);
-                idx += 1;
-            }
-            b'f' => {
-                out.push(0x0c);
-                idx += 1;
-            }
-            b'a' => {
-                out.push(0x07);
-                idx += 1;
-            }
+            b'\\' | b'n' | b'r' | b't' | b'b' | b'f' | b'a' => idx += 1,
             b'x' => {
                 let Some(hex_slice) = raw.get(idx + 1..idx + 3) else {
                     return Err(AppError::ProcessSnapshot(
                         "truncated \\xHH escape in lsof field".to_owned(),
                     ));
                 };
-                let hi = hex_nibble(hex_slice[0])?;
-                let lo = hex_nibble(hex_slice[1])?;
-                out.push((hi << 4) | lo);
+                let _ = hex_nibble(hex_slice[0])?;
+                let _ = hex_nibble(hex_slice[1])?;
                 idx += 3;
             }
             other => {
@@ -793,7 +944,89 @@ pub(crate) fn decode_lsof_bytes(raw: &[u8]) -> Result<Vec<u8>, AppError> {
             }
         }
     }
-    Ok(out)
+    Ok(())
+}
+
+/// Decode lsof escape sequences, borrowing `raw` directly when no backslash is present,
+/// or decoding into the reusable `scratch` buffer.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn decode_lsof_cow<'a>(raw: &'a [u8], scratch: &'a mut Vec<u8>) -> Result<&'a [u8], AppError> {
+    let Some(first_bs) = memchr::memchr(b'\\', raw) else {
+        return Ok(raw);
+    };
+    scratch.clear();
+    scratch.reserve(raw.len());
+    scratch.extend_from_slice(&raw[..first_bs]);
+    let mut idx = first_bs;
+    while idx < raw.len() {
+        let Some(rel) = memchr::memchr(b'\\', &raw[idx..]) else {
+            scratch.extend_from_slice(&raw[idx..]);
+            break;
+        };
+        scratch.extend_from_slice(&raw[idx..idx + rel]);
+        idx += rel + 1;
+        let Some(&next) = raw.get(idx) else {
+            return Err(AppError::ProcessSnapshot(
+                "truncated escape sequence in lsof field".to_owned(),
+            ));
+        };
+        match next {
+            b'\\' => {
+                scratch.push(b'\\');
+                idx += 1;
+            }
+            b'n' => {
+                scratch.push(b'\n');
+                idx += 1;
+            }
+            b'r' => {
+                scratch.push(b'\r');
+                idx += 1;
+            }
+            b't' => {
+                scratch.push(b'\t');
+                idx += 1;
+            }
+            b'b' => {
+                scratch.push(0x08);
+                idx += 1;
+            }
+            b'f' => {
+                scratch.push(0x0c);
+                idx += 1;
+            }
+            b'a' => {
+                scratch.push(0x07);
+                idx += 1;
+            }
+            b'x' => {
+                let Some(hex_slice) = raw.get(idx + 1..idx + 3) else {
+                    return Err(AppError::ProcessSnapshot(
+                        "truncated \\xHH escape in lsof field".to_owned(),
+                    ));
+                };
+                let hi = hex_nibble(hex_slice[0])?;
+                let lo = hex_nibble(hex_slice[1])?;
+                scratch.push((hi << 4) | lo);
+                idx += 3;
+            }
+            other => {
+                return Err(AppError::ProcessSnapshot(format!(
+                    "unsupported escape sequence `\\{}` in lsof field",
+                    char::from(other)
+                )));
+            }
+        }
+    }
+    Ok(scratch.as_slice())
+}
+
+/// Decode lsof escape sequences (`\\`, `\n`, `\r`, `\t`, `\b`, `\f`, `\a`, `\xHH`).
+/// Fails closed on any unrecognized or truncated escape.
+#[cfg(test)]
+pub(crate) fn decode_lsof_bytes(raw: &[u8]) -> Result<Vec<u8>, AppError> {
+    let mut scratch = Vec::new();
+    Ok(decode_lsof_cow(raw, &mut scratch)?.to_vec())
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -807,21 +1040,6 @@ fn hex_nibble(byte: u8) -> Result<u8, AppError> {
             char::from(byte)
         ))),
     }
-}
-
-#[cfg(unix)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
-
-    PathBuf::from(OsString::from_vec(bytes))
-}
-
-#[cfg(not(unix))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Strictly parse macOS `/sbin/mount` lines (`<source> on <mount_point> (<fstype>, ...)`).
@@ -890,21 +1108,27 @@ pub(crate) fn parse_tmutil_snapshots(raw: &str) -> Vec<CompactString> {
     snapshots
 }
 
-/// Normalize macOS firmlink/symlink system prefixes (`/var`, `/tmp`, `/etc` -> `/private/...`).
-pub(crate) fn normalize_macos_system_symlinks(path: &Path) -> PathBuf {
+/// Normalize macOS firmlink/symlink system prefixes (`/var`, `/tmp`, `/etc` -> `/private/...`),
+/// borrowing when no rewrite is required.
+pub(crate) fn normalize_macos_system_symlinks_cow(path: &Path) -> Cow<'_, Path> {
     #[cfg(target_os = "macos")]
     {
         if let Ok(rest) = path.strip_prefix("/var") {
-            return Path::new("/private/var").join(rest);
+            return Cow::Owned(Path::new("/private/var").join(rest));
         }
         if let Ok(rest) = path.strip_prefix("/tmp") {
-            return Path::new("/private/tmp").join(rest);
+            return Cow::Owned(Path::new("/private/tmp").join(rest));
         }
         if let Ok(rest) = path.strip_prefix("/etc") {
-            return Path::new("/private/etc").join(rest);
+            return Cow::Owned(Path::new("/private/etc").join(rest));
         }
     }
-    path.to_path_buf()
+    Cow::Borrowed(path)
+}
+
+/// Normalize macOS firmlink/symlink system prefixes (`/var`, `/tmp`, `/etc` -> `/private/...`).
+pub(crate) fn normalize_macos_system_symlinks(path: &Path) -> PathBuf {
+    normalize_macos_system_symlinks_cow(path).into_owned()
 }
 
 /// Return `true` if `path` or any ancestor component is a non-system symlink (fail-closed on error).
@@ -912,8 +1136,8 @@ pub(crate) fn has_symlink_boundary(path: &Path) -> bool {
     let Ok(canon) = std::fs::canonicalize(path) else {
         return true;
     };
-    let normalized = normalize_macos_system_symlinks(path);
-    canon != normalized
+    let normalized = normalize_macos_system_symlinks_cow(path);
+    canon.as_path() != normalized.as_ref()
 }
 
 /// Single-owner mount-boundary validator shared by `discover` and post-lock `execute` revalidation.
@@ -937,53 +1161,52 @@ pub(crate) fn crosses_mount_boundary(
         return false;
     };
 
-    let norm_target = normalize_mount_path(target_root);
+    let norm_target = normalize_mount_path_cow(target_root);
+    let norm_target_ref = norm_target.as_ref();
     for entry in entries {
         let mp = entry.mount_point.as_path();
         if mp == Path::new("/") || mp == Path::new(DEFAULT_VOLUME_MOUNT) {
             continue;
         }
-        let norm_mp = normalize_mount_path(mp);
-        if norm_mp == Path::new("/") {
+        let norm_mp = normalize_mount_path_cow(mp);
+        let norm_mp_ref = norm_mp.as_ref();
+        if norm_mp_ref == Path::new("/") {
             continue;
         }
-        if norm_mp == norm_target || norm_mp.starts_with(&norm_target) {
+        if norm_mp_ref == norm_target_ref || norm_mp_ref.starts_with(norm_target_ref) {
             return true;
         }
-        if norm_target.starts_with(&norm_mp) && is_non_local_fstype(&entry.fstype) {
+        if norm_target_ref.starts_with(norm_mp_ref) && is_non_local_fstype(&entry.fstype) {
             return true;
         }
     }
     false
 }
 
-fn normalize_mount_path(path: &Path) -> PathBuf {
-    let stripped = if let Ok(rest) = path.strip_prefix(DEFAULT_VOLUME_MOUNT) {
+fn normalize_mount_path_cow(path: &Path) -> Cow<'_, Path> {
+    if let Ok(rest) = path.strip_prefix(DEFAULT_VOLUME_MOUNT) {
         if rest.as_os_str().is_empty() {
-            PathBuf::from("/")
-        } else {
-            Path::new("/").join(rest)
+            return Cow::Borrowed(Path::new("/"));
         }
-    } else {
-        path.to_path_buf()
-    };
-    normalize_macos_system_symlinks(&stripped)
+        let joined = Path::new("/").join(rest);
+        return Cow::Owned(normalize_macos_system_symlinks_cow(&joined).into_owned());
+    }
+    normalize_macos_system_symlinks_cow(path)
 }
 
 fn is_non_local_fstype(fstype: &str) -> bool {
-    let lower = fstype.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "nfs"
-            | "smbfs"
-            | "afpfs"
-            | "webdav"
-            | "autofs"
-            | "devfs"
-            | "nullfs"
-            | "macfuse"
-            | "osxfuse"
-    ) || lower.starts_with("fuse")
+    fstype.eq_ignore_ascii_case("nfs")
+        || fstype.eq_ignore_ascii_case("smbfs")
+        || fstype.eq_ignore_ascii_case("afpfs")
+        || fstype.eq_ignore_ascii_case("webdav")
+        || fstype.eq_ignore_ascii_case("autofs")
+        || fstype.eq_ignore_ascii_case("devfs")
+        || fstype.eq_ignore_ascii_case("nullfs")
+        || fstype.eq_ignore_ascii_case("macfuse")
+        || fstype.eq_ignore_ascii_case("osxfuse")
+        || fstype
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("fuse"))
 }
 
 #[cfg(unix)]
@@ -1192,22 +1415,24 @@ mod tests {
         assert_eq!(p.pid, 41797);
         assert_eq!(p.comm.as_str(), "Antigravity Helper (Plugin)");
         assert_eq!(
-            p.exe_path.as_deref(),
+            snap.exe_path(p),
             Some(std::path::Path::new(
                 "/Applications/Antigravity.app/Contents/MacOS/Antigravity Helper"
             ))
         );
         assert_eq!(
-            p.cwd.as_deref(),
+            snap.cwd(p),
             Some(std::path::Path::new("/Users/dev/Projects/тест\\repo"))
         );
-        assert!(p.open_paths.contains(&PathBuf::from(
-            "/Users/dev/Projects/repo/target/debug/deps/libmacro.dylib"
-        )));
+        assert!(snap.open_path_refs(p).iter().any(|&r| {
+            snap.path(r)
+                == std::path::Path::new("/Users/dev/Projects/repo/target/debug/deps/libmacro.dylib")
+        }));
         assert!(
-            !p.open_paths
+            !snap
+                .open_path_refs(p)
                 .iter()
-                .any(|path| path.to_string_lossy().contains("netsrc"))
+                .any(|&r| snap.path(r).to_string_lossy().contains("netsrc"))
         );
     }
 
@@ -1326,5 +1551,123 @@ com.apple.os.update-ZZZ
             .unwrap();
         assert!(!stopped);
         assert!(!watcher.is_stopped());
+    }
+
+    #[test]
+    fn lsof_stream_parser_matches_across_arbitrary_chunk_sizes_and_dedups_open_paths() {
+        use super::LsofStreamParser;
+
+        // Includes `\x2f` leading slash, spaces, duplicate open REG/DIR paths on same PID,
+        // non-kept IPv4/PIPE records, and a final line without a trailing `\n`.
+        let sample = concat!(
+            "p101\0ccargo\0\n",
+            "fcwd\0tDIR\0n\\x2fUsers/dev/repo\0\n",
+            "ftxt\0tREG\0n/usr/bin/cargo\0\n",
+            "f3\0tREG\0n/Users/dev/repo/target/a\\x20b.o\0\n",
+            "f4\0tREG\0n/Users/dev/repo/target/a\\x20b.o\0\n",
+            "f5\0tIPv4\0n127.0.0.1:8080->127.0.0.1:50000\0\n",
+            "f6\0tDIR\0n/Users/dev/repo/target\0\n",
+            "f7\0tDIR\0n/Users/dev/repo/target\0\n",
+            "p202\0crust-analyzer\0\n",
+            "f3\0tREG\0n/Users/dev/repo/target/a\\x20b.o\0"
+        )
+        .as_bytes();
+
+        let reference = parse_lsof_output(sample, 1234, 999).unwrap();
+        assert_eq!(reference.processes.len(), 2);
+        let p0 = &reference.processes[0];
+        assert_eq!(p0.pid, 101);
+        assert_eq!(
+            reference.cwd(p0),
+            Some(std::path::Path::new("/Users/dev/repo"))
+        );
+        assert_eq!(
+            reference.exe_path(p0),
+            Some(std::path::Path::new("/usr/bin/cargo"))
+        );
+        // Duplicates on f4 and f7 must be deduplicated per-PID.
+        let p0_opens: Vec<&std::path::Path> = reference
+            .open_path_refs(p0)
+            .iter()
+            .map(|&r| reference.path(r))
+            .collect();
+        assert_eq!(
+            p0_opens,
+            vec![
+                std::path::Path::new("/usr/bin/cargo"),
+                std::path::Path::new("/Users/dev/repo/target/a b.o"),
+                std::path::Path::new("/Users/dev/repo/target"),
+            ]
+        );
+        // Same path on a DIFFERENT PID (202) must still be recorded AND interned to the exact
+        // same `PathRef` in `path_pool` (zero duplicate bytes across PIDs).
+        let p1 = &reference.processes[1];
+        assert_eq!(p1.pid, 202);
+        assert_eq!(reference.open_path_refs(p1).len(), 1);
+        assert_eq!(
+            reference.open_path_refs(p1)[0],
+            reference.open_path_refs(p0)[1]
+        );
+        assert_eq!(
+            reference.path(reference.open_path_refs(p1)[0]),
+            std::path::Path::new("/Users/dev/repo/target/a b.o")
+        );
+
+        // Feeding 1, 2, 3, 7, 17 bytes at a time (splitting across `\0`, `\n`, `\x20`, `\x2f`)
+        // must produce the exact same snapshot.
+        for chunk_size in [1usize, 2, 3, 7, 17, 64] {
+            let mut parser = LsofStreamParser::new();
+            for chunk in sample.chunks(chunk_size) {
+                parser.feed(chunk);
+            }
+            let streamed = parser.finish(1234, 999).unwrap();
+            assert_eq!(streamed, reference, "chunk_size={chunk_size} diverged");
+        }
+
+        // Malformed escape inside a NON-kept record (e.g. `tIPv4` / `tPIPE`) MUST still fail closed!
+        let bad_non_kept = b"p10\0ccargo\0\nf5\0tIPv4\0n/bad\\xZZ\0\n";
+        assert!(parse_lsof_output(bad_non_kept, 1, 0).is_err());
+
+        let bad_non_kept_trunc = b"p10\0ccargo\0\nf5\0tPIPE\0n/bad\\\0\n";
+        assert!(parse_lsof_output(bad_non_kept_trunc, 1, 0).is_err());
+    }
+
+    #[test]
+    fn normalize_macos_system_symlinks_cow_borrows_clean_paths_and_rewrites_aliases() {
+        use std::borrow::Cow;
+        use std::path::Path;
+
+        use super::normalize_macos_system_symlinks_cow;
+
+        let clean = normalize_macos_system_symlinks_cow(Path::new("/Users/dev/repo/target"));
+        assert!(matches!(clean, Cow::Borrowed(_)));
+        assert_eq!(clean.as_ref(), Path::new("/Users/dev/repo/target"));
+
+        let already_private = normalize_macos_system_symlinks_cow(Path::new("/private/tmp/a"));
+        assert!(matches!(already_private, Cow::Borrowed(_)));
+        assert_eq!(already_private.as_ref(), Path::new("/private/tmp/a"));
+
+        let tmp = normalize_macos_system_symlinks_cow(Path::new("/tmp/a/b"));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(matches!(tmp, Cow::Owned(_)));
+            assert_eq!(tmp.as_ref(), Path::new("/private/tmp/a/b"));
+
+            let var_root = normalize_macos_system_symlinks_cow(Path::new("/var"));
+            assert_eq!(var_root.as_ref(), Path::new("/private/var"));
+
+            let etc_file = normalize_macos_system_symlinks_cow(Path::new("/etc/hosts"));
+            assert_eq!(etc_file.as_ref(), Path::new("/private/etc/hosts"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(matches!(tmp, Cow::Borrowed(_)));
+            assert_eq!(tmp.as_ref(), Path::new("/tmp/a/b"));
+        }
+
+        // Must NOT rewrite lookalike prefixes like `/tmpfoo` or `/variable`.
+        let lookalike = normalize_macos_system_symlinks_cow(Path::new("/tmpfoo/bar"));
+        assert!(matches!(lookalike, Cow::Borrowed(_)));
+        assert_eq!(lookalike.as_ref(), Path::new("/tmpfoo/bar"));
     }
 }

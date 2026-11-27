@@ -31,7 +31,7 @@ use crate::discover::{ScanDetail, ScanRequest, ScanRoot};
 use crate::error::AppError;
 use crate::model::{ActionOutcome, DiskPressure, PinScope, PlanMode, ReclaimProfile};
 use crate::platform::{DEFAULT_VOLUME_MOUNT, Platform, SignalWatcher, default_platform};
-use crate::state::State;
+use crate::state::{State, TargetScanSummary};
 use crate::store::{CLI_RUN_LOCK_RETRY_TIMEOUT, StateCache};
 
 const EXIT_PARTIAL: u8 = 3;
@@ -294,6 +294,22 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                 current_pressure,
                 mode,
             );
+            // Release full `ScanSnapshot` (`ProcessSnapshot` + all build units) and `verdicts`
+            // before executing plan actions (which run fresh post-lock `lsof` probes).
+            let captured_at_unix = snapshot.captured_at_unix;
+            let walk_partial = snapshot.walk_partial;
+            let scan_summaries: Vec<TargetScanSummary> = if dry_run {
+                Vec::new()
+            } else {
+                snapshot
+                    .targets
+                    .iter()
+                    .map(TargetScanSummary::from)
+                    .collect()
+            };
+            drop(verdicts);
+            drop(snapshot);
+
             let r5_target = rules::r5_headroom_target(current_pressure, &config);
             let exec = execute::execute_plan(
                 &plan,
@@ -324,12 +340,7 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                     plan.hold_active = true;
                     state.reclaim_hold = Some(hold);
                 }
-                state.record_scan_targets(
-                    &snapshot.targets,
-                    snapshot.captured_at_unix,
-                    true,
-                    snapshot.walk_partial,
-                );
+                state.record_scan_summaries(&scan_summaries, captured_at_unix, true, walk_partial);
                 state.apply_receipts(&exec.receipts);
                 store::append_receipts(&state_dir, &exec.receipts)?;
                 state_cache.save(&state)?;
@@ -621,6 +632,16 @@ where
                                         current_pressure,
                                         mode,
                                     );
+                                    let captured_at_unix = snapshot.captured_at_unix;
+                                    let walk_partial = snapshot.walk_partial;
+                                    let scan_summaries: Vec<TargetScanSummary> = snapshot
+                                        .targets
+                                        .iter()
+                                        .map(TargetScanSummary::from)
+                                        .collect();
+                                    drop(verdicts);
+                                    drop(snapshot);
+
                                     let r5_target =
                                         rules::r5_headroom_target(current_pressure, config);
                                     let exec = execute::execute_plan(
@@ -637,6 +658,7 @@ where
                                         },
                                         Some(stop_flag),
                                     );
+                                    drop(plan);
 
                                     let final_pressure = if dry_run {
                                         current_pressure
@@ -661,11 +683,11 @@ where
                                     if !dry_run && let Some(hold) = exec.triggered_hold {
                                         state.reclaim_hold = Some(hold);
                                     }
-                                    state.record_scan_targets(
-                                        &snapshot.targets,
-                                        snapshot.captured_at_unix,
+                                    state.record_scan_summaries(
+                                        &scan_summaries,
+                                        captured_at_unix,
                                         full_walk,
-                                        snapshot.walk_partial,
+                                        walk_partial,
                                     );
                                     state.apply_receipts(&exec.receipts);
 
@@ -814,11 +836,10 @@ mod tests {
             })
         }
         fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
-            Ok(ProcessSnapshot {
-                captured_at_unix: self.now.load(Ordering::Relaxed),
-                self_pid: std::process::id(),
-                processes: vec![],
-            })
+            Ok(ProcessSnapshot::empty(
+                self.now.load(Ordering::Relaxed),
+                std::process::id(),
+            ))
         }
         fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
             Ok(vec![MountEntry {

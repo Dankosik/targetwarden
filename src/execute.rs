@@ -4,6 +4,7 @@
 //!
 //! Allowed dependencies: `error`, `model`, `platform`.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,8 +14,9 @@ use compact_str::CompactString;
 
 use crate::error::AppError;
 use crate::model::{
-    ActionOutcome, ActionReceipt, DiskPressure, EvictRule, IncrementalRemoval, ProcessSnapshot,
-    ReclaimAction, ReclaimHoldState, ReclaimPlan, SweepOps, V1UnitRemoval, V2UnitRemoval,
+    ActionOutcome, ActionReceipt, DiskPressure, EvictRule, FastU64BuildHasher, IncrementalRemoval,
+    PathPrefix, ProcessSnapshot, ReclaimAction, ReclaimHoldState, ReclaimPlan, SweepOps,
+    V1UnitRemoval, V2UnitRemoval, extract_16hex_from_dep_name, parse_16_lower_hex_u64,
 };
 use crate::platform::{
     DEFAULT_VOLUME_MOUNT, LockProbe, Platform, crosses_mount_boundary, has_symlink_boundary,
@@ -693,59 +695,14 @@ fn execute_prune_incremental(
     let mut moved_bytes: u64 = 0;
     let mut move_error: Option<String> = None;
 
-    for (idx, removal) in removals.iter().enumerate() {
-        match removal {
-            IncrementalRemoval::WholeCrateDir {
-                dir_name,
-                allocated_bytes,
-                ..
-            } => {
-                let dst = format!("inc_crate_{idx}");
-                match rename_entry_atomic(&inc_root, dir_name.as_str(), &staging_dir, &dst) {
-                    Ok(true) => {
-                        moved_count = moved_count.saturating_add(1);
-                        moved_bytes = moved_bytes.saturating_add(*allocated_bytes);
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        move_error = Some(format!("rename incremental/{dir_name}: {error}"));
-                        break;
-                    }
-                }
-            }
-            IncrementalRemoval::SingleSession {
-                crate_dir,
-                session_dir,
-                lock_file,
-                allocated_bytes,
-            } => {
-                let crate_path = inc_root.join(crate_dir.as_str());
-                let dst = format!("inc_sess_{idx}");
-                match rename_entry_atomic(&crate_path, session_dir.as_str(), &staging_dir, &dst) {
-                    Ok(true) => {
-                        moved_count = moved_count.saturating_add(1);
-                        moved_bytes = moved_bytes.saturating_add(*allocated_bytes);
-                        if let Some(lf) = lock_file {
-                            let lock_dst = format!("inc_lock_{idx}");
-                            let _ = rename_entry_atomic(
-                                &crate_path,
-                                lf.as_str(),
-                                &staging_dir,
-                                &lock_dst,
-                            );
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        move_error = Some(format!(
-                            "rename incremental/{crate_dir}/{session_dir}: {error}"
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    stage_incremental_removals(
+        &inc_root,
+        &staging_dir,
+        removals,
+        &mut moved_count,
+        &mut moved_bytes,
+        &mut move_error,
+    );
 
     release_locks(held_locks);
 
@@ -908,33 +865,23 @@ fn has_any_process_for_eviction(
     target_root: &Path,
     worktree_root: Option<&Path>,
 ) -> Option<CompactString> {
+    let target_prefix = PathPrefix::new(target_root);
+    let wt_prefix = worktree_root.map(PathPrefix::new);
     for proc_entry in &proc_snap.processes {
         if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
             continue;
         }
-        if proc_entry
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.starts_with(target_root))
-            || proc_entry
-                .open_paths
-                .iter()
-                .any(|open| open.starts_with(target_root))
+        if proc_snap.cwd_has_prefix(proc_entry, &target_prefix)
+            || proc_snap.any_open_has_prefix(proc_entry, &target_prefix)
         {
             return Some(CompactString::from(format!(
                 "process_in_target:{}",
                 proc_entry.comm
             )));
         }
-        if let Some(wt) = worktree_root
-            && (proc_entry
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.starts_with(wt))
-                || proc_entry
-                    .open_paths
-                    .iter()
-                    .any(|open| open.starts_with(wt)))
+        if let Some(wt) = wt_prefix
+            && (proc_snap.cwd_has_prefix(proc_entry, &wt)
+                || proc_snap.any_open_has_prefix(proc_entry, &wt))
         {
             return Some(CompactString::from(format!(
                 "process_in_worktree:{}",
@@ -1082,25 +1029,24 @@ fn has_blocking_process_for_sweep(
     profile_dir: &Path,
     ops: &SweepOps,
 ) -> Option<CompactString> {
+    let target_prefix = PathPrefix::new(target_root);
+    let wt_prefix = worktree_root.map(PathPrefix::new);
     for proc_entry in &proc_snap.processes {
         if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
             continue;
         }
-        let is_pm_srv = proc_entry.is_rust_analyzer_proc_macro_srv();
-        if proc_entry
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.starts_with(target_root))
-        {
+        let is_pm_srv = proc_snap.is_rust_analyzer_proc_macro_srv(proc_entry);
+        if proc_snap.cwd_has_prefix(proc_entry, &target_prefix) {
             return Some(CompactString::from(format!(
                 "process_cwd_in_target:{}",
                 proc_entry.comm
             )));
         }
-        for open in &proc_entry.open_paths {
-            if !open.starts_with(target_root) {
+        for &path_ref in proc_snap.open_path_refs(proc_entry) {
+            if !proc_snap.path_has_prefix(path_ref, &target_prefix) {
                 continue;
             }
+            let open = proc_snap.path(path_ref);
             if is_pm_srv && open.extension().and_then(|e| e.to_str()) == Some("dylib") {
                 if path_hits_swept_unit(open, profile_dir, ops) {
                     return Some(CompactString::new("proc_macro_dylib_open_in_swept_unit"));
@@ -1112,16 +1058,10 @@ fn has_blocking_process_for_sweep(
                 proc_entry.comm
             )));
         }
-        if let Some(wt) = worktree_root
-            && proc_entry.is_active_compiler_or_tool()
-            && (proc_entry
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.starts_with(wt))
-                || proc_entry
-                    .open_paths
-                    .iter()
-                    .any(|open| open.starts_with(wt)))
+        if let Some(wt) = wt_prefix
+            && proc_snap.is_active_compiler_or_tool(proc_entry)
+            && (proc_snap.cwd_has_prefix(proc_entry, &wt)
+                || proc_snap.any_open_has_prefix(proc_entry, &wt))
         {
             return Some(CompactString::from(format!(
                 "compiler_in_worktree:{}",
@@ -1138,30 +1078,37 @@ fn has_hard_blocked_process_for_target(
     worktree_root: Option<&Path>,
     action_dir: &Path,
 ) -> Option<CompactString> {
+    let target_prefix = PathPrefix::new(target_root);
+    let action_prefix = PathPrefix::new(action_dir);
+    let wt_prefix = worktree_root.map(PathPrefix::new);
     for proc_entry in &proc_snap.processes {
         if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
             continue;
         }
-        let is_pm_srv = proc_entry.is_rust_analyzer_proc_macro_srv();
-        if proc_entry
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.starts_with(target_root) || cwd.starts_with(action_dir))
+        let is_pm_srv = proc_snap.is_rust_analyzer_proc_macro_srv(proc_entry);
+        if proc_snap.cwd_has_prefix(proc_entry, &target_prefix)
+            || proc_snap.cwd_has_prefix(proc_entry, &action_prefix)
         {
             return Some(CompactString::from(format!(
                 "process_cwd_in_target:{}",
                 proc_entry.comm
             )));
         }
-        for open in &proc_entry.open_paths {
-            if open.starts_with(action_dir) {
+        for &path_ref in proc_snap.open_path_refs(proc_entry) {
+            if proc_snap.path_has_prefix(path_ref, &action_prefix) {
                 return Some(CompactString::from(format!(
                     "process_open_in_dir:{}",
                     proc_entry.comm
                 )));
             }
-            if open.starts_with(target_root) {
-                if is_pm_srv && open.extension().and_then(|e| e.to_str()) == Some("dylib") {
+            if proc_snap.path_has_prefix(path_ref, &target_prefix) {
+                if is_pm_srv
+                    && proc_snap
+                        .path(path_ref)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        == Some("dylib")
+                {
                     continue;
                 }
                 return Some(CompactString::from(format!(
@@ -1170,16 +1117,10 @@ fn has_hard_blocked_process_for_target(
                 )));
             }
         }
-        if let Some(wt) = worktree_root
-            && proc_entry.is_active_compiler_or_tool()
-            && (proc_entry
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.starts_with(wt))
-                || proc_entry
-                    .open_paths
-                    .iter()
-                    .any(|open| open.starts_with(wt)))
+        if let Some(wt) = wt_prefix
+            && proc_snap.is_active_compiler_or_tool(proc_entry)
+            && (proc_snap.cwd_has_prefix(proc_entry, &wt)
+                || proc_snap.any_open_has_prefix(proc_entry, &wt))
         {
             return Some(CompactString::from(format!(
                 "compiler_in_worktree:{}",
@@ -1191,32 +1132,48 @@ fn has_hard_blocked_process_for_target(
 }
 
 fn path_hits_swept_unit(path: &Path, profile_dir: &Path, ops: &SweepOps) -> bool {
-    let check_v2 = |v2: &[V2UnitRemoval]| {
-        v2.iter().any(|u| {
-            let unit_dir = profile_dir
-                .join("build")
-                .join(u.pkg.as_str())
-                .join(u.unit_hash.as_str());
-            path.starts_with(&unit_dir)
-        })
+    let Ok(rel) = path.strip_prefix(profile_dir) else {
+        return false;
     };
-    let check_v1 = |v1: &[V1UnitRemoval]| {
-        let deps_dir = profile_dir.join("deps");
-        v1.iter().any(|u| {
-            let fp_hit = u
-                .fingerprint_dir
-                .as_deref()
-                .is_some_and(|fp| path.starts_with(profile_dir.join(".fingerprint").join(fp)));
-            let build_hit = u
-                .build_dir
-                .as_deref()
-                .is_some_and(|b| path.starts_with(profile_dir.join("build").join(b)));
-            let dep_hit = u
-                .dep_entries
+    let mut comps = rel.components();
+    let Some(first) = comps.next().and_then(|c| c.as_os_str().to_str()) else {
+        return false;
+    };
+    let second = comps.next().and_then(|c| c.as_os_str().to_str());
+    let third = comps.next().and_then(|c| c.as_os_str().to_str());
+
+    let check_v2 = |v2: &[V2UnitRemoval]| -> bool {
+        if first != "build" {
+            return false;
+        }
+        let (Some(pkg), Some(hash)) = (second, third) else {
+            return false;
+        };
+        v2.iter()
+            .any(|u| u.pkg.as_str() == pkg && u.unit_hash.as_str() == hash)
+    };
+    let check_v1 = |v1: &[V1UnitRemoval]| -> bool {
+        let Some(entry_name) = second else {
+            return false;
+        };
+        match first {
+            ".fingerprint" => v1
                 .iter()
-                .any(|d| path.starts_with(deps_dir.join(d.as_str())));
-            fp_hit || build_hit || dep_hit
-        })
+                .any(|u| u.fingerprint_dir.as_deref() == Some(entry_name)),
+            "build" => v1
+                .iter()
+                .any(|u| u.build_dir.as_deref() == Some(entry_name)),
+            "deps" => {
+                let dep_hash = extract_16hex_from_dep_name(entry_name);
+                v1.iter().any(|u| {
+                    u.dep_entries.iter().any(|d| d.as_str() == entry_name)
+                        || (u.dep_entries.is_empty()
+                            && u.sweep_deps_by_hash
+                            && dep_hash == Some(u.unit_hash.as_str()))
+                })
+            }
+            _ => false,
+        }
     };
     match ops {
         SweepOps::V2(v2) => check_v2(v2),
@@ -1226,18 +1183,13 @@ fn path_hits_swept_unit(path: &Path, profile_dir: &Path, ops: &SweepOps) -> bool
 }
 
 fn any_process_in_dir(proc_snap: &ProcessSnapshot, dir: &Path) -> bool {
+    let prefix = PathPrefix::new(dir);
     proc_snap.processes.iter().any(|proc_entry| {
         if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
             return false;
         }
-        proc_entry
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.starts_with(dir))
-            || proc_entry
-                .open_paths
-                .iter()
-                .any(|open| open.starts_with(dir))
+        proc_snap.cwd_has_prefix(proc_entry, &prefix)
+            || proc_snap.any_open_has_prefix(proc_entry, &prefix)
     })
 }
 
@@ -1248,44 +1200,241 @@ fn pin_marker_present_fail_closed(path: &Path) -> bool {
     )
 }
 
+#[cfg(not(unix))]
 fn path_mtime_exceeds(path: &Path, expected_unix: u64) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta_mtime_unix(&meta) > expected_unix)
 }
 
+#[cfg(unix)]
+fn statat_mtime_status(
+    dir_fd: &std::os::fd::OwnedFd,
+    rel: &str,
+    expected_unix: u64,
+) -> Option<bool> {
+    use rustix::fs::{AtFlags, statat};
+
+    match statat(dir_fd, rel, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(st) => Some(u64::try_from(st.st_mtime).unwrap_or(0) > expected_unix),
+        Err(_) => None,
+    }
+}
+
 fn sweep_unit_mtime_advanced(profile_dir: &Path, ops: &SweepOps, expected_unix: u64) -> bool {
-    let check_v2 = |v2: &[V2UnitRemoval]| {
-        let build_root = profile_dir.join("build");
-        v2.iter().any(|u| {
-            let unit_dir = build_root.join(u.pkg.as_str()).join(u.unit_hash.as_str());
-            let fp_dir = unit_dir.join("fingerprint");
-            path_mtime_exceeds(&unit_dir, expected_unix)
-                || path_mtime_exceeds(&fp_dir, expected_unix)
-                || path_mtime_exceeds(&fp_dir.join("invoked.timestamp"), expected_unix)
-        })
-    };
-    let check_v1 = |v1: &[V1UnitRemoval]| {
-        let fp_root = profile_dir.join(".fingerprint");
-        let build_root = profile_dir.join("build");
-        let deps_root = profile_dir.join("deps");
-        v1.iter().any(|u| {
-            if let Some(fp_name) = u.fingerprint_dir.as_deref() {
-                let fp_dir = fp_root.join(fp_name);
-                path_mtime_exceeds(&fp_dir, expected_unix)
-                    || path_mtime_exceeds(&fp_dir.join("invoked.timestamp"), expected_unix)
-            } else {
-                u.build_dir
-                    .as_deref()
-                    .is_some_and(|b| path_mtime_exceeds(&build_root.join(b), expected_unix))
-                    || u.dep_entries
-                        .iter()
-                        .any(|d| path_mtime_exceeds(&deps_root.join(d.as_str()), expected_unix))
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open, openat};
+
+        let open_dir = |p: &Path| {
+            open(
+                p,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .ok()
+        };
+
+        let check_v2 = |v2: &[V2UnitRemoval]| -> bool {
+            if v2.is_empty() {
+                return false;
             }
-        })
-    };
-    match ops {
-        SweepOps::V2(v2) => check_v2(v2),
-        SweepOps::V1(v1) => check_v1(v1),
-        SweepOps::Mixed { v2, v1 } => check_v2(v2) || check_v1(v1),
+            let Some(build_root_fd) = open_dir(&profile_dir.join("build")) else {
+                return false;
+            };
+            let mut cached_pkg: Option<(&str, Option<std::os::fd::OwnedFd>)> = None;
+            let mut rel_buf = String::with_capacity(96);
+            for u in v2 {
+                if cached_pkg
+                    .as_ref()
+                    .is_none_or(|(name, _)| *name != u.pkg.as_str())
+                {
+                    drop(cached_pkg.take());
+                    let fd = openat(
+                        &build_root_fd,
+                        u.pkg.as_str(),
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .ok();
+                    cached_pkg = Some((u.pkg.as_str(), fd));
+                }
+                let Some((_, Some(ref pkg_fd))) = cached_pkg else {
+                    continue;
+                };
+                match statat_mtime_status(pkg_fd, u.unit_hash.as_str(), expected_unix) {
+                    Some(true) => return true,
+                    Some(false) => {}
+                    None => continue,
+                }
+                rel_buf.clear();
+                rel_buf.push_str(u.unit_hash.as_str());
+                rel_buf.push_str("/fingerprint");
+                match statat_mtime_status(pkg_fd, rel_buf.as_str(), expected_unix) {
+                    Some(true) => return true,
+                    Some(false) => {}
+                    None => continue,
+                }
+                rel_buf.push_str("/invoked.timestamp");
+                if statat_mtime_status(pkg_fd, rel_buf.as_str(), expected_unix) == Some(true) {
+                    return true;
+                }
+            }
+            false
+        };
+        let check_v1 = |v1: &[V1UnitRemoval]| -> bool {
+            if v1.is_empty() {
+                return false;
+            }
+            let mut fp_root_fd: Option<Option<std::os::fd::OwnedFd>> = None;
+            let mut build_root_fd: Option<Option<std::os::fd::OwnedFd>> = None;
+            let mut deps_root_fd: Option<Option<std::os::fd::OwnedFd>> = None;
+            let mut orphan_dep_hashes: HashSet<u64, FastU64BuildHasher> =
+                HashSet::with_hasher(FastU64BuildHasher);
+            let mut rel_buf = String::with_capacity(96);
+            for u in v1 {
+                if let Some(fp_name) = u.fingerprint_dir.as_deref() {
+                    let fd_opt = fp_root_fd
+                        .get_or_insert_with(|| open_dir(&profile_dir.join(".fingerprint")));
+                    let Some(fp_fd) = fd_opt.as_ref() else {
+                        continue;
+                    };
+                    match statat_mtime_status(fp_fd, fp_name, expected_unix) {
+                        Some(true) => return true,
+                        Some(false) => {}
+                        None => continue,
+                    }
+                    rel_buf.clear();
+                    rel_buf.push_str(fp_name);
+                    rel_buf.push_str("/invoked.timestamp");
+                    if statat_mtime_status(fp_fd, rel_buf.as_str(), expected_unix) == Some(true) {
+                        return true;
+                    }
+                } else {
+                    if let Some(b) = u.build_dir.as_deref() {
+                        let fd_opt = build_root_fd
+                            .get_or_insert_with(|| open_dir(&profile_dir.join("build")));
+                        if let Some(b_fd) = fd_opt.as_ref()
+                            && statat_mtime_status(b_fd, b, expected_unix) == Some(true)
+                        {
+                            return true;
+                        }
+                    }
+                    if !u.dep_entries.is_empty() {
+                        let fd_opt =
+                            deps_root_fd.get_or_insert_with(|| open_dir(&profile_dir.join("deps")));
+                        if let Some(d_fd) = fd_opt.as_ref()
+                            && u.dep_entries.iter().any(|d| {
+                                statat_mtime_status(d_fd, d.as_str(), expected_unix) == Some(true)
+                            })
+                        {
+                            return true;
+                        }
+                    } else if u.sweep_deps_by_hash
+                        && let Some(hash_u64) = parse_16_lower_hex_u64(&u.unit_hash)
+                    {
+                        orphan_dep_hashes.insert(hash_u64);
+                    }
+                }
+            }
+            if !orphan_dep_hashes.is_empty() {
+                let fd_opt =
+                    deps_root_fd.get_or_insert_with(|| open_dir(&profile_dir.join("deps")));
+                if let Some(d_fd) = fd_opt.as_ref()
+                    && let Ok(mut dir) = rustix::fs::Dir::read_from(d_fd)
+                {
+                    while let Some(entry_res) = dir.read() {
+                        let Ok(entry) = entry_res else {
+                            continue;
+                        };
+                        let name = entry.file_name();
+                        if let Ok(name_str) = std::str::from_utf8(name.to_bytes())
+                            && let Some(hash_u64) = extract_16hex_from_dep_name(name_str)
+                                .and_then(parse_16_lower_hex_u64)
+                            && orphan_dep_hashes.contains(&hash_u64)
+                            && let Ok(st) = rustix::fs::statat(
+                                d_fd,
+                                name,
+                                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                            )
+                            && u64::try_from(st.st_mtime).unwrap_or(0) > expected_unix
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+        match ops {
+            SweepOps::V2(v2) => check_v2(v2),
+            SweepOps::V1(v1) => check_v1(v1),
+            SweepOps::Mixed { v2, v1 } => check_v2(v2) || check_v1(v1),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let check_v2 = |v2: &[V2UnitRemoval]| {
+            let build_root = profile_dir.join("build");
+            v2.iter().any(|u| {
+                let unit_dir = build_root.join(u.pkg.as_str()).join(u.unit_hash.as_str());
+                let fp_dir = unit_dir.join("fingerprint");
+                path_mtime_exceeds(&unit_dir, expected_unix)
+                    || path_mtime_exceeds(&fp_dir, expected_unix)
+                    || path_mtime_exceeds(&fp_dir.join("invoked.timestamp"), expected_unix)
+            })
+        };
+        let check_v1 = |v1: &[V1UnitRemoval]| {
+            let fp_root = profile_dir.join(".fingerprint");
+            let build_root = profile_dir.join("build");
+            let deps_root = profile_dir.join("deps");
+            let mut orphan_dep_hashes: HashSet<u64, FastU64BuildHasher> =
+                HashSet::with_hasher(FastU64BuildHasher);
+            for u in v1 {
+                if let Some(fp_name) = u.fingerprint_dir.as_deref() {
+                    let fp_dir = fp_root.join(fp_name);
+                    if path_mtime_exceeds(&fp_dir, expected_unix)
+                        || path_mtime_exceeds(&fp_dir.join("invoked.timestamp"), expected_unix)
+                    {
+                        return true;
+                    }
+                } else {
+                    if u.build_dir
+                        .as_deref()
+                        .is_some_and(|b| path_mtime_exceeds(&build_root.join(b), expected_unix))
+                        || u.dep_entries
+                            .iter()
+                            .any(|d| path_mtime_exceeds(&deps_root.join(d.as_str()), expected_unix))
+                    {
+                        return true;
+                    }
+                    if u.dep_entries.is_empty()
+                        && u.sweep_deps_by_hash
+                        && let Some(hash_u64) = parse_16_lower_hex_u64(&u.unit_hash)
+                    {
+                        orphan_dep_hashes.insert(hash_u64);
+                    }
+                }
+            }
+            if !orphan_dep_hashes.is_empty()
+                && let Ok(entries) = fs::read_dir(&deps_root)
+            {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str()
+                        && let Some(hash_u64) =
+                            extract_16hex_from_dep_name(name).and_then(parse_16_lower_hex_u64)
+                        && orphan_dep_hashes.contains(&hash_u64)
+                        && path_mtime_exceeds(&entry.path(), expected_unix)
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        match ops {
+            SweepOps::V2(v2) => check_v2(v2),
+            SweepOps::V1(v1) => check_v1(v1),
+            SweepOps::Mixed { v2, v1 } => check_v2(v2) || check_v1(v1),
+        }
     }
 }
 
@@ -1294,25 +1443,80 @@ fn incremental_mtime_advanced(
     removals: &[IncrementalRemoval],
     expected_unix: u64,
 ) -> bool {
-    removals.iter().any(|removal| match removal {
-        IncrementalRemoval::WholeCrateDir {
-            dir_name,
-            expected_dir_mtime_unix,
-            ..
-        } => path_mtime_exceeds(&inc_root.join(dir_name.as_str()), *expected_dir_mtime_unix),
-        IncrementalRemoval::SingleSession {
-            crate_dir,
-            session_dir,
-            lock_file,
-            ..
-        } => {
-            let crate_path = inc_root.join(crate_dir.as_str());
-            path_mtime_exceeds(&crate_path.join(session_dir.as_str()), expected_unix)
-                || lock_file
-                    .as_deref()
-                    .is_some_and(|lf| path_mtime_exceeds(&crate_path.join(lf), expected_unix))
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+
+        if removals.is_empty() {
+            return false;
         }
-    })
+        let Ok(inc_root_fd) = open(
+            inc_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let mut rel_buf = String::with_capacity(96);
+        removals.iter().any(|removal| match removal {
+            IncrementalRemoval::WholeCrateDir {
+                dir_name,
+                expected_dir_mtime_unix,
+                ..
+            } => {
+                statat_mtime_status(&inc_root_fd, dir_name.as_str(), *expected_dir_mtime_unix)
+                    == Some(true)
+            }
+            IncrementalRemoval::SingleSession {
+                crate_dir,
+                session_dir,
+                lock_file,
+                ..
+            } => {
+                rel_buf.clear();
+                rel_buf.push_str(crate_dir.as_str());
+                rel_buf.push('/');
+                let prefix_len = rel_buf.len();
+                rel_buf.push_str(session_dir.as_str());
+                if statat_mtime_status(&inc_root_fd, rel_buf.as_str(), expected_unix) == Some(true)
+                {
+                    return true;
+                }
+                if let Some(lf) = lock_file.as_deref() {
+                    rel_buf.truncate(prefix_len);
+                    rel_buf.push_str(lf);
+                    if statat_mtime_status(&inc_root_fd, rel_buf.as_str(), expected_unix)
+                        == Some(true)
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        removals.iter().any(|removal| match removal {
+            IncrementalRemoval::WholeCrateDir {
+                dir_name,
+                expected_dir_mtime_unix,
+                ..
+            } => path_mtime_exceeds(&inc_root.join(dir_name.as_str()), *expected_dir_mtime_unix),
+            IncrementalRemoval::SingleSession {
+                crate_dir,
+                session_dir,
+                lock_file,
+                ..
+            } => {
+                let crate_path = inc_root.join(crate_dir.as_str());
+                path_mtime_exceeds(&crate_path.join(session_dir.as_str()), expected_unix)
+                    || lock_file
+                        .as_deref()
+                        .is_some_and(|lf| path_mtime_exceeds(&crate_path.join(lf), expected_unix))
+            }
+        })
+    }
 }
 
 fn stage_sweep_ops(
@@ -1370,6 +1574,178 @@ fn stage_sweep_ops(
     (moved, moved_bytes, first_error)
 }
 
+fn stage_incremental_removals(
+    inc_root: &Path,
+    staging_dir: &Path,
+    removals: &[IncrementalRemoval],
+    moved_count: &mut u32,
+    moved_bytes: &mut u64,
+    move_error: &mut Option<String>,
+) {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open, openat};
+        use rustix::io::Errno;
+
+        let Ok(staging_fd) = open(
+            staging_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            *move_error = Some("cannot open incremental staging dir".to_owned());
+            return;
+        };
+        let inc_root_fd = match open(
+            inc_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return,
+            Err(error) => {
+                *move_error = Some(format!("open incremental root: {error}"));
+                return;
+            }
+        };
+
+        use std::fmt::Write as _;
+
+        let mut cached_crate: Option<(&str, std::os::fd::OwnedFd)> = None;
+        let mut dst_buf = String::with_capacity(32);
+        for (idx, removal) in removals.iter().enumerate() {
+            match removal {
+                IncrementalRemoval::WholeCrateDir {
+                    dir_name,
+                    allocated_bytes,
+                    ..
+                } => {
+                    dst_buf.clear();
+                    let _ = write!(&mut dst_buf, "inc_crate_{idx}");
+                    match rename_entry_fd(&inc_root_fd, dir_name.as_str(), &staging_fd, &dst_buf) {
+                        Ok(true) => {
+                            *moved_count = moved_count.saturating_add(1);
+                            *moved_bytes = moved_bytes.saturating_add(*allocated_bytes);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            *move_error = Some(format!("rename incremental/{dir_name}: {error}"));
+                            break;
+                        }
+                    }
+                }
+                IncrementalRemoval::SingleSession {
+                    crate_dir,
+                    session_dir,
+                    lock_file,
+                    allocated_bytes,
+                } => {
+                    if cached_crate
+                        .as_ref()
+                        .is_none_or(|(name, _)| *name != crate_dir.as_str())
+                    {
+                        cached_crate = None;
+                        match openat(
+                            &inc_root_fd,
+                            crate_dir.as_str(),
+                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        ) {
+                            Ok(fd) => cached_crate = Some((crate_dir.as_str(), fd)),
+                            Err(Errno::NOENT) => continue,
+                            Err(error) => {
+                                *move_error =
+                                    Some(format!("open incremental/{crate_dir}: {error}"));
+                                break;
+                            }
+                        }
+                    }
+                    let Some((_, ref crate_fd)) = cached_crate else {
+                        continue;
+                    };
+                    dst_buf.clear();
+                    let _ = write!(&mut dst_buf, "inc_sess_{idx}");
+                    match rename_entry_fd(crate_fd, session_dir.as_str(), &staging_fd, &dst_buf) {
+                        Ok(true) => {
+                            *moved_count = moved_count.saturating_add(1);
+                            *moved_bytes = moved_bytes.saturating_add(*allocated_bytes);
+                            if let Some(lf) = lock_file {
+                                dst_buf.clear();
+                                let _ = write!(&mut dst_buf, "inc_lock_{idx}");
+                                let _ =
+                                    rename_entry_fd(crate_fd, lf.as_str(), &staging_fd, &dst_buf);
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            *move_error = Some(format!(
+                                "rename incremental/{crate_dir}/{session_dir}: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        for (idx, removal) in removals.iter().enumerate() {
+            match removal {
+                IncrementalRemoval::WholeCrateDir {
+                    dir_name,
+                    allocated_bytes,
+                    ..
+                } => {
+                    let dst = format!("inc_crate_{idx}");
+                    match rename_entry_atomic(inc_root, dir_name.as_str(), staging_dir, &dst) {
+                        Ok(true) => {
+                            *moved_count = moved_count.saturating_add(1);
+                            *moved_bytes = moved_bytes.saturating_add(*allocated_bytes);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            *move_error = Some(format!("rename incremental/{dir_name}: {error}"));
+                            break;
+                        }
+                    }
+                }
+                IncrementalRemoval::SingleSession {
+                    crate_dir,
+                    session_dir,
+                    lock_file,
+                    allocated_bytes,
+                } => {
+                    let crate_path = inc_root.join(crate_dir.as_str());
+                    let dst = format!("inc_sess_{idx}");
+                    match rename_entry_atomic(&crate_path, session_dir.as_str(), staging_dir, &dst)
+                    {
+                        Ok(true) => {
+                            *moved_count = moved_count.saturating_add(1);
+                            *moved_bytes = moved_bytes.saturating_add(*allocated_bytes);
+                            if let Some(lf) = lock_file {
+                                let lock_dst = format!("inc_lock_{idx}");
+                                let _ = rename_entry_atomic(
+                                    &crate_path,
+                                    lf.as_str(),
+                                    staging_dir,
+                                    &lock_dst,
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            *move_error = Some(format!(
+                                "rename incremental/{crate_dir}/{session_dir}: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn stage_v2_units(
     profile_dir: &Path,
     staging_dir: &Path,
@@ -1379,48 +1755,112 @@ fn stage_v2_units(
     first_error: &mut Option<String>,
 ) {
     let build_root = profile_dir.join("build");
-    let mut touched_pkgs: Vec<&str> = Vec::new();
-    for (idx, unit) in units.iter().enumerate() {
-        let pkg_dir = build_root.join(unit.pkg.as_str());
-        let dst = format!("v2_{idx}_{}", unit.unit_hash);
-        match rename_entry_atomic(&pkg_dir, unit.unit_hash.as_str(), staging_dir, &dst) {
-            Ok(true) => {
-                *moved = moved.saturating_add(1);
-                *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
-                touched_pkgs.push(unit.pkg.as_str());
-            }
-            Ok(false) => {}
-            Err(error) => {
-                *first_error = Some(format!(
-                    "rename V2 build/{}/{}: {error}",
-                    unit.pkg, unit.unit_hash
-                ));
-                break;
-            }
-        }
-    }
-    touched_pkgs.sort_unstable();
-    touched_pkgs.dedup();
-    for pkg in touched_pkgs {
-        remove_empty_dir_best_effort(&build_root, pkg);
-    }
-}
-
-fn remove_empty_dir_best_effort(parent: &Path, name: &str) {
     #[cfg(unix)]
     {
-        use rustix::fs::{AtFlags, Mode, OFlags, open, unlinkat};
-        if let Ok(parent_fd) = open(
-            parent,
+        use rustix::fs::{AtFlags, Mode, OFlags, open, openat, unlinkat};
+        use rustix::io::Errno;
+
+        let Ok(staging_fd) = open(
+            staging_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            *first_error = Some("cannot open V2 staging directory".to_owned());
+            return;
+        };
+        let build_root_fd = match open(
+            &build_root,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
-            let _ = unlinkat(&parent_fd, name, AtFlags::REMOVEDIR);
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return,
+            Err(error) => {
+                *first_error = Some(format!("open V2 build root: {error}"));
+                return;
+            }
+        };
+
+        use std::fmt::Write as _;
+
+        let mut cached_pkg: Option<(&str, std::os::fd::OwnedFd)> = None;
+        let mut touched_pkgs: Vec<&str> = Vec::new();
+        let mut dst_buf = String::with_capacity(48);
+        for (idx, unit) in units.iter().enumerate() {
+            if cached_pkg
+                .as_ref()
+                .is_none_or(|(name, _)| *name != unit.pkg.as_str())
+            {
+                cached_pkg = None;
+                match openat(
+                    &build_root_fd,
+                    unit.pkg.as_str(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => cached_pkg = Some((unit.pkg.as_str(), fd)),
+                    Err(Errno::NOENT) => continue,
+                    Err(error) => {
+                        *first_error = Some(format!("open V2 build/{}: {error}", unit.pkg));
+                        break;
+                    }
+                }
+            }
+            let Some((_, ref pkg_fd)) = cached_pkg else {
+                continue;
+            };
+            dst_buf.clear();
+            let _ = write!(&mut dst_buf, "v2_{idx}_{}", unit.unit_hash);
+            match rename_entry_fd(pkg_fd, unit.unit_hash.as_str(), &staging_fd, &dst_buf) {
+                Ok(true) => {
+                    *moved = moved.saturating_add(1);
+                    *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
+                    touched_pkgs.push(unit.pkg.as_str());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    *first_error = Some(format!(
+                        "rename V2 build/{}/{}: {error}",
+                        unit.pkg, unit.unit_hash
+                    ));
+                    break;
+                }
+            }
+        }
+        drop(cached_pkg);
+        touched_pkgs.sort_unstable();
+        touched_pkgs.dedup();
+        for pkg in touched_pkgs {
+            let _ = unlinkat(&build_root_fd, pkg, AtFlags::REMOVEDIR);
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = fs::remove_dir(parent.join(name));
+        let mut touched_pkgs: Vec<&str> = Vec::new();
+        for (idx, unit) in units.iter().enumerate() {
+            let pkg_dir = build_root.join(unit.pkg.as_str());
+            let dst = format!("v2_{idx}_{}", unit.unit_hash);
+            match rename_entry_atomic(&pkg_dir, unit.unit_hash.as_str(), staging_dir, &dst) {
+                Ok(true) => {
+                    *moved = moved.saturating_add(1);
+                    *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
+                    touched_pkgs.push(unit.pkg.as_str());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    *first_error = Some(format!(
+                        "rename V2 build/{}/{}: {error}",
+                        unit.pkg, unit.unit_hash
+                    ));
+                    break;
+                }
+            }
+        }
+        touched_pkgs.sort_unstable();
+        touched_pkgs.dedup();
+        for pkg in touched_pkgs {
+            let _ = fs::remove_dir(build_root.join(pkg));
+        }
     }
 }
 
@@ -1435,55 +1875,278 @@ fn stage_v1_units(
     let fp_root = profile_dir.join(".fingerprint");
     let build_root = profile_dir.join("build");
     let deps_root = profile_dir.join("deps");
-    for (idx, unit) in units.iter().enumerate() {
-        let mut any_entry_moved = false;
-        // Crash-consistency invariant (Section 4.3): for normal V1 units, rename
-        // `.fingerprint/<dir>` FIRST so Cargo treats the unit as absent even if power is lost
-        // before `deps/` finishes. For orphaned V1 units (`fingerprint_dir == None`), stage
-        // the leftover `build_dir` and `dep_entries` directly.
-        if let Some(fp_dir) = &unit.fingerprint_dir {
-            let fp_dst = format!("v1_fp_{idx}");
-            match rename_entry_atomic(&fp_root, fp_dir.as_str(), staging_dir, &fp_dst) {
-                Ok(true) => {
-                    any_entry_moved = true;
+
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, open};
+        use rustix::io::Errno;
+
+        let open_opt_dir = |p: &Path| -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+            match open(
+                p,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => Ok(Some(fd)),
+                Err(Errno::NOENT) => Ok(None),
+                Err(error) => Err(std::io::Error::from(error)),
+            }
+        };
+
+        let Ok(staging_fd) = open(
+            staging_dir,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            *first_error = Some("cannot open V1 staging directory".to_owned());
+            return;
+        };
+        let fp_root_fd = match open_opt_dir(&fp_root) {
+            Ok(fd) => fd,
+            Err(error) => {
+                *first_error = Some(format!("open V1 .fingerprint root: {error}"));
+                return;
+            }
+        };
+        let build_root_fd = match open_opt_dir(&build_root) {
+            Ok(fd) => fd,
+            Err(error) => {
+                *first_error = Some(format!("open V1 build root: {error}"));
+                return;
+            }
+        };
+        let deps_root_fd = match open_opt_dir(&deps_root) {
+            Ok(fd) => fd,
+            Err(error) => {
+                *first_error = Some(format!("open V1 deps root: {error}"));
+                return;
+            }
+        };
+
+        use std::ffi::CStr;
+        use std::fmt::Write as _;
+
+        let mut dst_buf = String::with_capacity(32);
+        let mut unit_moved = vec![false; units.len()];
+        let mut deferred_dep_hashes: HashMap<u64, usize, FastU64BuildHasher> =
+            HashMap::with_hasher(FastU64BuildHasher);
+
+        for (idx, unit) in units.iter().enumerate() {
+            // Crash-consistency invariant (Section 4.3): for normal V1 units, rename
+            // `.fingerprint/<dir>` FIRST so Cargo treats the unit as absent even if power is lost
+            // before `deps/` finishes. For orphaned V1 units (`fingerprint_dir == None`), stage
+            // the leftover `build_dir` and `dep_entries` directly.
+            if let Some(fp_dir) = &unit.fingerprint_dir {
+                let Some(ref fp_fd) = fp_root_fd else {
+                    continue;
+                };
+                dst_buf.clear();
+                let _ = write!(&mut dst_buf, "v1_fp_{idx}");
+                match rename_entry_fd(fp_fd, fp_dir.as_str(), &staging_fd, &dst_buf) {
+                    Ok(true) => unit_moved[idx] = true,
+                    Ok(false) => continue,
+                    Err(error) => {
+                        *first_error = Some(format!("rename V1 .fingerprint/{fp_dir}: {error}"));
+                        break;
+                    }
                 }
-                Ok(false) => continue,
+            }
+
+            if let Some(build_dir) = &unit.build_dir
+                && let Some(ref b_fd) = build_root_fd
+            {
+                dst_buf.clear();
+                let _ = write!(&mut dst_buf, "v1_build_{idx}");
+                match rename_entry_fd(b_fd, build_dir.as_str(), &staging_fd, &dst_buf) {
+                    Ok(true) => unit_moved[idx] = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        *first_error = Some(format!("rename V1 build/{build_dir}: {error}"));
+                        break;
+                    }
+                }
+            }
+
+            if !unit.dep_entries.is_empty() {
+                if let Some(ref d_fd) = deps_root_fd {
+                    for (dep_idx, dep_entry) in unit.dep_entries.iter().enumerate() {
+                        dst_buf.clear();
+                        let _ = write!(&mut dst_buf, "v1_dep_{idx}_{dep_idx}");
+                        match rename_entry_fd(d_fd, dep_entry.as_str(), &staging_fd, &dst_buf) {
+                            Ok(true) => unit_moved[idx] = true,
+                            Ok(false) => {}
+                            Err(error) => {
+                                *first_error = Some(format!("rename V1 deps/{dep_entry}: {error}"));
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else if unit.sweep_deps_by_hash
+                && let Some(hash_u64) = parse_16_lower_hex_u64(&unit.unit_hash)
+            {
+                deferred_dep_hashes.insert(hash_u64, idx);
+            }
+            if first_error.is_some() {
+                break;
+            }
+        }
+
+        // Single-pass `deps/` scan for units using deferred hash-based dep sweeping.
+        // Collect matched names before mutating `deps/` so APFS `getdirentries` never skips entries.
+        if first_error.is_none()
+            && !deferred_dep_hashes.is_empty()
+            && let Some(ref d_fd) = deps_root_fd
+        {
+            match rustix::fs::Dir::read_from(d_fd) {
+                Ok(mut dir) => {
+                    let mut name_arena: Vec<u8> = Vec::new();
+                    let mut matched: Vec<(usize, usize, usize)> = Vec::new();
+                    while let Some(entry_res) = dir.read() {
+                        let Ok(entry) = entry_res else {
+                            continue;
+                        };
+                        let name = entry.file_name();
+                        let bytes = name.to_bytes();
+                        if bytes == b"." || bytes == b".." {
+                            continue;
+                        }
+                        if let Ok(name_str) = std::str::from_utf8(bytes)
+                            && let Some(hash_u64) = extract_16hex_from_dep_name(name_str)
+                                .and_then(parse_16_lower_hex_u64)
+                            && let Some(&unit_idx) = deferred_dep_hashes.get(&hash_u64)
+                        {
+                            let start = name_arena.len();
+                            name_arena.extend_from_slice(name.to_bytes_with_nul());
+                            matched.push((start, name_arena.len(), unit_idx));
+                        }
+                    }
+                    drop(dir);
+
+                    for (dep_seq, (start, end, unit_idx)) in matched.into_iter().enumerate() {
+                        let Ok(name_cstr) = CStr::from_bytes_with_nul(&name_arena[start..end])
+                        else {
+                            continue;
+                        };
+                        dst_buf.clear();
+                        let _ = write!(&mut dst_buf, "v1_hdep_{unit_idx}_{dep_seq}");
+                        match rustix::fs::renameat(d_fd, name_cstr, &staging_fd, dst_buf.as_str()) {
+                            Ok(()) => unit_moved[unit_idx] = true,
+                            Err(Errno::NOENT) => {}
+                            Err(error) => {
+                                *first_error = Some(format!(
+                                    "rename V1 deps/{}: {}",
+                                    name_cstr.to_string_lossy(),
+                                    std::io::Error::from(error)
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
                 Err(error) => {
-                    *first_error = Some(format!("rename V1 .fingerprint/{fp_dir}: {error}"));
-                    break;
+                    *first_error = Some(format!(
+                        "read V1 deps directory: {}",
+                        std::io::Error::from(error)
+                    ));
                 }
             }
         }
 
-        if let Some(build_dir) = &unit.build_dir {
-            let build_dst = format!("v1_build_{idx}");
-            match rename_entry_atomic(&build_root, build_dir.as_str(), staging_dir, &build_dst) {
-                Ok(true) => any_entry_moved = true,
-                Ok(false) => {}
-                Err(error) => {
-                    *first_error = Some(format!("rename V1 build/{build_dir}: {error}"));
-                    break;
+        for (idx, unit) in units.iter().enumerate() {
+            if unit_moved[idx] {
+                *moved = moved.saturating_add(1);
+                *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mut unit_moved = vec![false; units.len()];
+        let mut deferred_dep_hashes: HashMap<u64, usize, FastU64BuildHasher> =
+            HashMap::with_hasher(FastU64BuildHasher);
+
+        for (idx, unit) in units.iter().enumerate() {
+            if let Some(fp_dir) = &unit.fingerprint_dir {
+                let fp_dst = format!("v1_fp_{idx}");
+                match rename_entry_atomic(&fp_root, fp_dir.as_str(), staging_dir, &fp_dst) {
+                    Ok(true) => unit_moved[idx] = true,
+                    Ok(false) => continue,
+                    Err(error) => {
+                        *first_error = Some(format!("rename V1 .fingerprint/{fp_dir}: {error}"));
+                        break;
+                    }
+                }
+            }
+
+            if let Some(build_dir) = &unit.build_dir {
+                let build_dst = format!("v1_build_{idx}");
+                match rename_entry_atomic(&build_root, build_dir.as_str(), staging_dir, &build_dst)
+                {
+                    Ok(true) => unit_moved[idx] = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        *first_error = Some(format!("rename V1 build/{build_dir}: {error}"));
+                        break;
+                    }
+                }
+            }
+
+            if !unit.dep_entries.is_empty() {
+                for (dep_idx, dep_entry) in unit.dep_entries.iter().enumerate() {
+                    let dep_dst = format!("v1_dep_{idx}_{dep_idx}");
+                    match rename_entry_atomic(&deps_root, dep_entry.as_str(), staging_dir, &dep_dst)
+                    {
+                        Ok(true) => unit_moved[idx] = true,
+                        Ok(false) => {}
+                        Err(error) => {
+                            *first_error = Some(format!("rename V1 deps/{dep_entry}: {error}"));
+                            break;
+                        }
+                    }
+                }
+            } else if unit.sweep_deps_by_hash
+                && let Some(hash_u64) = parse_16_lower_hex_u64(&unit.unit_hash)
+            {
+                deferred_dep_hashes.insert(hash_u64, idx);
+            }
+            if first_error.is_some() {
+                break;
+            }
+        }
+
+        if first_error.is_none()
+            && !deferred_dep_hashes.is_empty()
+            && let Ok(entries) = fs::read_dir(&deps_root)
+        {
+            let matched: Vec<(String, usize)> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_str()?.to_owned();
+                    let hash_u64 =
+                        extract_16hex_from_dep_name(&name).and_then(parse_16_lower_hex_u64)?;
+                    let &unit_idx = deferred_dep_hashes.get(&hash_u64)?;
+                    Some((name, unit_idx))
+                })
+                .collect();
+            for (dep_seq, (name, unit_idx)) in matched.into_iter().enumerate() {
+                let dst = format!("v1_hdep_{unit_idx}_{dep_seq}");
+                match rename_entry_atomic(&deps_root, &name, staging_dir, &dst) {
+                    Ok(true) => unit_moved[unit_idx] = true,
+                    Ok(false) => {}
+                    Err(error) => {
+                        *first_error = Some(format!("rename V1 deps/{name}: {error}"));
+                        break;
+                    }
                 }
             }
         }
 
-        for (dep_idx, dep_entry) in unit.dep_entries.iter().enumerate() {
-            let dep_dst = format!("v1_dep_{idx}_{dep_idx}");
-            match rename_entry_atomic(&deps_root, dep_entry.as_str(), staging_dir, &dep_dst) {
-                Ok(true) => any_entry_moved = true,
-                Ok(false) => {}
-                Err(error) => {
-                    *first_error = Some(format!("rename V1 deps/{dep_entry}: {error}"));
-                    break;
-                }
+        for (idx, unit) in units.iter().enumerate() {
+            if unit_moved[idx] {
+                *moved = moved.saturating_add(1);
+                *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
             }
-        }
-        if first_error.is_some() {
-            break;
-        }
-        if any_entry_moved {
-            *moved = moved.saturating_add(1);
-            *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
         }
     }
 }
@@ -1524,6 +2187,23 @@ fn create_internal_staging_dir(target_root: &Path, expected_dev: u64) -> Result<
     })
 }
 
+#[cfg(unix)]
+fn rename_entry_fd(
+    src_dir_fd: &std::os::fd::OwnedFd,
+    src_name: &str,
+    dst_dir_fd: &std::os::fd::OwnedFd,
+    dst_name: &str,
+) -> std::io::Result<bool> {
+    use rustix::fs::renameat;
+    use rustix::io::Errno;
+
+    match renameat(src_dir_fd, src_name, dst_dir_fd, dst_name) {
+        Ok(()) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
+        Err(error) => Err(std::io::Error::from(error)),
+    }
+}
+
 /// Atomically rename `src_parent/src_name` to `dst_parent/dst_name` via `rustix::fs::renameat`
 /// (opening both parent directories with `O_NOFOLLOW | O_DIRECTORY`).
 /// Returns `Ok(true)` if moved, `Ok(false)` if source did not exist (`ENOENT`).
@@ -1535,7 +2215,7 @@ fn rename_entry_atomic(
 ) -> std::io::Result<bool> {
     #[cfg(unix)]
     {
-        use rustix::fs::{Mode, OFlags, open, renameat};
+        use rustix::fs::{Mode, OFlags, open};
         use rustix::io::Errno;
 
         let src_dir_fd = match open(
@@ -1554,11 +2234,7 @@ fn rename_entry_atomic(
         )
         .map_err(std::io::Error::from)?;
 
-        match renameat(&src_dir_fd, src_name, &dst_dir_fd, dst_name) {
-            Ok(()) => Ok(true),
-            Err(Errno::NOENT) => Ok(false),
-            Err(error) => Err(std::io::Error::from(error)),
-        }
+        rename_entry_fd(&src_dir_fd, src_name, &dst_dir_fd, dst_name)
     }
     #[cfg(not(unix))]
     {
@@ -1571,9 +2247,16 @@ fn rename_entry_atomic(
     }
 }
 
+#[cfg(unix)]
+#[derive(Default)]
+struct RemoveScratch {
+    name_arena: Vec<u8>,
+    entries: Vec<(usize, usize, bool)>,
+}
+
 /// FD-anchored safe directory tree removal (`rustix::fs`):
 /// `openat(O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)` -> `fstat.st_dev == expected_dev`
-/// -> bounded depth-64 `Dir` + `statat(SYMLINK_NOFOLLOW)` -> `unlinkat(REMOVEDIR)` / `unlinkat(empty)`.
+/// -> bounded depth-64 `Dir` -> `unlinkat(REMOVEDIR)` / `unlinkat(empty)`.
 /// Never follows symlinks and never crosses device boundaries.
 pub(crate) fn remove_tree_safe(root: &Path, expected_dev: u64) -> Result<(), AppError> {
     #[cfg(unix)]
@@ -1630,7 +2313,8 @@ pub(crate) fn remove_tree_safe(root: &Path, expected_dev: u64) -> Result<(), App
         }
         ensure_dir_fd_writable(&root_fd, &st);
 
-        clear_dir_fd_recursive(&root_fd, expected_dev, 0, root)?;
+        let mut scratch = RemoveScratch::default();
+        clear_dir_fd_recursive(&root_fd, expected_dev, 0, root, &mut scratch)?;
         drop(root_fd);
 
         match unlinkat(&parent_fd, leaf_name, AtFlags::REMOVEDIR) {
@@ -1654,7 +2338,10 @@ fn clear_dir_fd_recursive(
     expected_dev: u64,
     depth: usize,
     diag_root: &Path,
+    scratch: &mut RemoveScratch,
 ) -> Result<(), AppError> {
+    use std::ffi::CStr;
+
     use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, openat, statat, unlinkat};
     use rustix::io::Errno;
 
@@ -1671,7 +2358,9 @@ fn clear_dir_fd_recursive(
         message: format!("Dir::read_from failed: {error}"),
     })?;
 
-    let mut entries: Vec<(std::ffi::CString, bool)> = Vec::new();
+    let arena_mark = scratch.name_arena.len();
+    let entries_mark = scratch.entries.len();
+
     for entry_res in dir.by_ref() {
         let entry = entry_res.map_err(|error| AppError::InvalidPath {
             path: diag_root.to_path_buf(),
@@ -1682,34 +2371,57 @@ fn clear_dir_fd_recursive(
         if bytes == b"." || bytes == b".." {
             continue;
         }
-        let st = match statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(st) => st,
-            Err(Errno::NOENT) => continue,
-            Err(error) => {
+        let ft = entry.file_type();
+        let is_dir = if ft == FileType::Directory {
+            // `openat(..., O_DIRECTORY | O_NOFOLLOW)` + `fstat(&child_fd)` below verifies both
+            // directory identity and `st_dev == expected_dev` without a redundant pre-stat.
+            true
+        } else if ft == FileType::Unknown {
+            let st = match statat(dir_fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => st,
+                Err(Errno::NOENT) => continue,
+                Err(error) => {
+                    return Err(AppError::InvalidPath {
+                        path: diag_root.to_path_buf(),
+                        message: format!("statat failed during safe remove: {error}"),
+                    });
+                }
+            };
+            let d = FileType::from_raw_mode(st.st_mode) == FileType::Directory;
+            #[allow(clippy::unnecessary_cast)]
+            let entry_dev = st.st_dev as u64;
+            if d && entry_dev != expected_dev {
                 return Err(AppError::InvalidPath {
                     path: diag_root.to_path_buf(),
-                    message: format!("statat failed during safe remove: {error}"),
+                    message: "encountered mount point inside staging tree".to_owned(),
                 });
             }
+            d
+        } else {
+            // Guaranteed non-directory (`RegularFile`, `Symlink`, etc.): skip redundant `statat`
+            // and unlink directly without following symlinks.
+            false
         };
-        let is_dir = FileType::from_raw_mode(st.st_mode) == FileType::Directory;
-        #[allow(clippy::unnecessary_cast)]
-        let entry_dev = st.st_dev as u64;
-        if is_dir && entry_dev != expected_dev {
-            return Err(AppError::InvalidPath {
-                path: diag_root.to_path_buf(),
-                message: "encountered mount point inside staging tree".to_owned(),
-            });
-        }
-        entries.push((name.to_owned(), is_dir));
+        let start = scratch.name_arena.len();
+        scratch
+            .name_arena
+            .extend_from_slice(name.to_bytes_with_nul());
+        scratch
+            .entries
+            .push((start, scratch.name_arena.len(), is_dir));
     }
     drop(dir);
 
-    for (name, is_dir) in entries {
+    let entries_end = scratch.entries.len();
+    for entry_idx in entries_mark..entries_end {
+        let (start, end, is_dir) = scratch.entries[entry_idx];
+        let Ok(name_cstr) = CStr::from_bytes_with_nul(&scratch.name_arena[start..end]) else {
+            continue;
+        };
         if is_dir {
             let child_fd = match openat(
                 dir_fd,
-                name.as_c_str(),
+                name_cstr,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             ) {
@@ -1735,9 +2447,12 @@ fn clear_dir_fd_recursive(
                 });
             }
             ensure_dir_fd_writable(&child_fd, &cst);
-            clear_dir_fd_recursive(&child_fd, expected_dev, depth + 1, diag_root)?;
+            clear_dir_fd_recursive(&child_fd, expected_dev, depth + 1, diag_root, scratch)?;
             drop(child_fd);
-            match unlinkat(dir_fd, name.as_c_str(), AtFlags::REMOVEDIR) {
+            let Ok(name_cstr) = CStr::from_bytes_with_nul(&scratch.name_arena[start..end]) else {
+                continue;
+            };
+            match unlinkat(dir_fd, name_cstr, AtFlags::REMOVEDIR) {
                 Ok(()) | Err(Errno::NOENT) => {}
                 Err(error) => {
                     return Err(AppError::InvalidPath {
@@ -1748,7 +2463,7 @@ fn clear_dir_fd_recursive(
             }
         } else {
             // Regular files, symlinks (unlinked directly, NEVER followed), fifos, sockets
-            match unlinkat(dir_fd, name.as_c_str(), AtFlags::empty()) {
+            match unlinkat(dir_fd, name_cstr, AtFlags::empty()) {
                 Ok(()) | Err(Errno::NOENT) => {}
                 Err(error) => {
                     return Err(AppError::InvalidPath {
@@ -1760,6 +2475,8 @@ fn clear_dir_fd_recursive(
         }
     }
 
+    scratch.name_arena.truncate(arena_mark);
+    scratch.entries.truncate(entries_mark);
     Ok(())
 }
 
@@ -1851,11 +2568,7 @@ mod tests {
             })
         }
         fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
-            Ok(ProcessSnapshot {
-                captured_at_unix: self.now,
-                self_pid: std::process::id(),
-                processes: vec![],
-            })
+            Ok(ProcessSnapshot::empty(self.now, std::process::id()))
         }
         fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
             Ok(vec![MountEntry {
@@ -2087,11 +2800,13 @@ mod tests {
             profile_locks: SmallVec::new(),
             ops: SweepOps::V1(vec![V1UnitRemoval {
                 fingerprint_dir: Some(CompactString::new("demo-0123456789abcdef")),
+                unit_hash: CompactString::new("0123456789abcdef"),
                 build_dir: Some(CompactString::new("demo-0123456789abcdef")),
                 dep_entries: vec![
                     CompactString::new("demo-0123456789abcdef.dSYM"),
                     CompactString::new("libdemo-0123456789abcdef.rlib"),
                 ],
+                sweep_deps_by_hash: false,
                 allocated_bytes: 200,
                 reason: SweepUnitReason::StaleRustcHash,
             }]),
@@ -2119,8 +2834,10 @@ mod tests {
             profile_locks: SmallVec::new(),
             ops: SweepOps::V1(vec![V1UnitRemoval {
                 fingerprint_dir: Some(CompactString::new("other-1111111111111111")),
+                unit_hash: CompactString::new("1111111111111111"),
                 build_dir: Some(CompactString::new("other-1111111111111111")),
                 dep_entries: vec![CompactString::new("libother-1111111111111111.rlib")],
+                sweep_deps_by_hash: false,
                 allocated_bytes: 200,
                 reason: SweepUnitReason::StaleRustcHash,
             }]),
@@ -2147,8 +2864,10 @@ mod tests {
             profile_locks: SmallVec::new(),
             ops: SweepOps::V1(vec![V1UnitRemoval {
                 fingerprint_dir: None,
+                unit_hash: CompactString::new("1111111111111111"),
                 build_dir: Some(CompactString::new("other-1111111111111111")),
                 dep_entries: vec![CompactString::new("libother-1111111111111111.rlib")],
+                sweep_deps_by_hash: false,
                 allocated_bytes: 200,
                 reason: SweepUnitReason::IncompleteAbortedUnit,
             }]),
@@ -2166,12 +2885,12 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         use super::execute_plan;
-        use crate::model::{EvictRule, ProcessEntry, ReclaimPlan};
+        use crate::model::{EvictRule, ReclaimPlan, TestProcessEntry};
 
         struct DynamicPlatform {
             now: u64,
             free_bytes: AtomicU64,
-            procs: Vec<ProcessEntry>,
+            procs: Vec<TestProcessEntry>,
         }
 
         impl Platform for DynamicPlatform {
@@ -2190,11 +2909,11 @@ mod tests {
                 })
             }
             fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
-                Ok(ProcessSnapshot {
-                    captured_at_unix: self.now,
-                    self_pid: std::process::id(),
-                    processes: self.procs.clone(),
-                })
+                Ok(ProcessSnapshot::from_test_entries(
+                    self.now,
+                    std::process::id(),
+                    self.procs.clone(),
+                ))
             }
             fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
                 Ok(vec![MountEntry {
@@ -2282,7 +3001,7 @@ mod tests {
         let busy_plat = DynamicPlatform {
             now: future,
             free_bytes: AtomicU64::new(40 * GIB),
-            procs: vec![ProcessEntry {
+            procs: vec![TestProcessEntry {
                 pid: 7777,
                 comm: CompactString::new("zsh"),
                 exe_path: None,
@@ -2331,11 +3050,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn revalidation_allows_newer_rustc_info_for_doc_and_blocks_worktree_compiler_or_pin_marker() {
-        use crate::model::ProcessEntry;
+        use crate::model::TestProcessEntry;
 
         struct ProcPlatform {
             now: u64,
-            procs: Vec<ProcessEntry>,
+            procs: Vec<TestProcessEntry>,
         }
         impl Platform for ProcPlatform {
             fn euid(&self) -> Result<u32, AppError> {
@@ -2353,11 +3072,11 @@ mod tests {
                 })
             }
             fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
-                Ok(ProcessSnapshot {
-                    captured_at_unix: self.now,
-                    self_pid: std::process::id(),
-                    processes: self.procs.clone(),
-                })
+                Ok(ProcessSnapshot::from_test_entries(
+                    self.now,
+                    std::process::id(),
+                    self.procs.clone(),
+                ))
             }
             fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
                 Ok(vec![MountEntry {
@@ -2446,7 +3165,7 @@ mod tests {
         };
         let compiler_plat = ProcPlatform {
             now: meta_mtime_unix(&ri_meta) + 100,
-            procs: vec![ProcessEntry {
+            procs: vec![TestProcessEntry {
                 pid: 4242,
                 comm: CompactString::new("cargo"),
                 exe_path: None,
@@ -2636,5 +3355,280 @@ mod tests {
         let res_evict = execute_action(&evict_after_sweep, &plat, DiskPressure::Calm, false);
         assert_eq!(res_evict.outcome, ActionOutcome::Applied);
         assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_anchored_mtime_revalidation_detects_exact_boundary_for_v2_v1_and_incremental() {
+        use super::{incremental_mtime_advanced, sweep_unit_mtime_advanced};
+        use crate::model::{
+            IncrementalRemoval, SweepOps, SweepUnitReason, V1UnitRemoval, V2UnitRemoval,
+        };
+
+        let set_mtime = |p: &Path, secs: i64| {
+            let ts = rustix::fs::Timespec {
+                tv_sec: secs,
+                tv_nsec: 0,
+            };
+            rustix::fs::utimensat(
+                rustix::fs::CWD,
+                p,
+                &rustix::fs::Timestamps {
+                    last_access: ts,
+                    last_modification: ts,
+                },
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path().join("debug");
+        let base_ts: i64 = 1_700_000_000;
+        let expected = base_ts as u64;
+
+        // V2 tree
+        let v2_fp = profile.join("build/demo/0123456789abcdef/fingerprint");
+        fs::create_dir_all(&v2_fp).unwrap();
+        let v2_inv = v2_fp.join("invoked.timestamp");
+        fs::write(&v2_inv, b"").unwrap();
+        set_mtime(&v2_inv, base_ts);
+        set_mtime(&v2_fp, base_ts);
+        set_mtime(v2_fp.parent().unwrap(), base_ts);
+
+        let v2_ops = SweepOps::V2(vec![
+            V2UnitRemoval {
+                pkg: CompactString::new("missing_pkg"),
+                unit_hash: CompactString::new("aaaaaaaaaaaaaaaa"),
+                allocated_bytes: 0,
+                reason: SweepUnitReason::UnreachableDuplicate,
+            },
+            V2UnitRemoval {
+                pkg: CompactString::new("demo"),
+                unit_hash: CompactString::new("0123456789abcdef"),
+                allocated_bytes: 0,
+                reason: SweepUnitReason::UnreachableDuplicate,
+            },
+        ]);
+        // Exact boundary (`== expected`) must NOT trigger
+        assert!(!sweep_unit_mtime_advanced(&profile, &v2_ops, expected));
+        // Bumping `invoked.timestamp` by 1s MUST trigger
+        set_mtime(&v2_inv, base_ts + 1);
+        assert!(sweep_unit_mtime_advanced(&profile, &v2_ops, expected));
+        set_mtime(&v2_inv, base_ts);
+        set_mtime(&v2_fp, base_ts);
+        assert!(!sweep_unit_mtime_advanced(&profile, &v2_ops, expected));
+
+        // V1 normal + orphan tree
+        let v1_fp = profile.join(".fingerprint/demo-fedcba9876543210");
+        let v1_deps = profile.join("deps");
+        fs::create_dir_all(&v1_fp).unwrap();
+        fs::create_dir_all(&v1_deps).unwrap();
+        let v1_inv = v1_fp.join("invoked.timestamp");
+        let orphan_dep = v1_deps.join("liborph-1111111111111111.rlib");
+        fs::write(&v1_inv, b"").unwrap();
+        fs::write(&orphan_dep, b"data").unwrap();
+        set_mtime(&v1_inv, base_ts);
+        set_mtime(&v1_fp, base_ts);
+        set_mtime(&orphan_dep, base_ts);
+
+        let v1_ops = SweepOps::V1(vec![
+            V1UnitRemoval {
+                fingerprint_dir: Some(CompactString::new("demo-fedcba9876543210")),
+                unit_hash: CompactString::new("fedcba9876543210"),
+                build_dir: None,
+                dep_entries: Vec::new(),
+                sweep_deps_by_hash: false,
+                allocated_bytes: 0,
+                reason: SweepUnitReason::UnreachableDuplicate,
+            },
+            V1UnitRemoval {
+                fingerprint_dir: None,
+                unit_hash: CompactString::new("1111111111111111"),
+                build_dir: None,
+                dep_entries: vec![CompactString::new("liborph-1111111111111111.rlib")],
+                sweep_deps_by_hash: false,
+                allocated_bytes: 0,
+                reason: SweepUnitReason::IncompleteAbortedUnit,
+            },
+        ]);
+        assert!(!sweep_unit_mtime_advanced(&profile, &v1_ops, expected));
+        set_mtime(&orphan_dep, base_ts + 1);
+        assert!(sweep_unit_mtime_advanced(&profile, &v1_ops, expected));
+        set_mtime(&orphan_dep, base_ts);
+        assert!(!sweep_unit_mtime_advanced(&profile, &v1_ops, expected));
+
+        // Deferred hash-based V1 orphan mtime revalidation MUST also detect exact boundary!
+        let v1_deferred_ops = SweepOps::V1(vec![V1UnitRemoval {
+            fingerprint_dir: None,
+            unit_hash: CompactString::new("1111111111111111"),
+            build_dir: None,
+            dep_entries: Vec::new(),
+            sweep_deps_by_hash: true,
+            allocated_bytes: 0,
+            reason: SweepUnitReason::IncompleteAbortedUnit,
+        }]);
+        assert!(!sweep_unit_mtime_advanced(
+            &profile,
+            &v1_deferred_ops,
+            expected
+        ));
+        set_mtime(&orphan_dep, base_ts + 1);
+        assert!(sweep_unit_mtime_advanced(
+            &profile,
+            &v1_deferred_ops,
+            expected
+        ));
+        set_mtime(&orphan_dep, base_ts);
+        assert!(!sweep_unit_mtime_advanced(
+            &profile,
+            &v1_deferred_ops,
+            expected
+        ));
+
+        // Incremental WholeCrateDir + SingleSession + lock_file
+        let inc_root = profile.join("incremental");
+        let crate_dir = inc_root.join("app-1234");
+        let sess_dir = crate_dir.join("s-abc-123-working");
+        let lock_file = crate_dir.join("s-abc-123.lock");
+        fs::create_dir_all(&sess_dir).unwrap();
+        fs::write(&lock_file, b"").unwrap();
+        set_mtime(&sess_dir, base_ts);
+        set_mtime(&lock_file, base_ts);
+        set_mtime(&crate_dir, base_ts);
+
+        let inc_removals = vec![IncrementalRemoval::SingleSession {
+            crate_dir: CompactString::new("app-1234"),
+            session_dir: CompactString::new("s-abc-123-working"),
+            lock_file: Some(CompactString::new("s-abc-123.lock")),
+            allocated_bytes: 0,
+        }];
+        assert!(!incremental_mtime_advanced(
+            &inc_root,
+            &inc_removals,
+            expected
+        ));
+        set_mtime(&lock_file, base_ts + 1);
+        assert!(incremental_mtime_advanced(
+            &inc_root,
+            &inc_removals,
+            expected
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deferred_v1_sweep_preserves_live_and_fingerprint_first_and_detects_open_dep_paths() {
+        use super::path_hits_swept_unit;
+        use crate::model::{SweepOps, SweepUnitReason, V1UnitRemoval};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        let profile = target.join("debug");
+        let fp_stale = profile.join(".fingerprint/stale-1111111111111111");
+        let build_stale = profile.join("build/stale-1111111111111111");
+        let build_missing_fp = profile.join("build/ghost-2222222222222222");
+        let deps = profile.join("deps");
+        fs::create_dir_all(&fp_stale).unwrap();
+        fs::create_dir_all(&build_stale).unwrap();
+        fs::create_dir_all(&build_missing_fp).unwrap();
+        fs::create_dir_all(deps.join("stale-1111111111111111.dSYM/Contents")).unwrap();
+
+        fs::write(fp_stale.join("lib-stale.json"), b"{}").unwrap();
+        fs::write(build_stale.join("out.rs"), b"// stale").unwrap();
+        fs::write(build_missing_fp.join("out.rs"), b"// must survive").unwrap();
+        fs::write(deps.join("libstale-1111111111111111.rlib"), b"stale").unwrap();
+        fs::write(
+            deps.join("stale-1111111111111111.abc123.rcgu.o"),
+            b"stale_obj",
+        )
+        .unwrap();
+        // Belongs to unit whose `.fingerprint/` disappeared before staging -> MUST NOT be deleted
+        fs::write(deps.join("libghost-2222222222222222.rlib"), b"keep_ghost").unwrap();
+        // Orphan unit (`fingerprint_dir: None`) -> MUST be deleted
+        fs::write(deps.join("liborphan-3333333333333333.rlib"), b"orphan").unwrap();
+        // Live unit -> MUST NOT be touched
+        fs::write(deps.join("liblive-4444444444444444.rlib"), b"live").unwrap();
+
+        let ops = SweepOps::V1(vec![
+            V1UnitRemoval {
+                fingerprint_dir: Some(CompactString::new("stale-1111111111111111")),
+                unit_hash: CompactString::new("1111111111111111"),
+                build_dir: Some(CompactString::new("stale-1111111111111111")),
+                dep_entries: Vec::new(),
+                sweep_deps_by_hash: true,
+                allocated_bytes: 4096,
+                reason: SweepUnitReason::UnreachableDuplicate,
+            },
+            V1UnitRemoval {
+                fingerprint_dir: Some(CompactString::new("ghost-2222222222222222")),
+                unit_hash: CompactString::new("2222222222222222"),
+                build_dir: Some(CompactString::new("ghost-2222222222222222")),
+                dep_entries: Vec::new(),
+                sweep_deps_by_hash: true,
+                allocated_bytes: 4096,
+                reason: SweepUnitReason::UnreachableDuplicate,
+            },
+            V1UnitRemoval {
+                fingerprint_dir: None,
+                unit_hash: CompactString::new("3333333333333333"),
+                build_dir: None,
+                dep_entries: Vec::new(),
+                sweep_deps_by_hash: true,
+                allocated_bytes: 4096,
+                reason: SweepUnitReason::IncompleteAbortedUnit,
+            },
+        ]);
+
+        // Verify zero-alloc `path_hits_swept_unit` matches deferred hashes accurately.
+        assert!(path_hits_swept_unit(
+            &deps.join("stale-1111111111111111.abc123.rcgu.o"),
+            &profile,
+            &ops
+        ));
+        assert!(path_hits_swept_unit(
+            &deps.join("liborphan-3333333333333333.rlib"),
+            &profile,
+            &ops
+        ));
+        assert!(!path_hits_swept_unit(
+            &deps.join("liblive-4444444444444444.rlib"),
+            &profile,
+            &ops
+        ));
+
+        let target_meta = fs::symlink_metadata(&target).unwrap();
+        let (tdev, tino) = (meta_dev(&target_meta), meta_ino(&target_meta));
+        let plat = RealLockTestPlatform { now: 1_800_000_000 };
+        let action = ReclaimAction::SweepBuildUnits {
+            target_root: target,
+            target_dev: tdev,
+            target_ino: tino,
+            expected_profile_mtime_unix: u64::MAX,
+            expected_activity_unix: u64::MAX,
+            expected_target_activity_unix: u64::MAX,
+            worktree_root: None,
+            profile_rel: PathBuf::from("debug"),
+            profile_locks: SmallVec::new(),
+            ops,
+            estimated_allocated_bytes: 12288,
+        };
+        let receipt = execute_action(&action, &plat, DiskPressure::Calm, false);
+        assert_eq!(receipt.outcome, ActionOutcome::Applied);
+
+        // Stale normal unit and orphan unit removed completely
+        assert!(!fp_stale.exists());
+        assert!(!build_stale.exists());
+        assert!(!deps.join("libstale-1111111111111111.rlib").exists());
+        assert!(!deps.join("stale-1111111111111111.abc123.rcgu.o").exists());
+        assert!(!deps.join("stale-1111111111111111.dSYM").exists());
+        assert!(!deps.join("liborphan-3333333333333333.rlib").exists());
+
+        // Unit whose `.fingerprint/` was absent MUST retain its `build/` and `deps/` (fail-closed)
+        assert!(build_missing_fp.exists());
+        assert!(deps.join("libghost-2222222222222222.rlib").exists());
+
+        // Live unit untouched
+        assert!(deps.join("liblive-4444444444444444.rlib").exists());
     }
 }
