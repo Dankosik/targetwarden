@@ -1023,8 +1023,7 @@ fn decode_lsof_cow<'a>(raw: &'a [u8], scratch: &'a mut Vec<u8>) -> Result<&'a [u
 
 /// Decode lsof escape sequences (`\\`, `\n`, `\r`, `\t`, `\b`, `\f`, `\a`, `\xHH`).
 /// Fails closed on any unrecognized or truncated escape.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn decode_lsof_bytes(raw: &[u8]) -> Result<Vec<u8>, AppError> {
     let mut scratch = Vec::new();
     Ok(decode_lsof_cow(raw, &mut scratch)?.to_vec())

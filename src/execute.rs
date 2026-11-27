@@ -3516,6 +3516,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn deferred_v1_sweep_preserves_live_and_fingerprint_first_and_detects_open_dep_paths() {
         use super::path_hits_swept_unit;

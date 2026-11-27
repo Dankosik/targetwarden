@@ -4877,9 +4877,6 @@ fn sum_dir_fd_recursive(
         MtimePolicy::V2UnitFingerprint { unit_depth } => depth == unit_depth,
     };
     if stat_self_dir && let Ok(st) = dir.stat() {
-        out.bytes = out
-            .bytes
-            .saturating_add(stat_allocated_bytes(&st, true, hardlinks));
         out.max_mtime = out.max_mtime.max(u64::try_from(st.st_mtime).unwrap_or(0));
     }
 
@@ -5021,9 +5018,12 @@ fn sum_dir_fd_recursive(
 #[cfg(unix)]
 #[inline]
 fn stat_allocated_bytes(st: &rustix::fs::Stat, is_dir: bool, hardlinks: &mut HardlinkSet) -> u64 {
+    if is_dir {
+        return 0;
+    }
     let blocks = u64::try_from(st.st_blocks).unwrap_or(0);
     let bytes = blocks.saturating_mul(512);
-    if !is_dir && st.st_nlink > 1 {
+    if st.st_nlink > 1 {
         #[allow(clippy::unnecessary_cast)]
         let dev = st.st_dev as u64;
         #[allow(clippy::unnecessary_cast)]
@@ -5061,8 +5061,11 @@ fn file_identity(path: &Path, meta: &fs::Metadata) -> (u64, u64) {
 }
 
 fn entry_allocated_bytes(meta: &fs::Metadata, hardlinks: &mut HardlinkSet) -> u64 {
+    if meta.is_dir() {
+        return 0;
+    }
     let bytes = meta_blocks(meta).saturating_mul(512);
-    if !meta.is_dir() && meta_nlink(meta) > 1 {
+    if meta_nlink(meta) > 1 {
         hardlinks.insert_and_count(meta_dev(meta), meta_ino(meta), bytes)
     } else {
         bytes
