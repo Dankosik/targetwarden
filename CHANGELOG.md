@@ -7,6 +7,33 @@ section of the tagged version as its release notes.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-28
+
+### Changed
+
+- Stream `lsof` output directly into a cross-PID interned byte-arena `PathPool`
+  and compact `BuildUnit`/`ProfileDir` storage, eliminating per-FD `PathBuf`
+  churn and raw V1 `deps/` filename retention (4.1–4.9× lower peak memory on
+  multi-target scans and reclaims).
+- Switch profile discovery, `.fingerprint/*.json` reads, post-lock
+  revalidation, and safe tree removal to FD-anchored `rustix` syscalls with
+  reusable scratch buffers and deterministic single-threaded target scanning to
+  eliminate APFS metadata lock contention (20–55% lower system CPU and cycles).
+- Release `ScanSnapshot` and safety verdicts before executing reclaim plans,
+  tail-seek `actions.jsonl` from EOF when reading recent history, and stream
+  text reports without constructing JSON intermediate structs.
+- Set `MallocSpaceEfficient=1` in the rendered macOS LaunchAgent plist,
+  reducing sleeping `watch` daemon physical memory footprint from ~10.7 MB to
+  ~1.0 MB.
+
+### Fixed
+
+- Disable primary-device `d_ino` hardlink `statat` skipping when `/sbin/mount`
+  is unavailable (fail-closed) and align symlink accounting between `Inventory`
+  and `Full` scan modes.
+- Open fingerprint JSON and companion files with `O_NONBLOCK` and handle
+  `PathPool` bounds fail-closed without panicking.
+
 ## [0.1.0] - 2026-11-27
 
 ### Added
@@ -34,5 +61,6 @@ section of the tagged version as its release notes.
 - Native macOS release archives (`aarch64-apple-darwin`, `x86_64-apple-darwin`),
   `SHA256SUMS`, build provenance attestations, and `install.sh`.
 
-[Unreleased]: https://github.com/Dankosik/targetwarden/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Dankosik/targetwarden/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Dankosik/targetwarden/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Dankosik/targetwarden/releases/tag/v0.1.0
