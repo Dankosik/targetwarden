@@ -4,7 +4,7 @@ Automatic safe Cargo `target/` disk reclaimer for macOS workstations running par
 
 [Specification](specs/targetwarden/README.md) · [Empirical Research](specs/targetwarden/research.md) · [Implementation Plan](specs/targetwarden/plan.md) · [Architecture](docs/architecture.md)
 
-> **Status:** Stage 0 repository scaffold complete (specification, verified `R1`–`R5` research, architecture, CI/template gates, and CLI skeleton). Subcommands beyond `--help`, `--version`, and `completions` are scheduled in Stages 1–4.
+> **Status:** Stages 1–4 (`T1–T14`) implemented and verified on macOS (`status`, `scan`, `reclaim`, `watch`, `pin`, `unpin`, `history`, `install`, `uninstall`, `completions`). Next: 48-hour `watch --dry-run` field soak (`T15`) and `v0.1.0` release packaging (`T16`).
 
 ## What `targetwarden` solves
 
@@ -15,7 +15,7 @@ On workstations running parallel AI agents (`Antigravity`, `Codex`, `Claude Code
 1. **Surgical intra-target sweep (`R2` + `R3`):** builds an exact dependency reachability graph from `fingerprint/*.json` (supporting `BuildDirV2` in Cargo `1.100+`, `LegacyV1` in `1.98`–`1.99`, and `MixedV1V2` profiles) and prunes two-level `incremental/` sessions (`Finalized` vs orphaned `Working`), preserving hot caches without touching active builds.
 2. **Pressure-aware target eviction (`R1`, `R4`, `R5`):** evicts dead/merged worktree targets and cooled worktrees under an APFS GiB hysteresis state machine (`Calm` / `Elevated` / `High` / `Critical`) with a `ReclaimHoldState` circuit breaker for macOS local APFS snapshots (`tmutil`).
 
-## Planned CLI interface
+## CLI interface
 
 ```sh
 targetwarden status [--format text|json]
