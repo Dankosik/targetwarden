@@ -212,16 +212,37 @@ pub(crate) fn plan(
                         worktree_tier_label(target.worktree_kind)
                     )),
                 );
-                // Replace any redundant sweep estimates for this target/nested children with full eviction bytes.
+                // Replace any redundant sweep or already-queued descendant eviction actions
+                // (e.g. an older nested child selected earlier by R4 or R5) with the single
+                // parent eviction so bytes are never double-counted and child removal never
+                // bumps the parent directory's mtime before parent eviction revalidates.
                 let dropped_sweep_bytes: u64 = sweep_actions_by_target
                     .iter()
                     .filter(|(root, _)| root.starts_with(&target.root))
                     .map(|(_, a)| a.estimated_allocated_bytes())
                     .fold(0u64, u64::saturating_add);
                 sweep_actions_by_target.retain(|(root, _)| !root.starts_with(&target.root));
+
+                let dropped_r5_bytes: u64 = r5_actions
+                    .iter()
+                    .filter(|a| a.target_root().starts_with(&target.root))
+                    .map(ReclaimAction::estimated_allocated_bytes)
+                    .fold(0u64, u64::saturating_add);
+                r5_actions.retain(|a| !a.target_root().starts_with(&target.root));
+
+                let dropped_r1_r4_bytes: u64 = evict_r1_r4_actions
+                    .iter()
+                    .filter(|a| a.target_root().starts_with(&target.root))
+                    .map(ReclaimAction::estimated_allocated_bytes)
+                    .fold(0u64, u64::saturating_add);
+                evict_r1_r4_actions.retain(|a| !a.target_root().starts_with(&target.root));
+
+                let dropped_bytes = dropped_sweep_bytes
+                    .saturating_add(dropped_r5_bytes)
+                    .saturating_add(dropped_r1_r4_bytes);
                 let total_evict_bytes = action.estimated_allocated_bytes();
                 projected_free = projected_free
-                    .saturating_sub(dropped_sweep_bytes)
+                    .saturating_sub(dropped_bytes)
                     .saturating_add(total_evict_bytes);
 
                 evicted_roots.insert(target.root.clone());
@@ -937,6 +958,93 @@ mod tests {
                 target_root,
                 ..
             } if target_root == Path::new("/nongit/target")
+        ));
+    }
+
+    #[test]
+    fn r5_subsumes_older_nested_child_without_double_counting_bytes_or_duplicating_actions() {
+        let cfg = Config::default();
+        // High pressure: free = 40 GiB, headroom target = 55 GiB (needs 15 GiB).
+        // Nested child is OLDER (5h, 10 GiB) than parent (1h, 2 GiB), plus another NonGit target (4 GiB).
+        // Without subsumption, child (10 GiB) + parent (12 GiB) would double-count 10 GiB = 22 GiB
+        // and falsely stop before NonGit (4 GiB), while also emitting two colliding EvictTarget actions.
+        let mut parent = mk_target_with(
+            "/wt/target",
+            WorktreeKind::LinkedWorktree,
+            HOUR,
+            2 * GIB,
+            Some(false),
+        );
+        let mut child = mk_target_with(
+            "/wt/target/grpc-codegen",
+            WorktreeKind::LinkedWorktree,
+            5 * HOUR,
+            10 * GIB,
+            Some(false),
+        );
+        parent.nested_target_roots = vec![child.root.clone()];
+        child.parent_target = Some(parent.root.clone());
+        let nongit = mk_target_with(
+            "/other/target",
+            WorktreeKind::NonGit,
+            2 * HOUR,
+            4 * GIB,
+            None,
+        );
+
+        let snap = ScanSnapshot {
+            captured_at_unix: NOW,
+            disk: DiskStats {
+                mount: PathBuf::from("/System/Volumes/Data"),
+                total_bytes: 460 * GIB,
+                free_bytes: 40 * GIB,
+                local_snapshots: Some(vec![]),
+            },
+            processes: Some(ProcessSnapshot {
+                captured_at_unix: NOW,
+                self_pid: 1,
+                processes: vec![],
+            }),
+            process_snapshot_error: None,
+            mount_table_available: true,
+            mount_table_error: None,
+            targets: vec![parent, child, nongit],
+            walk_partial: false,
+            leftover_staging: vec![],
+            scanned_roots: vec![],
+        };
+        let verdicts = vec![SafetyVerdict::Eligible; 3];
+        let p = plan(
+            &snap,
+            &verdicts,
+            &State::new_default(),
+            &cfg,
+            DiskPressure::High,
+            PlanMode {
+                profile: ReclaimProfile::Full,
+                ignore_snapshot_hold: false,
+            },
+        );
+        // Must emit ONLY parent (12 GiB, subsuming child) + nongit (4 GiB) = 16 GiB (40 + 16 >= 55 GiB).
+        assert_eq!(p.actions.len(), 2);
+        assert_eq!(p.estimated_allocated_bytes, 16 * GIB);
+        assert!(matches!(
+            &p.actions[0],
+            ReclaimAction::EvictTarget {
+                rule: EvictRule::R5PressureLru,
+                target_root,
+                estimated_allocated_bytes,
+                ..
+            } if target_root == Path::new("/wt/target") && *estimated_allocated_bytes == 12 * GIB
+        ));
+        assert!(matches!(
+            &p.actions[1],
+            ReclaimAction::EvictTarget {
+                rule: EvictRule::R5PressureLru,
+                target_root,
+                estimated_allocated_bytes,
+                ..
+            } if target_root == Path::new("/other/target") && *estimated_allocated_bytes == 4 * GIB
         ));
     }
 }

@@ -393,7 +393,7 @@ fn execute_sweep_build_units(
     profile_rel: &Path,
     profile_locks: &[PathBuf],
     ops: &SweepOps,
-    estimated_allocated_bytes: u64,
+    _estimated_allocated_bytes: u64,
     platform: &impl Platform,
 ) -> (ActionOutcome, u32, u64) {
     let held_locks = match acquire_sorted_locks(profile_locks, platform) {
@@ -419,6 +419,17 @@ fn execute_sweep_build_units(
         return (outcome, 0, 0);
     }
 
+    if sweep_unit_mtime_advanced(&profile_dir, ops, expected_activity_unix) {
+        release_locks(held_locks);
+        return (
+            ActionOutcome::SkippedRevalidateChanged {
+                reason: CompactString::new("unit_mtime_advanced"),
+            },
+            0,
+            0,
+        );
+    }
+
     let staging_dir = match create_internal_staging_dir(target_root, target_dev) {
         Ok(dir) => dir,
         Err(error) => {
@@ -433,7 +444,7 @@ fn execute_sweep_build_units(
         }
     };
 
-    let (moved_units, move_error) = stage_sweep_ops(&profile_dir, &staging_dir, ops);
+    let (moved_units, moved_bytes, move_error) = stage_sweep_ops(&profile_dir, &staging_dir, ops);
 
     // Explicitly unlock and drop Cargo locks immediately after staging renames (< 15 ms).
     release_locks(held_locks);
@@ -466,11 +477,7 @@ fn execute_sweep_build_units(
             0,
         );
     }
-    (
-        ActionOutcome::Applied,
-        moved_units,
-        estimated_allocated_bytes,
-    )
+    (ActionOutcome::Applied, moved_units, moved_bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -580,7 +587,7 @@ fn execute_prune_incremental(
     profile_rel: &Path,
     profile_locks: &[PathBuf],
     removals: &[IncrementalRemoval],
-    estimated_allocated_bytes: u64,
+    _estimated_allocated_bytes: u64,
     platform: &impl Platform,
 ) -> (ActionOutcome, u32, u64) {
     let profile_dir = target_root.join(profile_rel);
@@ -611,8 +618,19 @@ fn execute_prune_incremental(
                 all_locks.push(inc_root.join(crate_dir.as_str()).join(lf.as_str()));
             }
             IncrementalRemoval::SingleSession {
-                lock_file: None, ..
-            } => {}
+                crate_dir,
+                session_dir,
+                lock_file: None,
+                ..
+            } => {
+                if let Some((prefix, _)) = session_dir.rsplit_once('-') {
+                    all_locks.push(
+                        inc_root
+                            .join(crate_dir.as_str())
+                            .join(format!("{prefix}.lock")),
+                    );
+                }
+            }
         }
     }
 
@@ -638,6 +656,17 @@ fn execute_prune_incremental(
         return (outcome, 0, 0);
     }
 
+    if incremental_mtime_advanced(&inc_root, removals, expected_activity_unix) {
+        release_locks(held_locks);
+        return (
+            ActionOutcome::SkippedRevalidateChanged {
+                reason: CompactString::new("incremental_mtime_advanced"),
+            },
+            0,
+            0,
+        );
+    }
+
     let staging_dir = match create_internal_staging_dir(target_root, target_dev) {
         Ok(dir) => dir,
         Err(error) => {
@@ -653,14 +682,21 @@ fn execute_prune_incremental(
     };
 
     let mut moved_count: u32 = 0;
+    let mut moved_bytes: u64 = 0;
     let mut move_error: Option<String> = None;
 
     for (idx, removal) in removals.iter().enumerate() {
         match removal {
-            IncrementalRemoval::WholeCrateDir { dir_name, .. } => {
+            IncrementalRemoval::WholeCrateDir {
+                dir_name,
+                allocated_bytes,
+            } => {
                 let dst = format!("inc_crate_{idx}");
                 match rename_entry_atomic(&inc_root, dir_name.as_str(), &staging_dir, &dst) {
-                    Ok(true) => moved_count = moved_count.saturating_add(1),
+                    Ok(true) => {
+                        moved_count = moved_count.saturating_add(1);
+                        moved_bytes = moved_bytes.saturating_add(*allocated_bytes);
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         move_error = Some(format!("rename incremental/{dir_name}: {error}"));
@@ -672,13 +708,14 @@ fn execute_prune_incremental(
                 crate_dir,
                 session_dir,
                 lock_file,
-                ..
+                allocated_bytes,
             } => {
                 let crate_path = inc_root.join(crate_dir.as_str());
                 let dst = format!("inc_sess_{idx}");
                 match rename_entry_atomic(&crate_path, session_dir.as_str(), &staging_dir, &dst) {
                     Ok(true) => {
                         moved_count = moved_count.saturating_add(1);
+                        moved_bytes = moved_bytes.saturating_add(*allocated_bytes);
                         if let Some(lf) = lock_file {
                             let lock_dst = format!("inc_lock_{idx}");
                             let _ = rename_entry_atomic(
@@ -733,11 +770,7 @@ fn execute_prune_incremental(
             0,
         );
     }
-    (
-        ActionOutcome::Applied,
-        moved_count,
-        estimated_allocated_bytes,
-    )
+    (ActionOutcome::Applied, moved_count, moved_bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -980,9 +1013,9 @@ where
         });
     }
 
-    // Revalidate pin marker wasn't created after scan (TOCTOU fail-closed)
-    if fs::symlink_metadata(target_root.join(PIN_MARKER_FILE)).is_ok()
-        || worktree_root.is_some_and(|wt| fs::symlink_metadata(wt.join(PIN_MARKER_FILE)).is_ok())
+    // Revalidate pin marker wasn't created after scan (fail closed on any non-NotFound error)
+    if pin_marker_present_fail_closed(&target_root.join(PIN_MARKER_FILE))
+        || worktree_root.is_some_and(|wt| pin_marker_present_fail_closed(&wt.join(PIN_MARKER_FILE)))
     {
         return Err(ActionOutcome::SkippedRevalidateChanged {
             reason: CompactString::new("pin_marker_appeared"),
@@ -1197,30 +1230,120 @@ fn any_process_in_dir(proc_snap: &ProcessSnapshot, dir: &Path) -> bool {
     })
 }
 
+fn pin_marker_present_fail_closed(path: &Path) -> bool {
+    !matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn path_mtime_exceeds(path: &Path, expected_unix: u64) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta_mtime_unix(&meta) > expected_unix)
+}
+
+fn sweep_unit_mtime_advanced(profile_dir: &Path, ops: &SweepOps, expected_unix: u64) -> bool {
+    let check_v2 = |v2: &[V2UnitRemoval]| {
+        let build_root = profile_dir.join("build");
+        v2.iter().any(|u| {
+            let unit_dir = build_root.join(u.pkg.as_str()).join(u.unit_hash.as_str());
+            let fp_dir = unit_dir.join("fingerprint");
+            path_mtime_exceeds(&unit_dir, expected_unix)
+                || path_mtime_exceeds(&fp_dir, expected_unix)
+                || path_mtime_exceeds(&fp_dir.join("invoked.timestamp"), expected_unix)
+        })
+    };
+    let check_v1 = |v1: &[V1UnitRemoval]| {
+        let fp_root = profile_dir.join(".fingerprint");
+        v1.iter().any(|u| {
+            let fp_dir = fp_root.join(u.fingerprint_dir.as_str());
+            path_mtime_exceeds(&fp_dir, expected_unix)
+                || path_mtime_exceeds(&fp_dir.join("invoked.timestamp"), expected_unix)
+        })
+    };
+    match ops {
+        SweepOps::V2(v2) => check_v2(v2),
+        SweepOps::V1(v1) => check_v1(v1),
+        SweepOps::Mixed { v2, v1 } => check_v2(v2) || check_v1(v1),
+    }
+}
+
+fn incremental_mtime_advanced(
+    inc_root: &Path,
+    removals: &[IncrementalRemoval],
+    expected_unix: u64,
+) -> bool {
+    removals.iter().any(|removal| match removal {
+        IncrementalRemoval::WholeCrateDir { dir_name, .. } => {
+            path_mtime_exceeds(&inc_root.join(dir_name.as_str()), expected_unix)
+        }
+        IncrementalRemoval::SingleSession {
+            crate_dir,
+            session_dir,
+            lock_file,
+            ..
+        } => {
+            let crate_path = inc_root.join(crate_dir.as_str());
+            path_mtime_exceeds(&crate_path.join(session_dir.as_str()), expected_unix)
+                || lock_file
+                    .as_deref()
+                    .is_some_and(|lf| path_mtime_exceeds(&crate_path.join(lf), expected_unix))
+        }
+    })
+}
+
 fn stage_sweep_ops(
     profile_dir: &Path,
     staging_dir: &Path,
     ops: &SweepOps,
-) -> (u32, Option<String>) {
+) -> (u32, u64, Option<String>) {
     let mut moved: u32 = 0;
+    let mut moved_bytes: u64 = 0;
     let mut first_error: Option<String> = None;
 
     match ops {
         SweepOps::V2(v2) => {
-            stage_v2_units(profile_dir, staging_dir, v2, &mut moved, &mut first_error);
+            stage_v2_units(
+                profile_dir,
+                staging_dir,
+                v2,
+                &mut moved,
+                &mut moved_bytes,
+                &mut first_error,
+            );
         }
         SweepOps::V1(v1) => {
-            stage_v1_units(profile_dir, staging_dir, v1, &mut moved, &mut first_error);
+            stage_v1_units(
+                profile_dir,
+                staging_dir,
+                v1,
+                &mut moved,
+                &mut moved_bytes,
+                &mut first_error,
+            );
         }
         SweepOps::Mixed { v2, v1 } => {
-            stage_v2_units(profile_dir, staging_dir, v2, &mut moved, &mut first_error);
+            stage_v2_units(
+                profile_dir,
+                staging_dir,
+                v2,
+                &mut moved,
+                &mut moved_bytes,
+                &mut first_error,
+            );
             if first_error.is_none() {
-                stage_v1_units(profile_dir, staging_dir, v1, &mut moved, &mut first_error);
+                stage_v1_units(
+                    profile_dir,
+                    staging_dir,
+                    v1,
+                    &mut moved,
+                    &mut moved_bytes,
+                    &mut first_error,
+                );
             }
         }
     }
 
-    (moved, first_error)
+    (moved, moved_bytes, first_error)
 }
 
 fn stage_v2_units(
@@ -1228,6 +1351,7 @@ fn stage_v2_units(
     staging_dir: &Path,
     units: &[V2UnitRemoval],
     moved: &mut u32,
+    moved_bytes: &mut u64,
     first_error: &mut Option<String>,
 ) {
     let build_root = profile_dir.join("build");
@@ -1235,7 +1359,10 @@ fn stage_v2_units(
         let pkg_dir = build_root.join(unit.pkg.as_str());
         let dst = format!("v2_{idx}_{}", unit.unit_hash);
         match rename_entry_atomic(&pkg_dir, unit.unit_hash.as_str(), staging_dir, &dst) {
-            Ok(true) => *moved = moved.saturating_add(1),
+            Ok(true) => {
+                *moved = moved.saturating_add(1);
+                *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
+            }
             Ok(false) => {}
             Err(error) => {
                 *first_error = Some(format!(
@@ -1253,6 +1380,7 @@ fn stage_v1_units(
     staging_dir: &Path,
     units: &[V1UnitRemoval],
     moved: &mut u32,
+    moved_bytes: &mut u64,
     first_error: &mut Option<String>,
 ) {
     let fp_root = profile_dir.join(".fingerprint");
@@ -1302,6 +1430,7 @@ fn stage_v1_units(
             break;
         }
         *moved = moved.saturating_add(1);
+        *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
     }
 }
 
@@ -1437,12 +1566,15 @@ pub(crate) fn remove_tree_safe(root: &Path, expected_dev: u64) -> Result<(), App
             path: root.to_path_buf(),
             message: format!("fstat failed: {error}"),
         })?;
-        if u64::try_from(st.st_dev).unwrap_or(u64::MAX) != expected_dev {
+        #[allow(clippy::unnecessary_cast)]
+        let root_dev = st.st_dev as u64;
+        if root_dev != expected_dev {
             return Err(AppError::InvalidPath {
                 path: root.to_path_buf(),
                 message: "device mismatch during safe remove (mount boundary)".to_owned(),
             });
         }
+        ensure_dir_fd_writable(&root_fd, &st);
 
         clear_dir_fd_recursive(&root_fd, expected_dev, 0, root)?;
         drop(root_fd);
@@ -1507,7 +1639,9 @@ fn clear_dir_fd_recursive(
             }
         };
         let is_dir = FileType::from_raw_mode(st.st_mode) == FileType::Directory;
-        if is_dir && u64::try_from(st.st_dev).unwrap_or(u64::MAX) != expected_dev {
+        #[allow(clippy::unnecessary_cast)]
+        let entry_dev = st.st_dev as u64;
+        if is_dir && entry_dev != expected_dev {
             return Err(AppError::InvalidPath {
                 path: diag_root.to_path_buf(),
                 message: "encountered mount point inside staging tree".to_owned(),
@@ -1538,12 +1672,15 @@ fn clear_dir_fd_recursive(
                 path: diag_root.to_path_buf(),
                 message: format!("fstat child directory failed: {error}"),
             })?;
-            if u64::try_from(cst.st_dev).unwrap_or(u64::MAX) != expected_dev {
+            #[allow(clippy::unnecessary_cast)]
+            let child_dev = cst.st_dev as u64;
+            if child_dev != expected_dev {
                 return Err(AppError::InvalidPath {
                     path: diag_root.to_path_buf(),
                     message: "child directory crossed device boundary".to_owned(),
                 });
             }
+            ensure_dir_fd_writable(&child_fd, &cst);
             clear_dir_fd_recursive(&child_fd, expected_dev, depth + 1, diag_root)?;
             drop(child_fd);
             match unlinkat(dir_fd, name.as_c_str(), AtFlags::REMOVEDIR) {
@@ -1570,6 +1707,18 @@ fn clear_dir_fd_recursive(
     }
 
     Ok(())
+}
+
+/// Grant owner rwx on an already-opened, `O_NOFOLLOW`, same-device staged directory FD when
+/// build scripts unpacked read-only (`0o555`) directories inside `out/`.
+#[cfg(unix)]
+fn ensure_dir_fd_writable(dir_fd: &std::os::fd::OwnedFd, st: &rustix::fs::Stat) {
+    use rustix::fs::{Mode, fchmod};
+
+    let perm_bits = st.st_mode & 0o7777;
+    if (perm_bits & 0o700) != 0o700 {
+        let _ = fchmod(dir_fd, Mode::from_raw_mode(perm_bits | 0o700));
+    }
 }
 
 fn is_staging_dir_name(name: &str) -> bool {
@@ -2232,5 +2381,148 @@ mod tests {
             ActionOutcome::SkippedRevalidateChanged { .. }
         ));
         assert!(root.join("debug/build/demo/aaaaaaaaaaaaaaaa").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_tree_safe_cleans_readonly_subdirs_and_toctou_detects_unit_and_inc_mtime_and_partial_bytes()
+     {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+
+        // 1. Read-only (0555) subdir with read-only (0444) file inside staging tree must delete cleanly.
+        let staging = base.join(".targetwarden-reap.77.1");
+        let ro_sub = staging.join("out/vendor_ro");
+        fs::create_dir_all(&ro_sub).unwrap();
+        let ro_file = ro_sub.join("header.h");
+        fs::write(&ro_file, b"// ro").unwrap();
+        fs::set_permissions(&ro_file, fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(&ro_sub, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let dev = meta_dev(&fs::symlink_metadata(&staging).unwrap());
+        remove_tree_safe(&staging, dev).unwrap();
+        assert!(!staging.exists());
+
+        // 2. Post-lock TOCTOU catches unit `fingerprint/invoked.timestamp` advancing even when `debug/` didn't!
+        let target = base.join("proj/target");
+        let debug = target.join("debug");
+        let u1_fp = debug.join("build/demo/1111111111111111/fingerprint");
+        let u2_dir = debug.join("build/demo/2222222222222222");
+        let inc_crate = debug.join("incremental/demo-abc1234567890");
+        fs::create_dir_all(&u1_fp).unwrap();
+        fs::create_dir_all(&u2_dir).unwrap();
+        fs::create_dir_all(&inc_crate).unwrap();
+        let invoked = u1_fp.join("invoked.timestamp");
+        fs::write(&invoked, b"").unwrap();
+
+        let tmeta = fs::symlink_metadata(&target).unwrap();
+        let tdev = meta_dev(&tmeta);
+        let tino = meta_ino(&tmeta);
+        let baseline_mtime = meta_mtime_unix(&tmeta);
+        let future_ts = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&invoked)
+            .unwrap()
+            .set_modified(future_ts)
+            .unwrap();
+
+        let plat = RealLockTestPlatform {
+            now: baseline_mtime + 7200,
+        };
+        let sweep_action = ReclaimAction::SweepBuildUnits {
+            target_root: target.clone(),
+            target_dev: tdev,
+            target_ino: tino,
+            expected_activity_unix: baseline_mtime,
+            expected_target_activity_unix: baseline_mtime,
+            worktree_root: None,
+            profile_rel: PathBuf::from("debug"),
+            profile_locks: SmallVec::new(),
+            ops: SweepOps::V2(vec![V2UnitRemoval {
+                pkg: CompactString::new("demo"),
+                unit_hash: CompactString::new("1111111111111111"),
+                allocated_bytes: 500,
+                reason: SweepUnitReason::UnreachableDuplicate,
+            }]),
+            estimated_allocated_bytes: 500,
+        };
+        let res_u1 = execute_action(&sweep_action, &plat, DiskPressure::Calm, false);
+        assert!(matches!(
+            res_u1.outcome,
+            ActionOutcome::SkippedRevalidateChanged { ref reason } if reason == "unit_mtime_advanced"
+        ));
+        assert!(u1_fp.exists());
+
+        // 3. Partial absence reports ONLY the moved unit's `allocated_bytes` (not absent unit's bytes).
+        let partial_sweep = ReclaimAction::SweepBuildUnits {
+            target_root: target.clone(),
+            target_dev: tdev,
+            target_ino: tino,
+            expected_activity_unix: baseline_mtime + 7200,
+            expected_target_activity_unix: baseline_mtime + 7200,
+            worktree_root: None,
+            profile_rel: PathBuf::from("debug"),
+            profile_locks: SmallVec::new(),
+            ops: SweepOps::V2(vec![
+                V2UnitRemoval {
+                    pkg: CompactString::new("demo"),
+                    unit_hash: CompactString::new("2222222222222222"),
+                    allocated_bytes: 4096,
+                    reason: SweepUnitReason::UnreachableDuplicate,
+                },
+                V2UnitRemoval {
+                    pkg: CompactString::new("demo"),
+                    unit_hash: CompactString::new("9999999999999999"),
+                    allocated_bytes: 999_999,
+                    reason: SweepUnitReason::UnreachableDuplicate,
+                },
+            ]),
+            estimated_allocated_bytes: 4096 + 999_999,
+        };
+        let res_partial = execute_action(&partial_sweep, &plat, DiskPressure::Calm, false);
+        assert_eq!(res_partial.outcome, ActionOutcome::Applied);
+        assert_eq!(res_partial.units_removed, 1);
+        assert_eq!(res_partial.allocated_bytes, 4096);
+
+        // 4. Incremental crate dir mtime advancing aborts PruneIncremental even when `incremental/` didn't!
+        let inc_future = rustix::fs::Timespec {
+            tv_sec: i64::try_from(baseline_mtime + 10_000).unwrap(),
+            tv_nsec: 0,
+        };
+        rustix::fs::utimensat(
+            rustix::fs::CWD,
+            &inc_crate,
+            &rustix::fs::Timestamps {
+                last_access: inc_future,
+                last_modification: inc_future,
+            },
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .unwrap();
+        let inc_action = ReclaimAction::PruneIncremental {
+            target_root: target,
+            target_dev: tdev,
+            target_ino: tino,
+            expected_activity_unix: baseline_mtime + 7200,
+            expected_target_activity_unix: baseline_mtime + 7200,
+            worktree_root: None,
+            profile_rel: PathBuf::from("debug"),
+            profile_locks: SmallVec::new(),
+            removals: vec![IncrementalRemoval::WholeCrateDir {
+                dir_name: CompactString::new("demo-abc1234567890"),
+                allocated_bytes: 1024,
+            }],
+            estimated_allocated_bytes: 1024,
+        };
+        let res_inc = execute_action(&inc_action, &plat, DiskPressure::Calm, false);
+        assert!(matches!(
+            res_inc.outcome,
+            ActionOutcome::SkippedRevalidateChanged { ref reason }
+                if reason == "incremental_mtime_advanced"
+        ));
+        assert!(inc_crate.exists());
     }
 }

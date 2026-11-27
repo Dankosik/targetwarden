@@ -41,12 +41,12 @@ pub(crate) fn evaluate_all(
 pub(crate) fn is_r1_dead_worktree_candidate(target: &CargoTarget) -> bool {
     match &target.git {
         GitDiscovery::Inspected(git) => {
-            git.worktree_dir_missing
-                || (git.worktree_kind == WorktreeKind::LinkedWorktree
-                    && !git.is_dirty
-                    && !git.worktree_locked
-                    && !git.git_op_in_progress
-                    && git.branch_merged_into_default == Some(true))
+            !git.worktree_locked
+                && !git.git_op_in_progress
+                && (git.worktree_dir_missing
+                    || (git.worktree_kind == WorktreeKind::LinkedWorktree
+                        && !git.is_dirty
+                        && git.branch_merged_into_default == Some(true)))
         }
         GitDiscovery::NotInGitRepo | GitDiscovery::Failed(_) => false,
     }
@@ -124,12 +124,14 @@ fn evaluate_single(
                     }
                 }
                 WorktreeKind::LinkedWorktree => {
-                    if !git.worktree_dir_missing {
+                    if git.worktree_locked {
+                        sweep_only.push(SweepOnlyReason::DirtyOrUnmergedWorktree);
+                    } else if !git.worktree_dir_missing {
                         let r4_cooled = age_secs >= config.cooling.r4_age_secs(pressure);
                         let r5_allowed = pressure >= DiskPressure::High && !hold_active;
                         let merged_and_clean =
                             !git.is_dirty && git.branch_merged_into_default == Some(true);
-                        if git.worktree_locked || (!merged_and_clean && !r4_cooled && !r5_allowed) {
+                        if !merged_and_clean && !r4_cooled && !r5_allowed {
                             sweep_only.push(SweepOnlyReason::DirtyOrUnmergedWorktree);
                         }
                     }
@@ -273,7 +275,11 @@ fn evaluate_process_against_target(
         .is_some_and(|cwd| cwd.starts_with(wt_root));
 
     if is_ra {
-        if cwd_in_worktree {
+        let open_in_worktree = proc_entry
+            .open_paths
+            .iter()
+            .any(|path| path.starts_with(wt_root));
+        if cwd_in_worktree || open_in_worktree {
             push_unique_sweep(
                 sweep_only,
                 SweepOnlyReason::IdleRustAnalyzer {
@@ -792,11 +798,13 @@ mod tests {
         );
         assert_eq!(v_high[0], SafetyVerdict::Eligible);
 
-        // Locked worktree stays SweepOnly even in High pressure.
+        // Locked worktree stays SweepOnly even in High pressure or when worktree_dir_missing.
         let mut locked_wt = wt;
         if let GitDiscovery::Inspected(git) = &mut locked_wt.git {
             git.worktree_locked = true;
+            git.worktree_dir_missing = true;
         }
+        assert!(!super::is_r1_dead_worktree_candidate(&locked_wt));
         let v_locked = evaluate_all(
             &base_snapshot(vec![locked_wt], Some(vec![])),
             &State::new_default(),
@@ -808,6 +816,32 @@ mod tests {
             &v_locked[0],
             SafetyVerdict::SweepOnly { reasons, .. }
                 if reasons.contains(&SweepOnlyReason::DirtyOrUnmergedWorktree)
+        ));
+
+        // rust-analyzer with cwd outside worktree but an open file inside worktree -> SweepOnly
+        let ra_target = base_target(
+            "/Users/dev/ws/wt_ra/target",
+            WorktreeKind::LinkedWorktree,
+            3600,
+        );
+        let ra_proc = vec![ProcessEntry {
+            pid: 555,
+            comm: CompactString::new("rust-analyzer"),
+            exe_path: Some(PathBuf::from("/usr/local/bin/rust-analyzer")),
+            cwd: Some(PathBuf::from("/Users/dev/ws")),
+            open_paths: vec![PathBuf::from("/Users/dev/ws/wt_ra/src/lib.rs")],
+        }];
+        let v_ra = evaluate_all(
+            &base_snapshot(vec![ra_target], Some(ra_proc)),
+            &State::new_default(),
+            &cfg,
+            DiskPressure::Calm,
+            false,
+        );
+        assert!(matches!(
+            &v_ra[0],
+            SafetyVerdict::SweepOnly { reasons, .. }
+                if reasons.contains(&SweepOnlyReason::IdleRustAnalyzer { pid: 555 })
         ));
     }
 }

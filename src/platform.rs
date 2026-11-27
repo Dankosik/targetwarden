@@ -27,6 +27,7 @@ const SUBPROCESS_STDOUT_CAP: usize = 4 * 1024 * 1024;
 const SUBPROCESS_STDERR_CAP: usize = 256 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) struct CommandOutput {
     pub status_code: Option<i32>,
     pub stdout: Vec<u8>,
@@ -34,6 +35,7 @@ pub(crate) struct CommandOutput {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) enum LockProbe {
     Acquired(#[allow(dead_code)] File),
     Contested,
@@ -539,6 +541,7 @@ fn run_bounded_command(
 /// Strictly parse `/usr/sbin/lsof -n -P -F0pcftn` output.
 /// Fails closed on empty output, `fNOFD`, invalid escape sequences, malformed headers,
 /// or unexpected empty `n` fields outside `{PIPE, NPOLICY, NEXUS}`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_lsof_output(
     raw: &[u8],
     captured_at_unix: u64,
@@ -722,6 +725,7 @@ pub(crate) fn parse_lsof_output(
 
 /// Decode lsof escape sequences (`\\`, `\n`, `\r`, `\t`, `\b`, `\f`, `\a`, `\xHH`).
 /// Fails closed on any unrecognized or truncated escape.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn decode_lsof_bytes(raw: &[u8]) -> Result<Vec<u8>, AppError> {
     if !raw.contains(&b'\\') {
         return Ok(raw.to_vec());
@@ -792,6 +796,7 @@ pub(crate) fn decode_lsof_bytes(raw: &[u8]) -> Result<Vec<u8>, AppError> {
     Ok(out)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn hex_nibble(byte: u8) -> Result<u8, AppError> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -805,6 +810,7 @@ fn hex_nibble(byte: u8) -> Result<u8, AppError> {
 }
 
 #[cfg(unix)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
@@ -813,12 +819,14 @@ fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
 }
 
 #[cfg(not(unix))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn bytes_to_pathbuf(bytes: Vec<u8>) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Strictly parse macOS `/sbin/mount` lines (`<source> on <mount_point> (<fstype>, ...)`).
 /// Fails closed on empty output, missing parentheses, or ambiguous ` on ` separators.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_mount_output(raw: &str) -> Result<Vec<MountEntry>, AppError> {
     let mut entries = Vec::new();
     for line in raw.lines() {
@@ -869,6 +877,7 @@ pub(crate) fn parse_mount_output(raw: &str) -> Result<Vec<MountEntry>, AppError>
 }
 
 /// Parse `/usr/bin/tmutil listlocalsnapshots /` output into a sorted deduplicated list.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn parse_tmutil_snapshots(raw: &str) -> Vec<CompactString> {
     let mut snapshots: Vec<CompactString> = raw
         .lines()
@@ -1132,9 +1141,7 @@ impl Drop for SignalWatcher {
 }
 
 #[cfg(not(unix))]
-pub(crate) struct SignalWatcher {
-    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
+pub(crate) struct SignalWatcher;
 
 #[cfg(not(unix))]
 impl SignalWatcher {
@@ -1143,7 +1150,7 @@ impl SignalWatcher {
     }
 
     pub(crate) fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::clone(&self.stop_flag)
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true))
     }
 
     pub(crate) fn wait_for_stop_or_timeout(

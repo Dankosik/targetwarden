@@ -36,13 +36,13 @@ pub(crate) struct UninstallOutcome {
 /// Pure LaunchAgent plist renderer (`Nice = 10`, `Aqua`, `ThrottleInterval = 60`,
 /// deliberately omitting `ProcessType=Background` and `LowPriorityIO`).
 pub(crate) fn render_plist(exe: &Path, home: &Path) -> Result<String, AppError> {
-    if !exe.is_absolute() {
+    if !is_absolute_launch_path(exe) {
         return Err(AppError::InvalidPath {
             path: exe.to_path_buf(),
             message: "LaunchAgent executable path must be absolute".to_owned(),
         });
     }
-    if !home.is_absolute() {
+    if !is_absolute_launch_path(home) {
         return Err(AppError::InvalidPath {
             path: home.to_path_buf(),
             message: "HOME directory path must be absolute".to_owned(),
@@ -50,11 +50,14 @@ pub(crate) fn render_plist(exe: &Path, home: &Path) -> Result<String, AppError> 
     }
 
     let exe_str = path_to_valid_xml_utf8(exe)?;
-    let log_path = log_path_for(home);
-    let log_str = path_to_valid_xml_utf8(&log_path)?;
+    let home_str = path_to_valid_xml_utf8(home)?;
+    let log_str = format!(
+        "{}/Library/Logs/targetwarden.log",
+        home_str.trim_end_matches(['/', '\\'])
+    );
 
     let escaped_exe = escape_xml(exe_str);
-    let escaped_log = escape_xml(log_str);
+    let escaped_log = escape_xml(&log_str);
 
     Ok(format!(
         "\
@@ -219,6 +222,10 @@ fn plist_path_for(home: &Path) -> PathBuf {
 
 fn log_path_for(home: &Path) -> PathBuf {
     home.join("Library").join("Logs").join("targetwarden.log")
+}
+
+fn is_absolute_launch_path(path: &Path) -> bool {
+    path.is_absolute() || path.to_str().is_some_and(|s| s.starts_with('/'))
 }
 
 fn path_to_valid_xml_utf8(path: &Path) -> Result<&str, AppError> {

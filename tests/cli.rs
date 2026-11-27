@@ -1,6 +1,7 @@
 //! Built CLI contract tests: grammar, completions, independence from `HOME`, exit codes,
 //! and Stage 1 read-only `status`/`scan` framing.
 
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -93,6 +94,17 @@ fn invalid_format_env_is_rejected_with_exit_code_2() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn non_macos_platform_exits_cleanly_with_macos_only_message() {
+    let home = tempfile::tempdir().unwrap();
+    let output = command(home.path()).arg("status").output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("targetwarden supports macOS only"));
 }
 
 #[cfg(target_os = "macos")]

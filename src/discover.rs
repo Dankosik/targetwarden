@@ -26,6 +26,7 @@ use crate::model::{
 };
 use crate::platform::{
     DEFAULT_VOLUME_MOUNT, LockProbe, Platform, crosses_mount_boundary, has_symlink_boundary,
+    normalize_macos_system_symlinks,
 };
 
 const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
@@ -302,12 +303,22 @@ pub(crate) fn scan<P: Platform + Sync>(
     let mut deferred_chunks: Vec<AccountChunk> = Vec::new();
 
     for batch in batches.drain(..) {
+        let mut accepted_in_batch: HashSet<(u64, u64)> = HashSet::new();
         for (target, hardlinks) in batch.targets {
             let key = (target.dev_id, target.ino);
-            if let std::collections::hash_map::Entry::Vacant(slot) = target_idx_by_id.entry(key) {
-                slot.insert(final_targets.len());
-                final_targets.push(target);
-                target_hardlinks.push(hardlinks);
+            match target_idx_by_id.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(final_targets.len());
+                    accepted_in_batch.insert(key);
+                    final_targets.push(target);
+                    target_hardlinks.push(hardlinks);
+                }
+                std::collections::hash_map::Entry::Occupied(existing) => {
+                    let existing_target = &mut final_targets[*existing.get()];
+                    if existing_target.parent_target.is_none() && target.parent_target.is_some() {
+                        existing_target.parent_target = target.parent_target;
+                    }
+                }
             }
         }
         for (staging, ino) in batch.leftover_staging {
@@ -315,7 +326,11 @@ pub(crate) fn scan<P: Platform + Sync>(
                 leftover_staging.push(staging);
             }
         }
-        deferred_chunks.extend(batch.account_chunks);
+        for chunk in batch.account_chunks {
+            if accepted_in_batch.contains(&chunk.target_key) {
+                deferred_chunks.push(chunk);
+            }
+        }
     }
 
     if !deferred_chunks.is_empty() {
@@ -409,7 +424,7 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
             let Ok(canon_meta) = fs::symlink_metadata(&canon_root) else {
                 continue;
             };
-            if !visited_roots.insert((meta_dev(&canon_meta), meta_ino(&canon_meta))) {
+            if !visited_roots.insert(file_identity(&canon_root, &canon_meta)) {
                 continue;
             }
             scanned_roots.push(canon_root.clone());
@@ -514,7 +529,10 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
     }
 
     let mut checked_known_parents: HashSet<PathBuf> = HashSet::new();
-    for known in &request.known_targets {
+    for known_raw in &request.known_targets {
+        let known_norm = normalize_macos_system_symlinks(known_raw);
+        let known = known_norm.as_path();
+
         if !request.full_walk
             && let Some(parent) = known.parent()
             && checked_known_parents.insert(parent.to_path_buf())
@@ -527,8 +545,7 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
                     && meta.file_type().is_dir()
                     && !meta.file_type().is_symlink()
                 {
-                    let dev = meta_dev(&meta);
-                    let ino = meta_ino(&meta);
+                    let (dev, ino) = file_identity(&entry.path(), &meta);
                     if seen_staging.insert((dev, ino)) {
                         leftover_staging.push(LeftoverStaging {
                             staging_dir: entry.path(),
@@ -558,6 +575,21 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
             push_candidate(&mut seen_candidates, &mut candidates, known, origin, false);
         }
     }
+
+    // Prune direct nested children when their non-symlink parent target is already a candidate:
+    // `inspect_target(parent)` discovers and inspects direct nested children once with
+    // `parent_target = Some(parent)`, preventing redundant worker I/O and double-accounting.
+    let non_symlink_roots: HashSet<PathBuf> = candidates
+        .iter()
+        .filter(|c| !c.forced_boundary_violation)
+        .map(|c| c.path.clone())
+        .collect();
+    candidates.retain(|c| {
+        c.forced_boundary_violation
+            || c.path
+                .parent()
+                .is_none_or(|parent| !non_symlink_roots.contains(parent))
+    });
 
     candidates.sort_by(|a, b| a.path.cmp(&b.path));
 
@@ -605,14 +637,15 @@ fn consume_walk_budget(
 
 fn record_walk_candidate(batch: &mut WalkBatch, path: PathBuf, origin: TargetOrigin) {
     if let Ok(meta) = fs::symlink_metadata(&path) {
+        let (dev, ino) = file_identity(&path, &meta);
         batch.candidates.push((
             DiscoveredCandidate {
                 path,
                 origin,
                 forced_boundary_violation: false,
             },
-            meta_dev(&meta),
-            meta_ino(&meta),
+            dev,
+            ino,
         ));
     }
 }
@@ -676,12 +709,13 @@ fn visit_walk_dir<F>(
             if is_staging_dir_name(name) {
                 let staging_path = entry.path();
                 if let Ok(meta) = fs::symlink_metadata(&staging_path) {
+                    let (dev, ino) = file_identity(&staging_path, &meta);
                     batch.leftover_staging.push((
                         LeftoverStaging {
                             staging_dir: staging_path,
-                            expected_dev: meta_dev(&meta),
+                            expected_dev: dev,
                         },
-                        meta_ino(&meta),
+                        ino,
                     ));
                 }
                 continue;
@@ -782,7 +816,7 @@ fn push_candidate(
     forced_boundary_violation: bool,
 ) {
     if let Ok(meta) = fs::symlink_metadata(path)
-        && seen_candidates.insert((meta_dev(&meta), meta_ino(&meta)))
+        && seen_candidates.insert(file_identity(path, &meta))
     {
         candidates.push(DiscoveredCandidate {
             path: path.to_path_buf(),
@@ -797,7 +831,10 @@ enum MtimePolicy {
     None,
     UpToDepth(usize),
     V2PkgDir,
-    V2UnitFingerprint { unit_depth: usize },
+    #[cfg_attr(not(unix), allow(dead_code))]
+    V2UnitFingerprint {
+        unit_depth: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -843,6 +880,7 @@ fn inspect_candidates_bounded<P: Platform + Sync>(
             &candidates[0].path,
             candidates[0].origin,
             None,
+            None,
             candidates[0].forced_boundary_violation,
         );
         return vec![WorkerOutput {
@@ -869,6 +907,7 @@ fn inspect_candidates_bounded<P: Platform + Sync>(
                     ctx.inspect_target(
                         &cand.path,
                         cand.origin,
+                        None,
                         None,
                         cand.forced_boundary_violation,
                     );
@@ -1127,13 +1166,13 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
         target_root: &Path,
         origin: TargetOrigin,
         parent_target: Option<PathBuf>,
+        parent_project_dir: Option<&Path>,
         forced_boundary_violation: bool,
     ) {
         let Ok(lmeta) = fs::symlink_metadata(target_root) else {
             return;
         };
-        let dev_id = meta_dev(&lmeta);
-        let ino = meta_ino(&lmeta);
+        let (dev_id, ino) = file_identity(target_root, &lmeta);
         let target_key = (dev_id, ino);
         if !self.visited_targets.insert(target_key) {
             return;
@@ -1150,7 +1189,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
         let mut nested_target_roots: Vec<PathBuf> = Vec::new();
         let mut nested_to_inspect: Vec<(PathBuf, TargetOrigin)> = Vec::new();
         let mut has_unverified_top_entries = false;
-        let mut has_pin_marker = fs::symlink_metadata(target_root.join(PIN_MARKER_FILE)).is_ok();
+        let mut has_pin_marker = pin_marker_present_fail_closed(&target_root.join(PIN_MARKER_FILE));
         let mut allocated_bytes: u64 = 0;
         let mut last_activity_unix: u64 = 0;
 
@@ -1171,9 +1210,14 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             false
         };
 
+        // Fail closed when `target_root` cannot be read: never classify an unreadable
+        // target directory as an empty `ArtifactsOnly` `Eligible` target.
         let entries: Vec<_> = match fs::read_dir(target_root) {
             Ok(rd) => rd.flatten().collect(),
-            Err(_) => Vec::new(),
+            Err(_) => {
+                has_unverified_top_entries = true;
+                Vec::new()
+            }
         };
 
         for entry in entries {
@@ -1190,12 +1234,13 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             let ft = emeta.file_type();
 
             if ft.is_dir() && is_staging_dir_name(&name) {
+                let (sdev, sino) = file_identity(&entry_path, &emeta);
                 self.leftover_staging.push((
                     LeftoverStaging {
                         staging_dir: entry_path,
-                        expected_dev: meta_dev(&emeta),
+                        expected_dev: sdev,
                     },
-                    meta_ino(&emeta),
+                    sino,
                 ));
                 continue;
             }
@@ -1331,13 +1376,15 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             GitDiscovery::Inspected(info) => Some(info.worktree_root.clone()),
             GitDiscovery::NotInGitRepo | GitDiscovery::Failed(_) => {
                 infer_non_git_project_dir(target_root)
+                    .or_else(|| parent_project_dir.map(Path::to_path_buf))
             }
         };
         if let Some(proj) = &project_dir
-            && fs::symlink_metadata(proj.join(PIN_MARKER_FILE)).is_ok()
+            && pin_marker_present_fail_closed(&proj.join(PIN_MARKER_FILE))
         {
             has_pin_marker = true;
         }
+        let child_project_dir = project_dir.clone();
 
         self.targets.push((
             CargoTarget {
@@ -1369,6 +1416,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                 &nested_path,
                 nested_origin,
                 Some(target_root.to_path_buf()),
+                child_project_dir.as_deref(),
                 false,
             );
         }
@@ -1656,73 +1704,88 @@ fn inspect_profile_dir(
                         continue;
                     }
 
-                    let mut found_v2_child = false;
-                    if let Ok(children) = fs::read_dir(&entry_path) {
-                        for child in children.flatten() {
-                            let child_path = child.path();
-                            let Ok(cft) = child.file_type() else {
-                                continue;
-                            };
-                            if !cft.is_dir() || cft.is_symlink() {
-                                continue;
-                            }
-                            let child_os = child.file_name();
-                            let Some(child_name) = child_os.to_str() else {
-                                continue;
-                            };
-                            if !is_16_lower_hex(child_name) {
-                                continue;
-                            }
-                            found_v2_child = true;
-
-                            let unit_hash = CompactString::from(child_name);
-                            let fp_sub = child_path.join("fingerprint");
-                            let parsed = if fs::symlink_metadata(&fp_sub)
-                                .is_ok_and(|m| m.file_type().is_dir())
-                            {
-                                parse_fingerprint_dir(&fp_sub, seen_hardlinks)
-                            } else {
-                                let mtime = fs::symlink_metadata(&child_path)
-                                    .map(|m| meta_mtime_unix(&m))
-                                    .unwrap_or(0);
-                                ParsedFingerprintDir {
-                                    metadata: UnitMetadata::Incomplete { mtime_unix: mtime },
-                                    allocated_bytes: 0,
-                                    corrupt: false,
+                    let mut non_v2_sibling_bytes: u64 = 0;
+                    match fs::read_dir(&entry_path) {
+                        Ok(children) => {
+                            for child in children.flatten() {
+                                let child_path = child.path();
+                                let Ok(cft) = child.file_type() else {
+                                    continue;
+                                };
+                                if cft.is_symlink() {
+                                    continue;
                                 }
-                            };
-                            if parsed.corrupt {
-                                fingerprint_corrupt = true;
+                                if !cft.is_dir() {
+                                    if let Ok(meta) = fs::symlink_metadata(&child_path) {
+                                        non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(
+                                            entry_allocated_bytes(&meta, seen_hardlinks),
+                                        );
+                                    }
+                                    continue;
+                                }
+                                let child_os = child.file_name();
+                                let Some(child_name) = child_os.to_str() else {
+                                    non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(
+                                        sum_tree_bytes(&child_path, seen_hardlinks),
+                                    );
+                                    continue;
+                                };
+                                if !is_16_lower_hex(child_name) {
+                                    non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(
+                                        sum_tree_bytes(&child_path, seen_hardlinks),
+                                    );
+                                    continue;
+                                }
+
+                                let unit_hash = CompactString::from(child_name);
+                                let fp_sub = child_path.join("fingerprint");
+                                let parsed = if fs::symlink_metadata(&fp_sub)
+                                    .is_ok_and(|m| m.file_type().is_dir())
+                                {
+                                    parse_fingerprint_dir(&fp_sub, seen_hardlinks)
+                                } else {
+                                    let mtime = fs::symlink_metadata(&child_path)
+                                        .map(|m| meta_mtime_unix(&m))
+                                        .unwrap_or(0);
+                                    ParsedFingerprintDir {
+                                        metadata: UnitMetadata::Incomplete { mtime_unix: mtime },
+                                        allocated_bytes: 0,
+                                        corrupt: false,
+                                    }
+                                };
+                                if parsed.corrupt {
+                                    fingerprint_corrupt = true;
+                                }
+
+                                let other_bytes = sum_tree_bytes_excluding_child(
+                                    &child_path,
+                                    "fingerprint",
+                                    seen_hardlinks,
+                                );
+                                let unit_bytes = parsed.allocated_bytes.saturating_add(other_bytes);
+                                let unit_mtime = unit_metadata_mtime(&parsed.metadata);
+                                last_activity_unix = last_activity_unix.max(unit_mtime);
+                                allocated_bytes = allocated_bytes.saturating_add(unit_bytes);
+
+                                v2_units.push(BuildUnit {
+                                    id: BuildUnitId::V2 {
+                                        pkg: name.clone(),
+                                        unit_hash,
+                                    },
+                                    pkg_group: name.clone(),
+                                    metadata: parsed.metadata,
+                                    v1_build_dir: None,
+                                    v1_dep_entries: Vec::new(),
+                                    allocated_bytes: unit_bytes,
+                                });
                             }
-
-                            let other_bytes = sum_tree_bytes_excluding_child(
-                                &child_path,
-                                "fingerprint",
-                                seen_hardlinks,
-                            );
-                            let unit_bytes = parsed.allocated_bytes.saturating_add(other_bytes);
-                            let unit_mtime = unit_metadata_mtime(&parsed.metadata);
-                            last_activity_unix = last_activity_unix.max(unit_mtime);
-                            allocated_bytes = allocated_bytes.saturating_add(unit_bytes);
-
-                            v2_units.push(BuildUnit {
-                                id: BuildUnitId::V2 {
-                                    pkg: name.clone(),
-                                    unit_hash,
-                                },
-                                pkg_group: name.clone(),
-                                metadata: parsed.metadata,
-                                v1_build_dir: None,
-                                v1_dep_entries: Vec::new(),
-                                allocated_bytes: unit_bytes,
-                            });
+                        }
+                        Err(_) => {
+                            fingerprint_corrupt = true;
                         }
                     }
 
-                    if !found_v2_child {
-                        allocated_bytes = allocated_bytes
-                            .saturating_add(sum_tree_bytes(&entry_path, seen_hardlinks));
-                    }
+                    allocated_bytes = allocated_bytes.saturating_add(non_v2_sibling_bytes);
                 }
             }
             Err(_) => {
@@ -2219,9 +2282,11 @@ fn inspect_incremental_dir(
         .map(|m| meta_mtime_unix(&m))
         .unwrap_or(0);
 
-    let entries: Vec<_> = match fs::read_dir(dir_path) {
-        Ok(rd) => rd.flatten().collect(),
-        Err(_) => Vec::new(),
+    // Fail closed when an incremental crate directory is unreadable: mark `any_locked = true`
+    // so `R3` never treats it as an empty unlocked `WorkingOnly` directory and schedules removal.
+    let (entries, dir_unreadable) = match fs::read_dir(dir_path) {
+        Ok(rd) => (rd.flatten().collect(), false),
+        Err(_) => (Vec::new(), true),
     };
 
     for entry in &entries {
@@ -2250,7 +2315,7 @@ fn inspect_incremental_dir(
         }
     }
 
-    let mut any_locked = lock_status.values().any(|&locked| locked);
+    let mut any_locked = dir_unreadable || lock_status.values().any(|&locked| locked);
 
     for entry in entries {
         let entry_path = entry.path();
@@ -2418,9 +2483,18 @@ fn inspect_git_for_target(
         Err(reason) => return GitDiscovery::Failed(reason),
     };
 
-    let has_tracked_files_in_target = if !info.worktree_dir_missing
-        && let Ok(rel_target) = target_root.strip_prefix(&info.worktree_root)
-    {
+    let norm_target = normalize_macos_system_symlinks(target_root);
+    let has_tracked_files_in_target = if !info.worktree_dir_missing {
+        let Ok(rel_target) = norm_target.strip_prefix(&info.worktree_root) else {
+            return GitDiscovery::Failed(CompactString::new(
+                "target path outside inspected git worktree root",
+            ));
+        };
+        if rel_target.as_os_str().is_empty() {
+            return GitDiscovery::Failed(CompactString::new(
+                "target path equals git worktree root",
+            ));
+        }
         let Some(rel_str) = rel_target.to_str() else {
             return GitDiscovery::Failed(CompactString::new(
                 "non-utf8 target path inside git worktree",
@@ -2862,12 +2936,39 @@ fn record_stat_blocks(st: &rustix::fs::Stat, is_dir: bool, out: &mut TreeAccount
     let bytes = blocks.saturating_mul(512);
     let nlink = u64::from(st.st_nlink);
     if !is_dir && nlink > 1 {
-        let dev = u64::try_from(st.st_dev).unwrap_or(0);
+        #[allow(clippy::unnecessary_cast)]
+        let dev = st.st_dev as u64;
         #[allow(clippy::unnecessary_cast)]
         let ino = st.st_ino as u64;
         out.multi_link.push((dev, ino, bytes));
     } else {
         out.nlink1_bytes = out.nlink1_bytes.saturating_add(bytes);
+    }
+}
+
+/// Fail-closed `.targetwarden-pin` check: only `ErrorKind::NotFound` means absent.
+fn pin_marker_present_fail_closed(path: &Path) -> bool {
+    !matches!(
+        fs::symlink_metadata(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// Stable `(dev, ino)` identity on Unix; deterministic path-derived fallback on non-Unix so
+/// multi-target deduplication never collapses distinct paths into `(0, 0)` on Windows.
+fn file_identity(path: &Path, meta: &fs::Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        (meta_dev(meta), meta_ino(meta))
+    }
+    #[cfg(not(unix))]
+    {
+        use std::hash::{Hash, Hasher};
+        let _ = meta;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        (0, hasher.finish())
     }
 }
 
@@ -3549,5 +3650,197 @@ mod tests {
         );
         let partial_snap = scan(&platform, &tight_cfg, &partial_req).unwrap();
         assert!(partial_snap.walk_partial);
+    }
+
+    #[test]
+    fn known_targets_with_parent_and_nested_child_does_not_double_count_or_drop_parent_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let parent = base.join("proj/target");
+        let nested = parent.join("grpc-codegen");
+        write_cargo_tag(&parent);
+        write_cargo_tag(&nested);
+        fs::create_dir_all(parent.join("debug/build/app/1111111111111111/fingerprint")).unwrap();
+        fs::write(
+            parent.join("debug/build/app/1111111111111111/out_blob"),
+            vec![1u8; 64 * 1024],
+        )
+        .unwrap();
+        fs::create_dir_all(nested.join("debug/build/proto/2222222222222222/fingerprint")).unwrap();
+        fs::write(
+            nested.join("debug/build/proto/2222222222222222/out_blob"),
+            vec![2u8; 128 * 1024],
+        )
+        .unwrap();
+
+        let platform = TestPlatform::new(1_800_000_000);
+        let cfg = Config::default();
+
+        // Reference full walk without cached known_targets
+        let fresh_req = ScanRequest::with_default_volume(
+            vec![ScanRoot {
+                path: base.clone(),
+                max_depth: 6,
+                explicit: true,
+            }],
+            vec![],
+            true,
+            ScanDetail::Inventory,
+        );
+        let fresh_snap = scan(&platform, &cfg, &fresh_req).unwrap();
+        assert_eq!(fresh_snap.targets.len(), 2);
+
+        // Cached walk with BOTH parent and nested child in `known_targets` (normal state.json contents)
+        for detail in [ScanDetail::Inventory, ScanDetail::Full] {
+            let cached_req = ScanRequest::with_default_volume(
+                vec![ScanRoot {
+                    path: base.clone(),
+                    max_depth: 6,
+                    explicit: true,
+                }],
+                vec![nested.clone(), parent.clone()],
+                true,
+                detail,
+            );
+            let cached_snap = scan(&platform, &cfg, &cached_req).unwrap();
+            assert_eq!(cached_snap.targets.len(), 2);
+            let fresh_nested = fresh_snap
+                .targets
+                .iter()
+                .find(|t| t.root == nested)
+                .unwrap();
+            let cached_nested = cached_snap
+                .targets
+                .iter()
+                .find(|t| t.root == nested)
+                .unwrap();
+            assert_eq!(
+                cached_nested.parent_target.as_deref(),
+                Some(parent.as_path())
+            );
+            assert_eq!(
+                cached_nested.allocated_bytes, fresh_nested.allocated_bytes,
+                "nested target must not be double-counted when present in known_targets ({detail:?})"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_target_root_and_incremental_dir_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+
+        // 1. Unreadable target_root (0o111: searchable so CACHEDIR.TAG opens, but read_dir fails EACCES)
+        let ro_target = base.join("unreadable_proj/target");
+        write_cargo_tag(&ro_target);
+        fs::create_dir_all(ro_target.join("debug/build/demo/1111111111111111")).unwrap();
+
+        // 2. Unreadable incremental crate directory inside a readable target
+        let inc_target = base.join("inc_proj/target");
+        write_cargo_tag(&inc_target);
+        let locked_inc = inc_target.join("debug/incremental/demo-abc1234567890");
+        fs::create_dir_all(locked_inc.join("s-1-aaa-final")).unwrap();
+
+        fs::set_permissions(&ro_target, fs::Permissions::from_mode(0o111)).unwrap();
+        fs::set_permissions(&locked_inc, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let platform = TestPlatform::new(1_800_000_000);
+        let cfg = Config::default();
+        let req = ScanRequest::with_default_volume(
+            vec![],
+            vec![ro_target.clone(), inc_target.clone()],
+            false,
+            ScanDetail::Full,
+        );
+        let snap = scan(&platform, &cfg, &req).unwrap();
+
+        // Restore permissions before asserting so TempDir always cleans up!
+        fs::set_permissions(&ro_target, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&locked_inc, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let t_ro = snap.targets.iter().find(|t| t.root == ro_target).unwrap();
+        assert!(
+            t_ro.has_unverified_top_entries,
+            "unreadable target_root must fail closed as unverified/protected"
+        );
+
+        let t_inc = snap.targets.iter().find(|t| t.root == inc_target).unwrap();
+        assert_eq!(t_inc.profiles[0].incremental_dirs.len(), 1);
+        assert!(
+            t_inc.profiles[0].incremental_dirs[0].any_locked,
+            "unreadable incremental dir must fail closed as locked so R3 never prunes it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_and_var_alias_target_paths_inside_git_repo_fail_closed_or_detect_tracked() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(tmp.path()).unwrap().join("git-edge");
+        fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .unwrap();
+            assert!(st.status.success(), "git {args:?} failed: {:?}", st);
+        };
+        run(&["init", "-b", "main"]);
+
+        // 1. Tracked file detected even if known_targets uses `/var/...` alias on macOS
+        let tracked_target = repo.join("target");
+        write_cargo_tag(&tracked_target);
+        fs::create_dir_all(tracked_target.join("debug")).unwrap();
+        fs::write(tracked_target.join("debug/tracked.txt"), b"keep").unwrap();
+        run(&["add", "target/debug/tracked.txt"]);
+        run(&["commit", "-m", "track file"]);
+
+        let alias_target = tracked_target
+            .strip_prefix("/private")
+            .map(|rest| Path::new("/").join(rest))
+            .unwrap_or_else(|_| tracked_target.clone());
+
+        let mut platform = TestPlatform::new(1_800_000_000);
+        platform.run_real_git = true;
+        let cfg = Config::default();
+        let req = ScanRequest::with_default_volume(
+            vec![],
+            vec![alias_target],
+            false,
+            ScanDetail::Inventory,
+        );
+        let snap = scan(&platform, &cfg, &req).unwrap();
+        assert_eq!(snap.targets.len(), 1);
+        assert!(matches!(
+            &snap.targets[0].git,
+            GitDiscovery::Inspected(git) if git.has_tracked_files_in_target
+        ));
+
+        // 2. Non-UTF8 target path inside a Git repo fails closed (on filesystems allowing non-UTF8)
+        let bad_name = OsString::from_vec(vec![b't', b'g', b't', 0xff]);
+        let bad_target = repo.join(bad_name);
+        if fs::create_dir_all(bad_target.join("debug")).is_ok() {
+            write_cargo_tag(&bad_target);
+            let bad_req = ScanRequest::with_default_volume(
+                vec![],
+                vec![bad_target],
+                false,
+                ScanDetail::Inventory,
+            );
+            let bad_snap = scan(&platform, &cfg, &bad_req).unwrap();
+            assert_eq!(bad_snap.targets.len(), 1);
+            assert!(matches!(bad_snap.targets[0].git, GitDiscovery::Failed(_)));
+        }
     }
 }

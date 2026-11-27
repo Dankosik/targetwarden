@@ -23,6 +23,7 @@ pub(crate) enum AppError {
     ConfigInvalid { message: String },
     #[error("invalid path `{path}`: {message}")]
     InvalidPath { path: PathBuf, message: String },
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     #[error("cannot read disk statistics for `{path}`: {message}")]
     DiskStats { path: PathBuf, message: String },
     #[error("process snapshot failed (fail-closed): {0}")]
@@ -37,6 +38,7 @@ pub(crate) enum AppError {
     #[cfg_attr(not(unix), allow(dead_code))]
     #[error("signal handling error: {0}")]
     Signal(String),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     #[error("lock probe failed for `{path}`: {source}")]
     LockProbe {
         path: PathBuf,

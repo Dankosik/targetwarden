@@ -307,7 +307,19 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
             );
 
             if !dry_run {
-                state.pressure = current_pressure;
+                let final_pressure = exec
+                    .receipts
+                    .iter()
+                    .rev()
+                    .find(|r| matches!(r.outcome, ActionOutcome::Applied) && r.free_after_bytes > 0)
+                    .map_or(current_pressure, |r| {
+                        pressure::evaluate_pressure(
+                            current_pressure,
+                            r.free_after_bytes,
+                            &config.pressure,
+                        )
+                    });
+                state.pressure = final_pressure;
                 if let Some(hold) = exec.triggered_hold {
                     plan.hold_active = true;
                     state.reclaim_hold = Some(hold);
@@ -515,6 +527,7 @@ where
         };
 
         let (mut state, recovery_diag) = state_cache.load_or_recover();
+        last_pressure = state.pressure;
         if let Some(diag) = recovery_diag {
             log_watch_warning(
                 stderr,
@@ -530,6 +543,7 @@ where
             Ok(probe_free_bytes) => {
                 let probe_pressure =
                     pressure::evaluate_pressure(state.pressure, probe_free_bytes, &config.pressure);
+                last_pressure = probe_pressure;
                 let entered_high =
                     state.pressure < DiskPressure::High && probe_pressure >= DiskPressure::High;
                 let full_walk = should_run_full_walk(&state, platform.now_unix(), entered_high);
@@ -571,7 +585,6 @@ where
                                         snapshot.disk.free_bytes,
                                         &config.pressure,
                                     );
-                                    last_pressure = current_pressure;
 
                                     if let Some(hold) = &state.reclaim_hold
                                         && pressure::check_hold_reset(
@@ -622,7 +635,26 @@ where
                                         Some(stop_flag),
                                     );
 
-                                    state.pressure = current_pressure;
+                                    let final_pressure = if dry_run {
+                                        current_pressure
+                                    } else {
+                                        exec.receipts
+                                            .iter()
+                                            .rev()
+                                            .find(|r| {
+                                                matches!(r.outcome, ActionOutcome::Applied)
+                                                    && r.free_after_bytes > 0
+                                            })
+                                            .map_or(current_pressure, |r| {
+                                                pressure::evaluate_pressure(
+                                                    current_pressure,
+                                                    r.free_after_bytes,
+                                                    &config.pressure,
+                                                )
+                                            })
+                                    };
+                                    last_pressure = final_pressure;
+                                    state.pressure = final_pressure;
                                     if !dry_run && let Some(hold) = exec.triggered_hold {
                                         state.reclaim_hold = Some(hold);
                                     }
