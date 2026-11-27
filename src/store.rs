@@ -4,7 +4,7 @@
 //! Allowed dependencies: `error`, `model`, `state`.
 
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -309,7 +309,7 @@ fn append_receipts_with_limits(
     })?;
 
     let log_path = state_dir.join("actions.jsonl");
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(receipts.len().saturating_mul(256));
     for receipt in receipts {
         serde_json::to_writer(&mut buf, receipt).map_err(|error| AppError::Store {
             path: log_path.clone(),
@@ -374,7 +374,7 @@ fn rotate_actions_log(
     Ok(())
 }
 
-/// Read the latest `limit` entries from `actions.jsonl` using reverse `memchr` scanning.
+/// Read the latest `limit` entries from `actions.jsonl` by tail-seeking from EOF with reverse `memchr`.
 pub(crate) fn read_recent_receipts(
     state_dir: &Path,
     limit: usize,
@@ -383,7 +383,7 @@ pub(crate) fn read_recent_receipts(
         return Ok(Vec::new());
     }
     let log_path = state_dir.join("actions.jsonl");
-    let bytes = match fs::read(&log_path) {
+    let bytes = match read_tail_lines_bytes(&log_path, limit) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
@@ -395,7 +395,7 @@ pub(crate) fn read_recent_receipts(
     };
 
     let tail = slice_last_n_lines(&bytes, limit);
-    let mut receipts = Vec::new();
+    let mut receipts = Vec::with_capacity(limit.min(64));
     for raw_line in tail.split(|&b| b == b'\n') {
         if raw_line.is_empty() {
             continue;
@@ -408,6 +408,51 @@ pub(crate) fn read_recent_receipts(
         receipts.push(receipt);
     }
     Ok(receipts)
+}
+
+/// Read only the minimal suffix of `path` needed to cover the last `limit` newline-delimited lines.
+fn read_tail_lines_bytes(path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    const INITIAL_TAIL_WINDOW: u64 = 16 * 1024;
+
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len == 0 {
+        return Ok(Vec::new());
+    }
+    if file_len <= INITIAL_TAIL_WINDOW {
+        let mut buf = Vec::with_capacity(usize::try_from(file_len).unwrap_or(0));
+        file.read_to_end(&mut buf)?;
+        return Ok(buf);
+    }
+
+    let mut window = INITIAL_TAIL_WINDOW
+        .max(u64::try_from(limit).unwrap_or(u64::MAX).saturating_mul(384))
+        .min(file_len);
+    let mut buf = Vec::new();
+    loop {
+        let start = file_len.saturating_sub(window);
+        let to_read = usize::try_from(file_len - start).unwrap_or(usize::MAX);
+        file.seek(SeekFrom::Start(start))?;
+        buf.clear();
+        buf.reserve(to_read);
+        (&file).take(file_len - start).read_to_end(&mut buf)?;
+
+        if start == 0 {
+            return Ok(buf);
+        }
+        let trimmed_end = if buf.last() == Some(&b'\n') {
+            buf.len().saturating_sub(1)
+        } else {
+            buf.len()
+        };
+        let newlines = memchr::memrchr_iter(b'\n', &buf[..trimmed_end])
+            .take(limit)
+            .count();
+        if newlines >= limit {
+            return Ok(buf);
+        }
+        window = window.saturating_mul(2).min(file_len);
+    }
 }
 
 /// Return a subslice containing the last `n` newline-delimited lines using `memchr::memrchr_iter`.
@@ -529,5 +574,53 @@ mod tests {
         assert_eq!(top2.len(), 2);
         assert_eq!(top2[0].ts_unix, 29);
         assert_eq!(top2[1].ts_unix, 30);
+    }
+
+    #[test]
+    fn read_recent_receipts_tail_seeks_across_multi_chunk_log_and_rejects_corrupt_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write 250 receipts (~60 KiB, well past the 16 KiB initial tail window)
+        let batch: Vec<ActionReceipt> = (1..=250).map(sample_receipt).collect();
+        append_receipts_with_limits(dir.path(), &batch, 10 * 1024 * 1024, 10_000).unwrap();
+        let file_len = std::fs::metadata(dir.path().join("actions.jsonl"))
+            .unwrap()
+            .len();
+        assert!(file_len > 40 * 1024, "expected >40 KiB log, got {file_len}");
+
+        assert!(read_recent_receipts(dir.path(), 0).unwrap().is_empty());
+
+        let last1 = read_recent_receipts(dir.path(), 1).unwrap();
+        assert_eq!(last1.len(), 1);
+        assert_eq!(last1[0].ts_unix, 250);
+
+        let last5 = read_recent_receipts(dir.path(), 5).unwrap();
+        let ts5: Vec<u64> = last5.iter().map(|r| r.ts_unix).collect();
+        assert_eq!(ts5, vec![246, 247, 248, 249, 250]);
+
+        // Crosses multiple doubling windows (> 32 KiB)
+        let last160 = read_recent_receipts(dir.path(), 160).unwrap();
+        assert_eq!(last160.len(), 160);
+        assert_eq!(last160.first().unwrap().ts_unix, 91);
+        assert_eq!(last160.last().unwrap().ts_unix, 250);
+
+        // Requesting more than total returns the entire log cleanly
+        let all = read_recent_receipts(dir.path(), 500).unwrap();
+        assert_eq!(all.len(), 250);
+        assert_eq!(all.first().unwrap().ts_unix, 1);
+        assert_eq!(all.last().unwrap().ts_unix, 250);
+
+        // Strip trailing newline and confirm tail seeking still works identically
+        let log_path = dir.path().join("actions.jsonl");
+        let mut raw = std::fs::read(&log_path).unwrap();
+        assert_eq!(raw.pop(), Some(b'\n'));
+        std::fs::write(&log_path, &raw).unwrap();
+        let last3_no_nl = read_recent_receipts(dir.path(), 3).unwrap();
+        let ts3: Vec<u64> = last3_no_nl.iter().map(|r| r.ts_unix).collect();
+        assert_eq!(ts3, vec![248, 249, 250]);
+
+        // Corrupt line at the tail MUST fail closed
+        raw.extend_from_slice(b"\n{not_json\n");
+        std::fs::write(&log_path, &raw).unwrap();
+        assert!(read_recent_receipts(dir.path(), 2).is_err());
     }
 }

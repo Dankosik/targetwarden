@@ -9,8 +9,8 @@ use compact_str::CompactString;
 
 use crate::config::Config;
 use crate::model::{
-    CargoTarget, DiskPressure, EvictRule, GitDiscovery, PlanMode, ProcessSnapshot, ReclaimAction,
-    ReclaimPlan, ReclaimProfile, SafetyVerdict, ScanSnapshot, WorktreeKind,
+    CargoTarget, DiskPressure, EvictRule, GitDiscovery, PathPrefix, PlanMode, ProcessSnapshot,
+    ReclaimAction, ReclaimPlan, ReclaimProfile, SafetyVerdict, ScanSnapshot, WorktreeKind,
 };
 use crate::safety;
 use crate::state::State;
@@ -424,18 +424,13 @@ fn collect_target_locks(target: &CargoTarget, out: &mut Vec<PathBuf>) {
 }
 
 fn any_process_inside(snapshot: &ProcessSnapshot, dir: &Path) -> bool {
+    let prefix = PathPrefix::new(dir);
     snapshot.processes.iter().any(|proc_entry| {
         if snapshot.self_pid != 0 && proc_entry.pid == snapshot.self_pid {
             return false;
         }
-        proc_entry
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd.starts_with(dir))
-            || proc_entry
-                .open_paths
-                .iter()
-                .any(|open| open.starts_with(dir))
+        snapshot.cwd_has_prefix(proc_entry, &prefix)
+            || snapshot.any_open_has_prefix(proc_entry, &prefix)
     })
 }
 
@@ -450,9 +445,9 @@ mod tests {
     use crate::config::Config;
     use crate::model::{
         BuildUnit, BuildUnitId, CargoTarget, DiskPressure, DiskStats, EvictRule, GIB, GitDiscovery,
-        GitInspection, LeftoverStaging, PlanMode, ProcessEntry, ProcessSnapshot, ProfileDir,
-        ProtectedReason, ReclaimAction, ReclaimHoldState, ReclaimProfile, SafetyVerdict,
-        ScanSnapshot, TargetLayout, TargetOrigin, UnitMetadata, WorktreeKind,
+        GitInspection, LeftoverStaging, PlanMode, ProcessSnapshot, ProfileDir, ProtectedReason,
+        ReclaimAction, ReclaimHoldState, ReclaimProfile, SafetyVerdict, ScanSnapshot, TargetLayout,
+        TargetOrigin, TestProcessEntry, UnitMetadata, WorktreeKind,
     };
     use crate::state::State;
 
@@ -510,6 +505,7 @@ mod tests {
                 incremental_dir_count: 0,
                 v2_units: vec![],
                 v1_units: vec![],
+                dep_fp_pool: vec![],
                 incremental_dirs: vec![],
                 profile_mtime_unix: NOW - age_secs,
                 inc_root_mtime_unix: NOW - age_secs,
@@ -569,12 +565,10 @@ mod tests {
                 pkg: CompactString::new("aborted"),
                 unit_hash: CompactString::new("0123456789abcdef"),
             },
-            pkg_group: CompactString::new("aborted"),
             metadata: UnitMetadata::Incomplete {
                 mtime_unix: NOW - 10_000,
             },
-            v1_build_dir: None,
-            v1_dep_entries: vec![],
+            v1: None,
             allocated_bytes: 4096,
         });
         let t_b = mk_target_with("/b/target", WorktreeKind::NonGit, 10_000, 4096, None);
@@ -587,17 +581,17 @@ mod tests {
                 free_bytes: 100 * GIB,
                 local_snapshots: Some(vec![]),
             },
-            processes: Some(ProcessSnapshot {
-                captured_at_unix: NOW,
-                self_pid: 1,
-                processes: vec![ProcessEntry {
+            processes: Some(ProcessSnapshot::from_test_entries(
+                NOW,
+                1,
+                vec![TestProcessEntry {
                     pid: 42,
                     comm: CompactString::new("cat"),
                     exe_path: None,
                     cwd: None,
                     open_paths: vec![PathBuf::from("/tmp/.targetwarden-reap.busy/file")],
                 }],
-            }),
+            )),
             process_snapshot_error: None,
             mount_table_available: true,
             mount_table_error: None,
@@ -694,11 +688,7 @@ mod tests {
                 free_bytes: 40 * GIB,
                 local_snapshots: Some(vec![]),
             },
-            processes: Some(ProcessSnapshot {
-                captured_at_unix: NOW,
-                self_pid: 1,
-                processes: vec![],
-            }),
+            processes: Some(ProcessSnapshot::empty(NOW, 1)),
             process_snapshot_error: None,
             mount_table_available: true,
             mount_table_error: None,
@@ -812,11 +802,7 @@ mod tests {
                 free_bytes: 100 * GIB,
                 local_snapshots: Some(vec![]),
             },
-            processes: Some(ProcessSnapshot {
-                captured_at_unix: NOW,
-                self_pid: 1,
-                processes: vec![],
-            }),
+            processes: Some(ProcessSnapshot::empty(NOW, 1)),
             process_snapshot_error: None,
             mount_table_available: true,
             mount_table_error: None,
@@ -908,11 +894,7 @@ mod tests {
                 free_bytes: 40 * GIB,
                 local_snapshots: Some(vec![]),
             },
-            processes: Some(ProcessSnapshot {
-                captured_at_unix: NOW,
-                self_pid: 1,
-                processes: vec![],
-            }),
+            processes: Some(ProcessSnapshot::empty(NOW, 1)),
             process_snapshot_error: None,
             mount_table_available: true,
             mount_table_error: None,
@@ -1004,11 +986,7 @@ mod tests {
                 free_bytes: 40 * GIB,
                 local_snapshots: Some(vec![]),
             },
-            processes: Some(ProcessSnapshot {
-                captured_at_unix: NOW,
-                self_pid: 1,
-                processes: vec![],
-            }),
+            processes: Some(ProcessSnapshot::empty(NOW, 1)),
             process_snapshot_error: None,
             mount_table_available: true,
             mount_table_error: None,

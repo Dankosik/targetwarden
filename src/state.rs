@@ -10,8 +10,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{
     ActionOutcome, ActionReceipt, CargoTarget, DiskPressure, KnownTargetEntry, PinEntry, PinScope,
-    ReclaimHoldState, SCHEMA_VERSION,
+    ReclaimHoldState, SCHEMA_VERSION, TargetLayout,
 };
+
+/// Compact per-target summary extracted before dropping `ScanSnapshot` ahead of plan execution.
+#[derive(Clone, Debug)]
+pub(crate) struct TargetScanSummary {
+    pub root: PathBuf,
+    pub layout: TargetLayout,
+    pub allocated_bytes: u64,
+    pub last_activity_unix: u64,
+}
+
+impl From<&CargoTarget> for TargetScanSummary {
+    fn from(target: &CargoTarget) -> Self {
+        Self {
+            root: target.root.clone(),
+            layout: target.layout,
+            allocated_bytes: target.allocated_bytes,
+            last_activity_unix: target.last_activity_unix,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct State {
@@ -69,12 +89,12 @@ impl State {
         matched
     }
 
-    /// Update `known_targets` from a completed scan snapshot.
+    /// Update `known_targets` from compact target summaries extracted from a completed scan.
     /// If `full_walk && !walk_partial`, unseen targets are retired and `last_full_walk_unix` advances.
     /// If `walk_partial`, unseen `known_targets` are preserved without eviction.
-    pub(crate) fn record_scan_targets(
+    pub(crate) fn record_scan_summaries(
         &mut self,
-        targets: &[CargoTarget],
+        targets: &[TargetScanSummary],
         now_unix: u64,
         full_walk: bool,
         walk_partial: bool,
@@ -103,6 +123,20 @@ impl State {
             self.known_targets
                 .retain(|path, _| seen.contains(path.as_path()));
         }
+    }
+
+    /// Update `known_targets` from a completed scan snapshot.
+    #[cfg(test)]
+    pub(crate) fn record_scan_targets(
+        &mut self,
+        targets: &[CargoTarget],
+        now_unix: u64,
+        full_walk: bool,
+        walk_partial: bool,
+    ) {
+        let summaries: Vec<TargetScanSummary> =
+            targets.iter().map(TargetScanSummary::from).collect();
+        self.record_scan_summaries(&summaries, now_unix, full_walk, walk_partial);
     }
 
     /// Accumulate reclaimed allocated bytes from applied action receipts and retire evicted targets.

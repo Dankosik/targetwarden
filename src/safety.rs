@@ -11,10 +11,18 @@ use smallvec::SmallVec;
 
 use crate::config::Config;
 use crate::model::{
-    CargoTarget, DiskPressure, GitDiscovery, PinScope, ProcessEntry, ProtectedReason,
-    SafetyVerdict, ScanSnapshot, SweepOnlyReason, WorktreeKind,
+    CargoTarget, DiskPressure, GitDiscovery, PathPrefix, PinScope, ProcessEntry, ProcessSnapshot,
+    ProtectedReason, SafetyVerdict, ScanSnapshot, SweepOnlyReason, WorktreeKind,
 };
 use crate::state::State;
+
+#[derive(Clone, Copy)]
+struct ClassifiedProcess<'a> {
+    entry: &'a ProcessEntry,
+    is_proc_macro_srv: bool,
+    is_ra: bool,
+    is_compiler_or_tool: bool,
+}
 
 /// Evaluate all 6 safety barriers plus bottom-up nested target propagation.
 /// Returns one `SafetyVerdict` per target in `snapshot.targets` (matching indices).
@@ -26,10 +34,38 @@ pub(crate) fn evaluate_all(
     ignore_snapshot_hold: bool,
 ) -> Vec<SafetyVerdict> {
     let hold_active = state.reclaim_hold.is_some() && !ignore_snapshot_hold;
+    let classified_procs: Vec<ClassifiedProcess<'_>> = snapshot
+        .processes
+        .as_ref()
+        .map(|proc_snap| {
+            proc_snap
+                .processes
+                .iter()
+                .filter(|p| proc_snap.self_pid == 0 || p.pid != proc_snap.self_pid)
+                .map(|entry| ClassifiedProcess {
+                    entry,
+                    is_proc_macro_srv: proc_snap.is_rust_analyzer_proc_macro_srv(entry),
+                    is_ra: proc_snap.is_rust_analyzer(entry),
+                    is_compiler_or_tool: proc_snap.is_active_compiler_or_tool(entry),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut verdicts: Vec<SafetyVerdict> = snapshot
         .targets
         .iter()
-        .map(|target| evaluate_single(target, snapshot, state, config, pressure, hold_active))
+        .map(|target| {
+            evaluate_single(
+                target,
+                snapshot,
+                &classified_procs,
+                state,
+                config,
+                pressure,
+                hold_active,
+            )
+        })
         .collect();
 
     propagate_nested_verdicts(&snapshot.targets, &mut verdicts);
@@ -55,6 +91,7 @@ pub(crate) fn is_r1_dead_worktree_candidate(target: &CargoTarget) -> bool {
 fn evaluate_single(
     target: &CargoTarget,
     snapshot: &ScanSnapshot,
+    classified_procs: &[ClassifiedProcess<'_>],
     state: &State,
     config: &Config,
     pressure: DiskPressure,
@@ -145,14 +182,14 @@ fn evaluate_single(
     // Barrier 5: active processes (`lsof` snapshot)
     let worktree_root = target.worktree_root();
     if let Some(proc_snap) = &snapshot.processes {
-        for proc_entry in &proc_snap.processes {
-            if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
-                continue;
-            }
+        let target_prefix = PathPrefix::new(&target.root);
+        let wt_prefix = worktree_root.map(PathPrefix::new);
+        for proc_info in classified_procs {
             evaluate_process_against_target(
-                proc_entry,
-                &target.root,
-                worktree_root,
+                proc_snap,
+                *proc_info,
+                target_prefix,
+                wt_prefix,
                 &mut protected,
                 &mut sweep_only,
                 &mut pinned_unit_paths,
@@ -199,35 +236,29 @@ fn evaluate_single(
 }
 
 fn evaluate_process_against_target(
-    proc_entry: &ProcessEntry,
-    target_root: &Path,
-    worktree_root: Option<&Path>,
+    proc_snap: &ProcessSnapshot,
+    proc_info: ClassifiedProcess<'_>,
+    target_prefix: PathPrefix<'_>,
+    wt_prefix: Option<PathPrefix<'_>>,
     protected: &mut SmallVec<[ProtectedReason; 4]>,
     sweep_only: &mut SmallVec<[SweepOnlyReason; 2]>,
     pinned_unit_paths: &mut Vec<PathBuf>,
 ) {
-    let cwd_in_target = proc_entry
-        .cwd
-        .as_deref()
-        .is_some_and(|cwd| cwd.starts_with(target_root));
-    let open_in_target: SmallVec<[&PathBuf; 4]> = proc_entry
-        .open_paths
-        .iter()
-        .filter(|path| path.starts_with(target_root))
-        .collect();
+    let proc_entry = proc_info.entry;
+    let cwd_in_target = proc_snap.cwd_has_prefix(proc_entry, &target_prefix);
 
-    let is_proc_macro_srv = proc_entry.is_rust_analyzer_proc_macro_srv();
-    let is_ra = proc_entry.is_rust_analyzer();
-
-    if is_proc_macro_srv {
+    if proc_info.is_proc_macro_srv {
         let mut has_non_dylib_target_path = cwd_in_target;
         let mut mapped_dylib = false;
-        for path in open_in_target {
-            if is_dylib_path(path) {
-                mapped_dylib = true;
-                pinned_unit_paths.push(path.clone());
-            } else {
-                has_non_dylib_target_path = true;
+        for &path_ref in proc_snap.open_path_refs(proc_entry) {
+            if proc_snap.path_has_prefix(path_ref, &target_prefix) {
+                let path = proc_snap.path(path_ref);
+                if is_dylib_path(path) {
+                    mapped_dylib = true;
+                    pinned_unit_paths.push(path.to_path_buf());
+                } else {
+                    has_non_dylib_target_path = true;
+                }
             }
         }
         if has_non_dylib_target_path {
@@ -238,12 +269,7 @@ fn evaluate_process_against_target(
             });
             return;
         }
-        let cwd_in_worktree = worktree_root.is_some_and(|wt| {
-            proc_entry
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| cwd.starts_with(wt))
-        });
+        let cwd_in_worktree = wt_prefix.is_some_and(|wt| proc_snap.cwd_has_prefix(proc_entry, &wt));
         if mapped_dylib || cwd_in_worktree {
             push_unique_sweep(
                 sweep_only,
@@ -256,7 +282,7 @@ fn evaluate_process_against_target(
     }
 
     // Any other process touching `target_root` directly is an unconditional Hard Block.
-    if cwd_in_target || !open_in_target.is_empty() {
+    if cwd_in_target || proc_snap.any_open_has_prefix(proc_entry, &target_prefix) {
         protected.push(ProtectedReason::HardBlockedProcess {
             pid: proc_entry.pid,
             comm: proc_entry.comm.clone(),
@@ -265,20 +291,14 @@ fn evaluate_process_against_target(
         return;
     }
 
-    let Some(wt_root) = worktree_root else {
+    let Some(wt) = wt_prefix else {
         return;
     };
 
-    let cwd_in_worktree = proc_entry
-        .cwd
-        .as_deref()
-        .is_some_and(|cwd| cwd.starts_with(wt_root));
+    let cwd_in_worktree = proc_snap.cwd_has_prefix(proc_entry, &wt);
 
-    if is_ra {
-        let open_in_worktree = proc_entry
-            .open_paths
-            .iter()
-            .any(|path| path.starts_with(wt_root));
+    if proc_info.is_ra {
+        let open_in_worktree = proc_snap.any_open_has_prefix(proc_entry, &wt);
         if cwd_in_worktree || open_in_worktree {
             push_unique_sweep(
                 sweep_only,
@@ -290,11 +310,8 @@ fn evaluate_process_against_target(
         return;
     }
 
-    if proc_entry.is_active_compiler_or_tool() {
-        let open_in_worktree = proc_entry
-            .open_paths
-            .iter()
-            .any(|path| path.starts_with(wt_root));
+    if proc_info.is_compiler_or_tool {
+        let open_in_worktree = proc_snap.any_open_has_prefix(proc_entry, &wt);
         if cwd_in_worktree || open_in_worktree {
             protected.push(ProtectedReason::HardBlockedProcess {
                 pid: proc_entry.pid,
@@ -402,9 +419,9 @@ mod tests {
     use crate::config::Config;
     use crate::model::{
         CargoTarget, DiskPressure, DiskStats, DocDirInfo, GIB, GitDiscovery, GitInspection,
-        PinEntry, PinScope, ProcessEntry, ProcessSnapshot, ProfileDir, ProtectedReason,
-        ReclaimHoldState, SafetyVerdict, ScanSnapshot, SweepOnlyReason, TargetLayout, TargetOrigin,
-        WorktreeKind,
+        PinEntry, PinScope, ProcessSnapshot, ProfileDir, ProtectedReason, ReclaimHoldState,
+        SafetyVerdict, ScanSnapshot, SweepOnlyReason, TargetLayout, TargetOrigin,
+        TestProcessEntry as ProcessEntry, WorktreeKind,
     };
     use crate::state::State;
 
@@ -455,6 +472,7 @@ mod tests {
                 incremental_dir_count: 0,
                 v2_units: vec![],
                 v1_units: vec![],
+                dep_fp_pool: vec![],
                 incremental_dirs: vec![],
                 profile_mtime_unix: NOW - age_secs,
                 inc_root_mtime_unix: NOW - age_secs,
@@ -482,11 +500,7 @@ mod tests {
                 free_bytes: 100 * GIB,
                 local_snapshots: Some(vec![]),
             },
-            processes: processes.map(|list| ProcessSnapshot {
-                captured_at_unix: NOW,
-                self_pid: 99999,
-                processes: list,
-            }),
+            processes: processes.map(|list| ProcessSnapshot::from_test_entries(NOW, 99999, list)),
             process_snapshot_error: None,
             mount_table_available: true,
             mount_table_error: None,

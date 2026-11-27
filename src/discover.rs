@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use compact_str::CompactString;
@@ -20,13 +21,15 @@ use walkdir::WalkDir;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::model::{
-    BuildUnit, BuildUnitId, CargoTarget, DocDirInfo, GitDiscovery, GitInspection, IncrementalDir,
-    IncrementalSession, LeftoverStaging, MountEntry, ProfileDir, ScanSnapshot, SessionState,
-    TargetLayout, TargetOrigin, UnitMetadata, UnitTargetAnchor, UnitTargetKind, WorktreeKind,
+    BuildUnit, BuildUnitId, CargoTarget, DocDirInfo, FastU64BuildHasher, GitDiscovery,
+    GitInspection, IncrementalDir, IncrementalSession, LeftoverStaging, MountEntry, PathPrefix,
+    ProcessEntry, ProcessSnapshot, ProfileDir, ScanSnapshot, SessionState, TargetLayout,
+    TargetOrigin, UnitMetadata, UnitTargetAnchor, UnitTargetKind, V1UnitExtras, WorktreeKind,
+    extract_16hex_from_dep_name, format_16_lower_hex, is_16_lower_hex, parse_16_lower_hex_u64,
 };
 use crate::platform::{
     DEFAULT_VOLUME_MOUNT, LockProbe, Platform, crosses_mount_boundary, has_symlink_boundary,
-    normalize_macos_system_symlinks,
+    normalize_macos_system_symlinks_cow,
 };
 
 const CACHEDIR_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
@@ -37,110 +40,111 @@ const MAX_COMPANION_HASH_BYTES: u64 = 64;
 const STAGING_PREFIX: &str = ".targetwarden-reap.";
 const SIBLING_STAGING_MARKER: &str = ".targetwarden-reap.";
 const PIN_MARKER_FILE: &str = ".targetwarden-pin";
-const MAX_SCAN_WORKERS: usize = 8;
+const MAX_GIT_WORKERS: usize = 4;
 
-fn bounded_worker_count() -> usize {
+fn bounded_git_worker_count() -> usize {
     std::thread::available_parallelism()
         .map_or(4, std::num::NonZeroUsize::get)
-        .clamp(2, MAX_SCAN_WORKERS)
+        .clamp(2, MAX_GIT_WORKERS)
 }
 
+/// Strictly sorted for O(log N) binary search.
 const PRUNED_DIR_NAMES: &[&str] = &[
+    ".Trash",
+    ".cache",
+    ".codegraph",
     ".git",
+    ".gradle",
     ".hg",
-    ".svn",
-    "node_modules",
-    "vendor",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".ruff_cache",
-    ".pytest_cache",
     ".next",
     ".nuxt",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".svn",
     ".turbo",
-    ".cache",
-    "Pods",
-    ".gradle",
-    ".codegraph",
-    "dist",
+    ".venv",
     "Library",
-    ".Trash",
+    "Pods",
+    "__pycache__",
+    "dist",
+    "node_modules",
+    "vendor",
+    "venv",
 ];
 
 /// Non-target subdirectories pruned only once inside a `.git` repository (never at scan root,
-/// so default roots such as `~/src` remain scanned normally).
+/// so default roots such as `~/src` remain scanned normally). Strictly sorted for O(log N) lookup.
 const REPO_INNER_PRUNED_DIR_NAMES: &[&str] = &[
-    "src",
-    "docs",
-    "migrations",
-    "scripts",
-    "specs",
-    "plans",
-    "evals",
-    "assets",
-    "static",
-    "public",
-    "templates",
-    "charts",
-    "deploy",
-    "infra",
-    "k8s",
-    "helm",
-    "proto",
-    "openapi",
-    "fixtures",
-    "testdata",
-    "cmd",
-    "internal",
-    "pkg",
+    ".agents",
+    ".beads",
+    ".cargo",
+    ".ci",
+    ".claude",
+    ".cloud",
+    ".codex",
+    ".config",
+    ".cursor",
+    ".cursor-plugin",
+    ".gemini",
+    ".githooks",
+    ".github",
+    ".grok",
+    ".idea",
+    ".kilo",
+    ".local",
+    ".mise",
+    ".opencode",
+    ".qwen",
+    ".railway",
+    ".sqlx",
+    ".vscode",
+    "_bmad",
+    "_bmad-output",
+    "ansible",
     "api",
-    "env",
+    "archive",
+    "assets",
+    "brands",
+    "campaigns",
+    "charts",
+    "clients",
+    "cmd",
+    "compose",
+    "contracts",
+    "deploy",
     "design",
+    "docs",
+    "env",
+    "envoy",
+    "evals",
+    "fixtures",
+    "helm",
+    "inbox",
+    "infra",
+    "internal",
+    "k8s",
+    "licenses",
+    "migrations",
+    "observability",
+    "openapi",
+    "patches",
+    "pkg",
+    "plans",
+    "plugins",
+    "postgres",
+    "proto",
+    "public",
+    "quality",
     "research",
     "research_notes",
     "roadmap",
-    "quality",
-    "contracts",
-    "compose",
-    "observability",
-    "envoy",
-    "ansible",
-    "postgres",
-    "plugins",
-    "patches",
-    "licenses",
-    "brands",
-    "campaigns",
+    "scripts",
+    "specs",
+    "src",
+    "static",
     "studio",
-    "clients",
-    "inbox",
-    "archive",
-    "_bmad",
-    "_bmad-output",
-    ".agents",
-    ".github",
-    ".vscode",
-    ".claude",
-    ".codex",
-    ".cursor",
-    ".cursor-plugin",
-    ".idea",
-    ".local",
-    ".beads",
-    ".qwen",
-    ".grok",
-    ".gemini",
-    ".kilo",
-    ".opencode",
-    ".railway",
-    ".githooks",
-    ".mise",
-    ".config",
-    ".cargo",
-    ".sqlx",
-    ".ci",
-    ".cloud",
+    "templates",
+    "testdata",
 ];
 
 /// Controls how deeply target internals are parsed.
@@ -258,19 +262,23 @@ pub(crate) fn scan<P: Platform + Sync>(
 ) -> Result<ScanSnapshot, AppError> {
     let captured_at_unix = platform.now_unix();
 
-    // Overlap independent OS probes (`statvfs`+`tmutil`, `lsof`, `/sbin/mount`) with the
-    // parallel outer directory walk via synchronous scoped threads.
-    let (disk_res, proc_res, mount_res, walk_result) = std::thread::scope(|scope| {
-        let disk_handle = scope.spawn(|| platform.disk_stats(&request.volume_mount));
+    // Overlap independent OS probes (`statvfs`+`tmutil`+`/sbin/mount` and `lsof`) with the
+    // outer directory walk using at most 2 probe threads (minimizes macOS thread-magazine RSS).
+    let ((disk_res, mount_res), proc_res, walk_result) = std::thread::scope(|scope| {
+        let disk_mount_handle = scope.spawn(|| {
+            let disk = platform.disk_stats(&request.volume_mount);
+            let mounts = platform.mount_table();
+            (disk, mounts)
+        });
         let proc_handle = scope.spawn(|| platform.process_snapshot());
-        let mount_handle = scope.spawn(|| platform.mount_table());
         let walk_result = discover_candidates(config, request);
         (
-            disk_handle.join().expect("disk_stats thread panicked"),
+            disk_mount_handle
+                .join()
+                .expect("disk/mount probe thread panicked"),
             proc_handle
                 .join()
                 .expect("process_snapshot thread panicked"),
-            mount_handle.join().expect("mount_table thread panicked"),
             walk_result,
         )
     });
@@ -286,75 +294,34 @@ pub(crate) fn scan<P: Platform + Sync>(
     };
     let mount_table_available = mounts.is_some();
 
-    let mut batches = inspect_candidates_bounded(
+    let preinspected_git = preinspect_git_for_candidates(&walk_result.candidates, platform);
+    let mut session = ScanSession::new(
         platform,
         mounts.as_deref(),
+        processes.as_ref(),
         request.detail,
-        &walk_result.candidates,
+        walk_result.leftover_staging,
+        walk_result.seen_staging,
+        preinspected_git,
     );
-    let mut leftover_staging = walk_result.leftover_staging;
-    let mut seen_staging: HashSet<(u64, u64)> = walk_result.seen_staging;
-
-    // Merge staging dirs found inside targets, deduplicate targets by (dev, ino), and collect
-    // any deferred Inventory accounting chunks for load-balanced parallel execution.
-    let mut final_targets: Vec<CargoTarget> = Vec::new();
-    let mut target_hardlinks: Vec<HashSet<(u64, u64)>> = Vec::new();
-    let mut target_idx_by_id: HashMap<(u64, u64), usize> = HashMap::new();
-    let mut deferred_chunks: Vec<AccountChunk> = Vec::new();
-
-    for batch in batches.drain(..) {
-        let mut accepted_in_batch: HashSet<(u64, u64)> = HashSet::new();
-        for (target, hardlinks) in batch.targets {
-            let key = (target.dev_id, target.ino);
-            match target_idx_by_id.entry(key) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(final_targets.len());
-                    accepted_in_batch.insert(key);
-                    final_targets.push(target);
-                    target_hardlinks.push(hardlinks);
-                }
-                std::collections::hash_map::Entry::Occupied(existing) => {
-                    let existing_target = &mut final_targets[*existing.get()];
-                    if existing_target.parent_target.is_none() && target.parent_target.is_some() {
-                        existing_target.parent_target = target.parent_target;
-                    }
-                }
-            }
-        }
-        for (staging, ino) in batch.leftover_staging {
-            if seen_staging.insert((staging.expected_dev, ino)) {
-                leftover_staging.push(staging);
-            }
-        }
-        for chunk in batch.account_chunks {
-            if accepted_in_batch.contains(&chunk.target_key) {
-                deferred_chunks.push(chunk);
-            }
-        }
-    }
-
-    if !deferred_chunks.is_empty() {
-        apply_deferred_accounting(
-            &deferred_chunks,
-            &target_idx_by_id,
-            &mut final_targets,
-            &mut target_hardlinks,
+    for cand in &walk_result.candidates {
+        session.inspect_target(
+            &cand.path,
+            cand.origin,
+            None,
+            None,
+            None,
+            cand.forced_boundary_violation,
         );
     }
 
-    for target in &mut final_targets {
-        for profile in &mut target.profiles {
-            if profile.last_activity_unix == 0 {
-                profile.last_activity_unix = profile.profile_mtime_unix;
-            }
-            target.last_activity_unix = target.last_activity_unix.max(profile.last_activity_unix);
-        }
-        if target.last_activity_unix == 0 {
-            target.last_activity_unix = target.root_mtime_unix;
-        }
-    }
+    let ScanSession {
+        mut targets,
+        mut leftover_staging,
+        ..
+    } = session;
 
-    final_targets.sort_by(|a, b| a.root.cmp(&b.root));
+    targets.sort_by(|a, b| a.root.cmp(&b.root));
     leftover_staging.sort_by(|a, b| a.staging_dir.cmp(&b.staging_dir));
 
     Ok(ScanSnapshot {
@@ -364,7 +331,7 @@ pub(crate) fn scan<P: Platform + Sync>(
         process_snapshot_error,
         mount_table_available,
         mount_table_error,
-        targets: final_targets,
+        targets,
         walk_partial: walk_result.walk_partial,
         leftover_staging,
         scanned_roots: walk_result.scanned_roots,
@@ -379,7 +346,6 @@ struct WalkResult {
     walk_partial: bool,
 }
 
-#[derive(Clone, Debug)]
 struct WalkTask {
     path: PathBuf,
     depth: usize,
@@ -387,26 +353,60 @@ struct WalkTask {
     repo_cap: Option<usize>,
 }
 
-#[derive(Default)]
-struct WalkBatch {
-    candidates: Vec<(DiscoveredCandidate, u64, u64)>,
-    leftover_staging: Vec<(LeftoverStaging, u64)>,
+struct WalkState<'a> {
+    config: &'a Config,
+    deadline: Instant,
+    total_entries: usize,
+    walk_partial: bool,
+    seen_candidates: HashSet<(u64, u64)>,
+    candidates: Vec<DiscoveredCandidate>,
+    seen_staging: HashSet<(u64, u64)>,
+    leftover_staging: Vec<LeftoverStaging>,
+}
+
+impl WalkState<'_> {
+    #[inline]
+    fn consume_budget(&mut self) -> bool {
+        self.total_entries = self.total_entries.saturating_add(1);
+        if self.total_entries > self.config.discovery.max_entries
+            || ((self.total_entries & 0xFF) == 0 && Instant::now() >= self.deadline)
+        {
+            self.walk_partial = true;
+            return false;
+        }
+        true
+    }
+
+    fn record_candidate(&mut self, path: PathBuf, origin: TargetOrigin) {
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            let id = file_identity(&path, &meta);
+            if self.seen_candidates.insert(id) {
+                self.candidates.push(DiscoveredCandidate {
+                    path,
+                    origin,
+                    forced_boundary_violation: false,
+                });
+            }
+        }
+    }
 }
 
 fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
     let mut visited_roots: HashSet<(u64, u64)> = HashSet::new();
-    let mut seen_candidates: HashSet<(u64, u64)> = HashSet::new();
-    let mut candidates: Vec<DiscoveredCandidate> = Vec::new();
-    let mut leftover_staging: Vec<LeftoverStaging> = Vec::new();
-    let mut seen_staging: HashSet<(u64, u64)> = HashSet::new();
     let mut scanned_roots: Vec<PathBuf> = Vec::new();
-
-    let deadline = Instant::now() + Duration::from_secs(config.discovery.walk_timeout_secs);
-    let total_entries = AtomicUsize::new(0);
-    let walk_partial = AtomicBool::new(false);
+    let mut state = WalkState {
+        config,
+        deadline: Instant::now() + Duration::from_secs(config.discovery.walk_timeout_secs),
+        total_entries: 0,
+        walk_partial: false,
+        seen_candidates: HashSet::new(),
+        candidates: Vec::new(),
+        seen_staging: HashSet::new(),
+        leftover_staging: Vec::new(),
+    };
 
     if request.full_walk {
-        let mut seed_tasks: Vec<WalkTask> = Vec::new();
+        let mut stack: Vec<WalkTask> = Vec::with_capacity(64);
         for root in &request.roots {
             let Ok(lmeta) = fs::symlink_metadata(&root.path) else {
                 continue;
@@ -418,8 +418,8 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
                     && let Some(origin) = detect_target_origin(&root.path)
                 {
                     push_candidate(
-                        &mut seen_candidates,
-                        &mut candidates,
+                        &mut state.seen_candidates,
+                        &mut state.candidates,
                         &root.path,
                         origin,
                         true,
@@ -440,7 +440,7 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
                 continue;
             }
             scanned_roots.push(canon_root.clone());
-            seed_tasks.push(WalkTask {
+            stack.push(WalkTask {
                 path: canon_root,
                 depth: 0,
                 max_depth: root.max_depth,
@@ -448,102 +448,20 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
             });
         }
 
-        // Expand top 1-2 directory levels into independent subtrees so workers share I/O evenly
-        // (e.g., ~/Projects/{org-a/*, org-b/*, oss/*}) while holding <= 1 FD per worker.
-        let worker_count = bounded_worker_count();
-        let mut seed_out = WalkBatch::default();
-        let mut frontier = seed_tasks;
-        for _ in 0..2 {
-            if frontier.is_empty()
-                || frontier.len() >= worker_count * 4
-                || walk_partial.load(Ordering::Relaxed)
-            {
+        // Single-threaded DFS walk overlaps with `lsof` + `disk_stats`/`mount_table` probes
+        // without spawning extra APFS-contending walk threads or `libmalloc` thread magazines.
+        while let Some(task) = stack.pop() {
+            if state.walk_partial {
                 break;
             }
-            let mut next_frontier = Vec::new();
-            for task in frontier {
-                visit_walk_dir(
-                    &task,
-                    config,
-                    deadline,
-                    &total_entries,
-                    &walk_partial,
-                    &mut seed_out,
-                    |child| next_frontier.push(child),
-                );
-            }
-            frontier = next_frontier;
-        }
-        merge_walk_batch(
-            seed_out,
-            &mut seen_candidates,
-            &mut candidates,
-            &mut seen_staging,
-            &mut leftover_staging,
-        );
-
-        if !frontier.is_empty() && !walk_partial.load(Ordering::Relaxed) {
-            let active_workers = frontier.len().min(worker_count);
-            let next_idx = AtomicUsize::new(0);
-            let worker_batches: Vec<WalkBatch> = std::thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(active_workers);
-                for _ in 0..active_workers {
-                    let next_ref = &next_idx;
-                    let frontier_ref = &frontier;
-                    let total_ref = &total_entries;
-                    let partial_ref = &walk_partial;
-                    handles.push(scope.spawn(move || {
-                        let mut batch = WalkBatch::default();
-                        let mut stack: Vec<WalkTask> = Vec::with_capacity(32);
-                        loop {
-                            if partial_ref.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                            let Some(seed) = frontier_ref.get(idx) else {
-                                break;
-                            };
-                            stack.push(seed.clone());
-                            while let Some(task) = stack.pop() {
-                                if partial_ref.load(Ordering::Relaxed) {
-                                    break;
-                                }
-                                visit_walk_dir(
-                                    &task,
-                                    config,
-                                    deadline,
-                                    total_ref,
-                                    partial_ref,
-                                    &mut batch,
-                                    |child| stack.push(child),
-                                );
-                            }
-                        }
-                        batch
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().expect("discovery walk worker panicked"))
-                    .collect()
-            });
-
-            for batch in worker_batches {
-                merge_walk_batch(
-                    batch,
-                    &mut seen_candidates,
-                    &mut candidates,
-                    &mut seen_staging,
-                    &mut leftover_staging,
-                );
-            }
+            visit_walk_dir(&task, &mut state, &mut stack);
         }
     }
 
     let mut checked_known_parents: HashSet<PathBuf> = HashSet::new();
     for known_raw in &request.known_targets {
-        let known_norm = normalize_macos_system_symlinks(known_raw);
-        let known = known_norm.as_path();
+        let known_norm = normalize_macos_system_symlinks_cow(known_raw);
+        let known = known_norm.as_ref();
 
         if !request.full_walk
             && let Some(parent) = known.parent()
@@ -558,8 +476,8 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
                     && !meta.file_type().is_symlink()
                 {
                     let (dev, ino) = file_identity(&entry.path(), &meta);
-                    if seen_staging.insert((dev, ino)) {
-                        leftover_staging.push(LeftoverStaging {
+                    if state.seen_staging.insert((dev, ino)) {
+                        state.leftover_staging.push(LeftoverStaging {
                             staging_dir: entry.path(),
                             expected_dev: dev,
                         });
@@ -576,7 +494,13 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
                 && meta.is_dir()
                 && let Some(origin) = detect_target_origin(known)
             {
-                push_candidate(&mut seen_candidates, &mut candidates, known, origin, true);
+                push_candidate(
+                    &mut state.seen_candidates,
+                    &mut state.candidates,
+                    known,
+                    origin,
+                    true,
+                );
             }
             continue;
         }
@@ -584,96 +508,45 @@ fn discover_candidates(config: &Config, request: &ScanRequest) -> WalkResult {
             continue;
         }
         if let Some(origin) = detect_target_origin(known) {
-            push_candidate(&mut seen_candidates, &mut candidates, known, origin, false);
+            push_candidate(
+                &mut state.seen_candidates,
+                &mut state.candidates,
+                known,
+                origin,
+                false,
+            );
         }
     }
 
     // Prune direct nested children when their non-symlink parent target is already a candidate:
     // `inspect_target(parent)` discovers and inspects direct nested children once with
-    // `parent_target = Some(parent)`, preventing redundant worker I/O and double-accounting.
-    let non_symlink_roots: HashSet<PathBuf> = candidates
+    // `parent_target = Some(parent)`, preventing redundant I/O and double-accounting.
+    let non_symlink_roots: HashSet<PathBuf> = state
+        .candidates
         .iter()
         .filter(|c| !c.forced_boundary_violation)
         .map(|c| c.path.clone())
         .collect();
-    candidates.retain(|c| {
+    state.candidates.retain(|c| {
         c.forced_boundary_violation
             || c.path
                 .parent()
                 .is_none_or(|parent| !non_symlink_roots.contains(parent))
     });
 
-    candidates.sort_by(|a, b| a.path.cmp(&b.path));
+    state.candidates.sort_by(|a, b| a.path.cmp(&b.path));
 
     WalkResult {
-        candidates,
-        leftover_staging,
-        seen_staging,
+        candidates: state.candidates,
+        leftover_staging: state.leftover_staging,
+        seen_staging: state.seen_staging,
         scanned_roots,
-        walk_partial: walk_partial.load(Ordering::Relaxed),
+        walk_partial: state.walk_partial,
     }
 }
 
-fn merge_walk_batch(
-    batch: WalkBatch,
-    seen_candidates: &mut HashSet<(u64, u64)>,
-    candidates: &mut Vec<DiscoveredCandidate>,
-    seen_staging: &mut HashSet<(u64, u64)>,
-    leftover_staging: &mut Vec<LeftoverStaging>,
-) {
-    for (cand, dev, ino) in batch.candidates {
-        if seen_candidates.insert((dev, ino)) {
-            candidates.push(cand);
-        }
-    }
-    for (staging, ino) in batch.leftover_staging {
-        if seen_staging.insert((staging.expected_dev, ino)) {
-            leftover_staging.push(staging);
-        }
-    }
-}
-
-fn consume_walk_budget(
-    config: &Config,
-    deadline: Instant,
-    total_entries: &AtomicUsize,
-    walk_partial: &AtomicBool,
-) -> bool {
-    let count = total_entries.fetch_add(1, Ordering::Relaxed) + 1;
-    if count > config.discovery.max_entries || ((count & 0xFF) == 0 && Instant::now() >= deadline) {
-        walk_partial.store(true, Ordering::Relaxed);
-        return false;
-    }
-    true
-}
-
-fn record_walk_candidate(batch: &mut WalkBatch, path: PathBuf, origin: TargetOrigin) {
-    if let Ok(meta) = fs::symlink_metadata(&path) {
-        let (dev, ino) = file_identity(&path, &meta);
-        batch.candidates.push((
-            DiscoveredCandidate {
-                path,
-                origin,
-                forced_boundary_violation: false,
-            },
-            dev,
-            ino,
-        ));
-    }
-}
-
-fn visit_walk_dir<F>(
-    task: &WalkTask,
-    config: &Config,
-    deadline: Instant,
-    total_entries: &AtomicUsize,
-    walk_partial: &AtomicBool,
-    batch: &mut WalkBatch,
-    mut push_child: F,
-) where
-    F: FnMut(WalkTask),
-{
-    if !consume_walk_budget(config, deadline, total_entries, walk_partial) {
+fn visit_walk_dir(task: &WalkTask, state: &mut WalkState<'_>, stack: &mut Vec<WalkTask>) {
+    if !state.consume_budget() {
         return;
     }
 
@@ -685,7 +558,7 @@ fn visit_walk_dir<F>(
     let mut has_rustc_info = false;
     let mut has_git = false;
     let mut has_cargo_toml = false;
-    let mut child_dirs: Vec<(PathBuf, Option<String>)> = Vec::new();
+    let mut child_dirs: Vec<PathBuf> = Vec::new();
 
     for entry in rd.flatten() {
         let Ok(ft) = entry.file_type() else {
@@ -722,23 +595,20 @@ fn visit_walk_dir<F>(
                 let staging_path = entry.path();
                 if let Ok(meta) = fs::symlink_metadata(&staging_path) {
                     let (dev, ino) = file_identity(&staging_path, &meta);
-                    batch.leftover_staging.push((
-                        LeftoverStaging {
+                    if state.seen_staging.insert((dev, ino)) {
+                        state.leftover_staging.push(LeftoverStaging {
                             staging_dir: staging_path,
                             expected_dev: dev,
-                        },
-                        ino,
-                    ));
+                        });
+                    }
                 }
                 continue;
             }
-            if PRUNED_DIR_NAMES.contains(&name) {
+            if PRUNED_DIR_NAMES.binary_search(&name).is_ok() {
                 continue;
             }
-            child_dirs.push((entry.path(), Some(name.to_owned())));
-        } else {
-            child_dirs.push((entry.path(), None));
         }
+        child_dirs.push(entry.path());
     }
 
     if has_cachedir_tag {
@@ -747,7 +617,7 @@ fn visit_walk_dir<F>(
             .is_ok_and(|m| m.file_type().is_file() && m.len() <= MAX_CACHEDIR_TAG_BYTES)
             && is_verified_cargo_cachedir_tag(&tag_path)
         {
-            record_walk_candidate(batch, task.path.clone(), TargetOrigin::VerifiedCargoTag);
+            state.record_candidate(task.path.clone(), TargetOrigin::VerifiedCargoTag);
             return;
         }
         // Explicit non-Cargo CACHEDIR.TAG (e.g., .ruff_cache, .venv) must NOT fall through
@@ -759,7 +629,7 @@ fn visit_walk_dir<F>(
             && is_valid_rustc_info(&rustc_info)
             && has_any_profile_child(&task.path)
         {
-            record_walk_candidate(batch, task.path.clone(), TargetOrigin::HeuristicNoTag);
+            state.record_candidate(task.path.clone(), TargetOrigin::HeuristicNoTag);
             return;
         }
     }
@@ -778,7 +648,7 @@ fn visit_walk_dir<F>(
         } else {
             Some(
                 task.depth
-                    .saturating_add(config.discovery.non_rust_git_extra_depth),
+                    .saturating_add(state.config.discovery.non_rust_git_extra_depth),
             )
         }
     } else if let Some(existing_cap) = task.repo_cap {
@@ -794,23 +664,24 @@ fn visit_walk_dir<F>(
     let next_depth = task.depth + 1;
     let is_leaf = next_depth >= task.max_depth || next_cap.is_some_and(|cap| next_depth >= cap);
 
-    for (child_path, child_name) in child_dirs {
+    for child_path in child_dirs {
         if next_cap.is_some()
-            && child_name
-                .as_deref()
-                .is_some_and(|name| REPO_INNER_PRUNED_DIR_NAMES.contains(&name))
+            && child_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| REPO_INNER_PRUNED_DIR_NAMES.binary_search(&name).is_ok())
         {
             continue;
         }
         if is_leaf {
-            if !consume_walk_budget(config, deadline, total_entries, walk_partial) {
+            if !state.consume_budget() {
                 return;
             }
             if let Some(origin) = detect_target_origin(&child_path) {
-                record_walk_candidate(batch, child_path, origin);
+                state.record_candidate(child_path, origin);
             }
         } else {
-            push_child(WalkTask {
+            stack.push(WalkTask {
                 path: child_path,
                 depth: next_depth,
                 max_depth: task.max_depth,
@@ -838,6 +709,81 @@ fn push_candidate(
     }
 }
 
+/// Reusable single-threaded per-target hardlink deduplicator.
+///
+/// Allocates zero heap bytes on targets with no multi-link (`nlink > 1`) files, requires no
+/// locks/atomics or 128 KiB Bloom filter, guarantees 100% deterministic hardlink attribution,
+/// and supports exact primary-device `d_ino` `statat` skipping when mount boundaries are verified.
+struct HardlinkSet {
+    primary_dev: u64,
+    #[cfg(unix)]
+    allow_ino_skip: bool,
+    primary: HashSet<u64, FastU64BuildHasher>,
+    other_dev: HashSet<(u64, u64)>,
+}
+
+impl HardlinkSet {
+    fn new() -> Self {
+        Self {
+            primary_dev: 0,
+            #[cfg(unix)]
+            allow_ino_skip: false,
+            primary: HashSet::with_hasher(FastU64BuildHasher),
+            other_dev: HashSet::new(),
+        }
+    }
+
+    fn reset(&mut self, primary_dev: u64, allow_ino_skip: bool) {
+        self.primary_dev = primary_dev;
+        #[cfg(unix)]
+        {
+            self.allow_ino_skip = allow_ino_skip;
+        }
+        #[cfg(not(unix))]
+        let _ = allow_ino_skip;
+        if self.primary.capacity() > 4096 {
+            self.primary = HashSet::with_hasher(FastU64BuildHasher);
+        } else {
+            self.primary.clear();
+        }
+        if !self.other_dev.is_empty() {
+            self.other_dev = HashSet::new();
+        }
+    }
+
+    /// Exact membership check for a primary-device regular file `d_ino`.
+    #[cfg(unix)]
+    #[inline]
+    fn contains_primary(&self, ino: u64) -> bool {
+        self.allow_ino_skip && !self.primary.is_empty() && self.primary.contains(&ino)
+    }
+
+    /// Record a multi-link (`nlink > 1`) file inode and return `bytes` on first sight or `0`
+    /// if another hardlink to the same `(dev, ino)` was already accounted.
+    #[inline]
+    fn insert_and_count(&mut self, dev: u64, ino: u64, bytes: u64) -> u64 {
+        if dev == self.primary_dev {
+            if self.primary.insert(ino) { bytes } else { 0 }
+        } else if self.other_dev.insert((dev, ino)) {
+            bytes
+        } else {
+            0
+        }
+    }
+}
+
+/// Reusable scratch buffers avoiding per-directory `CString`, `PathBuf`, and JSON `Vec` churn.
+#[derive(Default)]
+struct DirScratch {
+    #[cfg(unix)]
+    name_arena: Vec<u8>,
+    #[cfg(unix)]
+    name_spans: Vec<(usize, usize)>,
+    read_buf: Vec<u8>,
+    #[cfg(unix)]
+    path_buf: PathBuf,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum MtimePolicy {
     None,
@@ -852,170 +798,11 @@ enum MtimePolicy {
     },
 }
 
-#[derive(Clone, Debug)]
-enum AccountDest {
-    TargetOnly,
-    DocDir,
-    Profile(PathBuf),
-}
-
-#[derive(Clone, Debug)]
-struct AccountChunk {
-    target_key: (u64, u64),
-    dest: AccountDest,
-    path: PathBuf,
-    mtime_policy: MtimePolicy,
-}
-
 #[derive(Default)]
-struct TreeAccounting {
-    nlink1_bytes: u64,
-    multi_link: Vec<(u64, u64, u64)>,
+struct DirAccountResult {
+    bytes: u64,
     max_mtime: u64,
-}
-
-struct WorkerOutput {
-    targets: Vec<(CargoTarget, HashSet<(u64, u64)>)>,
-    leftover_staging: Vec<(LeftoverStaging, u64)>,
-    account_chunks: Vec<AccountChunk>,
-}
-
-fn inspect_candidates_bounded<P: Platform + Sync>(
-    platform: &P,
-    mounts: Option<&[MountEntry]>,
-    detail: ScanDetail,
-    candidates: &[DiscoveredCandidate],
-) -> Vec<WorkerOutput> {
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    if candidates.len() == 1 {
-        let mut ctx = WorkerContext::new(platform, mounts, detail);
-        ctx.inspect_target(
-            &candidates[0].path,
-            candidates[0].origin,
-            None,
-            None,
-            candidates[0].forced_boundary_violation,
-        );
-        return vec![WorkerOutput {
-            targets: ctx.targets,
-            leftover_staging: ctx.leftover_staging,
-            account_chunks: ctx.account_chunks,
-        }];
-    }
-
-    let worker_count = candidates.len().min(bounded_worker_count());
-    let next_idx = AtomicUsize::new(0);
-
-    std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let next_ref = &next_idx;
-            handles.push(scope.spawn(move || {
-                let mut ctx = WorkerContext::new(platform, mounts, detail);
-                loop {
-                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    let Some(cand) = candidates.get(idx) else {
-                        break;
-                    };
-                    ctx.inspect_target(
-                        &cand.path,
-                        cand.origin,
-                        None,
-                        None,
-                        cand.forced_boundary_violation,
-                    );
-                }
-                WorkerOutput {
-                    targets: ctx.targets,
-                    leftover_staging: ctx.leftover_staging,
-                    account_chunks: ctx.account_chunks,
-                }
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("target inspection worker panicked"))
-            .collect()
-    })
-}
-
-fn apply_deferred_accounting(
-    chunks: &[AccountChunk],
-    target_idx_by_id: &HashMap<(u64, u64), usize>,
-    targets: &mut [CargoTarget],
-    target_hardlinks: &mut [HashSet<(u64, u64)>],
-) {
-    let worker_count = chunks.len().min(bounded_worker_count());
-    let next_idx = AtomicUsize::new(0);
-
-    let results: Vec<Vec<(usize, TreeAccounting)>> = std::thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let next_ref = &next_idx;
-            handles.push(scope.spawn(move || {
-                let mut local = Vec::new();
-                loop {
-                    let idx = next_ref.fetch_add(1, Ordering::Relaxed);
-                    let Some(chunk) = chunks.get(idx) else {
-                        break;
-                    };
-                    let acct = account_tree(&chunk.path, chunk.mtime_policy, None);
-                    local.push((idx, acct));
-                }
-                local
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("accounting worker panicked"))
-            .collect()
-    });
-
-    for worker_res in results {
-        for (chunk_idx, acct) in worker_res {
-            let chunk = &chunks[chunk_idx];
-            let Some(&tidx) = target_idx_by_id.get(&chunk.target_key) else {
-                continue;
-            };
-            let seen_hardlinks = &mut target_hardlinks[tidx];
-            let mut bytes = acct.nlink1_bytes;
-            for (dev, ino, file_bytes) in acct.multi_link {
-                if seen_hardlinks.insert((dev, ino)) {
-                    bytes = bytes.saturating_add(file_bytes);
-                }
-            }
-
-            let target = &mut targets[tidx];
-            target.allocated_bytes = target.allocated_bytes.saturating_add(bytes);
-            if acct.max_mtime > 0 {
-                target.last_activity_unix = target.last_activity_unix.max(acct.max_mtime);
-            }
-            match &chunk.dest {
-                AccountDest::TargetOnly => {}
-                AccountDest::DocDir => {
-                    if let Some(doc) = &mut target.doc_dir {
-                        doc.allocated_bytes = doc.allocated_bytes.saturating_add(bytes);
-                        if acct.max_mtime > 0 {
-                            doc.last_activity_unix = doc.last_activity_unix.max(acct.max_mtime);
-                        }
-                    }
-                }
-                AccountDest::Profile(rel_path) => {
-                    if let Some(profile) =
-                        target.profiles.iter_mut().find(|p| p.rel_path == *rel_path)
-                    {
-                        profile.allocated_bytes = profile.allocated_bytes.saturating_add(bytes);
-                        if acct.max_mtime > 0 {
-                            profile.last_activity_unix =
-                                profile.last_activity_unix.max(acct.max_mtime);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    v2_unit_count: usize,
 }
 
 pub(crate) fn is_staging_dir_name(name: &str) -> bool {
@@ -1051,21 +838,29 @@ pub(crate) fn detect_target_origin(dir: &Path) -> Option<TargetOrigin> {
 }
 
 fn is_verified_cargo_cachedir_tag(path: &Path) -> bool {
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
-    let mut buf = Vec::new();
-    if file
-        .take(MAX_CACHEDIR_TAG_BYTES + 1)
-        .read_to_end(&mut buf)
-        .is_err()
-    {
+    let mut buf = [0u8; MAX_CACHEDIR_TAG_BYTES as usize + 1];
+    let mut len = 0usize;
+    loop {
+        match file.read(&mut buf[len..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                len += n;
+                if len as u64 > MAX_CACHEDIR_TAG_BYTES {
+                    return false;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    let slice = &buf[..len];
+    if !slice.starts_with(CACHEDIR_SIGNATURE) {
         return false;
     }
-    if buf.len() as u64 > MAX_CACHEDIR_TAG_BYTES || !buf.starts_with(CACHEDIR_SIGNATURE) {
-        return false;
-    }
-    let rest = &buf[CACHEDIR_SIGNATURE.len()..];
+    let rest = &slice[CACHEDIR_SIGNATURE.len()..];
     contains_ascii_case_insensitive(rest, b"cargo")
 }
 
@@ -1078,10 +873,47 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool
         .any(|window| window.eq_ignore_ascii_case(needle_lower))
 }
 
+struct NonNullValue;
+
+impl<'de> Deserialize<'de> for NonNullValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<serde::de::IgnoredAny>::deserialize(deserializer)?
+            .map(|_| Self)
+            .ok_or_else(|| serde::de::Error::custom("expected non-null value"))
+    }
+}
+
+struct JsonObjectOnly;
+
+impl<'de> Deserialize<'de> for JsonObjectOnly {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjVisitor;
+        impl<'de> serde::de::Visitor<'de> for ObjVisitor {
+            type Value = JsonObjectOnly;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while map
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {}
+                Ok(JsonObjectOnly)
+            }
+        }
+        deserializer.deserialize_map(ObjVisitor)
+    }
+}
+
 #[derive(Deserialize)]
 struct MinimalRustcInfo {
-    rustc_fingerprint: serde_json::Value,
-    outputs: serde_json::Value,
+    #[serde(rename = "rustc_fingerprint")]
+    _rustc_fingerprint: NonNullValue,
+    #[serde(rename = "outputs")]
+    _outputs: JsonObjectOnly,
 }
 
 fn is_valid_rustc_info(path: &Path) -> bool {
@@ -1099,10 +931,7 @@ fn is_valid_rustc_info(path: &Path) -> bool {
     if buf.len() as u64 > MAX_RUSTC_INFO_BYTES {
         return false;
     }
-    match serde_json::from_slice::<MinimalRustcInfo>(&buf) {
-        Ok(info) => !info.rustc_fingerprint.is_null() && info.outputs.is_object(),
-        Err(_) => false,
-    }
+    serde_json::from_slice::<MinimalRustcInfo>(&buf).is_ok()
 }
 
 fn has_any_profile_child(dir: &Path) -> bool {
@@ -1146,34 +975,145 @@ fn is_profile_dir(dir: &Path) -> bool {
         "deps",
         "incremental",
     ];
-    PROFILE_MARKERS.iter().any(|marker| {
-        fs::symlink_metadata(dir.join(marker)).is_ok_and(|m| !m.file_type().is_symlink())
-    })
+    let mut candidate = dir.to_path_buf();
+    for marker in PROFILE_MARKERS {
+        candidate.push(marker);
+        let found = fs::symlink_metadata(&candidate).is_ok_and(|m| !m.file_type().is_symlink());
+        candidate.pop();
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
-struct WorkerContext<'a, P: Platform> {
+#[derive(Clone, Copy)]
+struct ClassifiedProc<'a> {
+    entry: &'a ProcessEntry,
+    is_proc_macro_srv: bool,
+    is_compiler_or_tool: bool,
+}
+
+struct ProfileProbe {
+    profile: ProfileDir,
+    full_path: PathBuf,
+    has_v1_fp_dir: bool,
+    has_v1_deps_dir: bool,
+    has_build_dir: bool,
+    has_inc_dir: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct V1DepHashStats {
+    bytes: u64,
+    max_mtime: u64,
+    count: u32,
+}
+
+struct PreinspectedGit {
+    by_target: HashMap<PathBuf, GitDiscovery>,
+    git_repo_cache: HashMap<PathBuf, Result<RepoGitInfo, CompactString>>,
+    default_ref_cache: HashMap<PathBuf, Option<String>>,
+}
+
+struct ScanSession<'a, P: Platform + Sync> {
     platform: &'a P,
     mounts: Option<&'a [MountEntry]>,
+    processes: Option<&'a ProcessSnapshot>,
+    classified_procs: Vec<ClassifiedProc<'a>>,
     detail: ScanDetail,
     visited_targets: HashSet<(u64, u64)>,
-    targets: Vec<(CargoTarget, HashSet<(u64, u64)>)>,
-    leftover_staging: Vec<(LeftoverStaging, u64)>,
-    account_chunks: Vec<AccountChunk>,
+    target_idx_by_id: HashMap<(u64, u64), usize>,
+    targets: Vec<CargoTarget>,
+    leftover_staging: Vec<LeftoverStaging>,
+    seen_staging: HashSet<(u64, u64)>,
+    precomputed_git: HashMap<PathBuf, GitDiscovery>,
     git_repo_cache: HashMap<PathBuf, Result<RepoGitInfo, CompactString>>,
+    default_ref_cache: HashMap<PathBuf, Option<String>>,
+    hardlinks: HardlinkSet,
+    scratch: DirScratch,
 }
 
-impl<'a, P: Platform> WorkerContext<'a, P> {
-    fn new(platform: &'a P, mounts: Option<&'a [MountEntry]>, detail: ScanDetail) -> Self {
+impl<'a, P: Platform + Sync> ScanSession<'a, P> {
+    fn new(
+        platform: &'a P,
+        mounts: Option<&'a [MountEntry]>,
+        processes: Option<&'a ProcessSnapshot>,
+        detail: ScanDetail,
+        leftover_staging: Vec<LeftoverStaging>,
+        seen_staging: HashSet<(u64, u64)>,
+        preinspected_git: PreinspectedGit,
+    ) -> Self {
+        let classified_procs = processes
+            .map(|proc_snap| {
+                proc_snap
+                    .processes
+                    .iter()
+                    .filter(|p| proc_snap.self_pid == 0 || p.pid != proc_snap.self_pid)
+                    .map(|entry| ClassifiedProc {
+                        entry,
+                        is_proc_macro_srv: proc_snap.is_rust_analyzer_proc_macro_srv(entry),
+                        is_compiler_or_tool: proc_snap.is_active_compiler_or_tool(entry),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             platform,
             mounts,
+            processes,
+            classified_procs,
             detail,
             visited_targets: HashSet::new(),
+            target_idx_by_id: HashMap::new(),
             targets: Vec::new(),
-            leftover_staging: Vec::new(),
-            account_chunks: Vec::new(),
-            git_repo_cache: HashMap::new(),
+            leftover_staging,
+            seen_staging,
+            precomputed_git: preinspected_git.by_target,
+            git_repo_cache: preinspected_git.git_repo_cache,
+            default_ref_cache: preinspected_git.default_ref_cache,
+            hardlinks: HardlinkSet::new(),
+            scratch: DirScratch::default(),
         }
+    }
+
+    fn process_hard_blocks_target(&self, target_root: &Path, worktree_root: Option<&Path>) -> bool {
+        let Some(proc_snap) = self.processes else {
+            return true;
+        };
+        let target_prefix = PathPrefix::new(target_root);
+        let wt_prefix = worktree_root.map(PathPrefix::new);
+        for proc_info in &self.classified_procs {
+            let entry = proc_info.entry;
+            if proc_snap.cwd_has_prefix(entry, &target_prefix) {
+                return true;
+            }
+            if proc_info.is_proc_macro_srv {
+                for &path_ref in proc_snap.open_path_refs(entry) {
+                    if proc_snap.path_has_prefix(path_ref, &target_prefix)
+                        && proc_snap
+                            .path(path_ref)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            != Some("dylib")
+                    {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if proc_snap.any_open_has_prefix(entry, &target_prefix) {
+                return true;
+            }
+            if proc_info.is_compiler_or_tool
+                && let Some(wt) = wt_prefix
+                && (proc_snap.cwd_has_prefix(entry, &wt)
+                    || proc_snap.any_open_has_prefix(entry, &wt))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn inspect_target(
@@ -1182,6 +1122,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
         origin: TargetOrigin,
         parent_target: Option<PathBuf>,
         parent_project_dir: Option<&Path>,
+        parent_clean_git: Option<(&Path, &Path)>,
         forced_boundary_violation: bool,
     ) {
         let Ok(lmeta) = fs::symlink_metadata(target_root) else {
@@ -1190,6 +1131,13 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
         let (dev_id, ino) = file_identity(target_root, &lmeta);
         let root_mtime_unix = meta_mtime_unix(&lmeta);
         let target_key = (dev_id, ino);
+        if let Some(&existing_idx) = self.target_idx_by_id.get(&target_key) {
+            let existing = &mut self.targets[existing_idx];
+            if existing.parent_target.is_none() && parent_target.is_some() {
+                existing.parent_target = parent_target;
+            }
+            return;
+        }
         if !self.visited_targets.insert(target_key) {
             return;
         }
@@ -1199,9 +1147,14 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             || has_symlink_boundary(target_root)
             || crosses_mount_boundary(target_root, dev_id, self.mounts);
 
-        let mut seen_hardlinks: HashSet<(u64, u64)> = HashSet::new();
-        let mut profiles: Vec<ProfileDir> = Vec::new();
+        // Reset reusable per-target hardlink tracker (exact d_ino skip enabled only when
+        // mount table was verified and target has no symlink or mount boundary).
+        self.hardlinks
+            .reset(dev_id, !symlink_or_mount_boundary && self.mounts.is_some());
+
+        let mut profile_probes: Vec<ProfileProbe> = Vec::new();
         let mut doc_dir: Option<DocDirInfo> = None;
+        let mut top_account_dirs: Vec<PathBuf> = Vec::new();
         let mut nested_target_roots: Vec<PathBuf> = Vec::new();
         let mut nested_to_inspect: Vec<(PathBuf, TargetOrigin)> = Vec::new();
         let mut has_unverified_top_entries = false;
@@ -1226,7 +1179,15 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             false
         };
 
-        let git = inspect_git_for_target(target_root, self.platform, &mut self.git_repo_cache);
+        let git = self.precomputed_git.remove(target_root).unwrap_or_else(|| {
+            inspect_git_for_target(
+                target_root,
+                self.platform,
+                &mut self.git_repo_cache,
+                &mut self.default_ref_cache,
+                parent_clean_git,
+            )
+        });
         let worktree_kind = match &git {
             GitDiscovery::Inspected(info) => info.worktree_kind,
             GitDiscovery::NotInGitRepo | GitDiscovery::Failed(_) => WorktreeKind::NonGit,
@@ -1244,23 +1205,18 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             has_pin_marker = true;
         }
         let child_project_dir = project_dir.clone();
-
-        // Skip expensive single-threaded `fingerprint/*.json` & `s-*.lock` parsing when the
-        // target is already unconditionally `Protected` by fast barriers.
-        let target_hard_blocked = symlink_or_mount_boundary
-            || root_locked_now
-            || has_pin_marker
-            || match &git {
-                GitDiscovery::Failed(_) => true,
-                GitDiscovery::Inspected(info) => {
-                    info.git_op_in_progress || info.has_tracked_files_in_target
-                }
-                GitDiscovery::NotInGitRepo => false,
-            };
-        let effective_detail = if target_hard_blocked {
-            ScanDetail::Inventory
-        } else {
-            self.detail
+        let child_clean_git: Option<(PathBuf, PathBuf)> = match &git {
+            GitDiscovery::Inspected(info)
+                if !info.has_tracked_files_in_target
+                    && !info.worktree_dir_missing
+                    && !symlink_or_mount_boundary =>
+            {
+                Some((
+                    info.worktree_root.clone(),
+                    normalize_macos_system_symlinks_cow(target_root).into_owned(),
+                ))
+            }
+            _ => None,
         };
 
         // Fail closed when `target_root` cannot be read: never classify an unreadable
@@ -1288,13 +1244,12 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
 
             if ft.is_dir() && is_staging_dir_name(&name) {
                 let (sdev, sino) = file_identity(&entry_path, &emeta);
-                self.leftover_staging.push((
-                    LeftoverStaging {
+                if self.seen_staging.insert((sdev, sino)) {
+                    self.leftover_staging.push(LeftoverStaging {
                         staging_dir: entry_path,
                         expected_dev: sdev,
-                    },
-                    sino,
-                ));
+                    });
+                }
                 continue;
             }
 
@@ -1306,43 +1261,25 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             if name == ".rustc_info.json" || name == ".rustdoc_fingerprint.json" {
                 last_activity_unix = last_activity_unix.max(meta_mtime_unix(&emeta));
                 allocated_bytes = allocated_bytes
-                    .saturating_add(entry_allocated_bytes(&emeta, &mut seen_hardlinks));
+                    .saturating_add(entry_allocated_bytes(&emeta, &mut self.hardlinks));
                 continue;
             }
 
             if name == "CACHEDIR.TAG" || name == ".cargo-lock" {
                 allocated_bytes = allocated_bytes
-                    .saturating_add(entry_allocated_bytes(&emeta, &mut seen_hardlinks));
+                    .saturating_add(entry_allocated_bytes(&emeta, &mut self.hardlinks));
                 continue;
             }
 
             if ft.is_dir() && !ft.is_symlink() {
                 if name == "doc" {
-                    let info = inspect_doc_dir(
-                        &entry_path,
-                        self.platform,
-                        effective_detail,
-                        target_key,
-                        &mut seen_hardlinks,
-                        &mut self.account_chunks,
-                    );
+                    let info = probe_doc_dir(&entry_path, self.platform);
                     last_activity_unix = last_activity_unix.max(info.last_activity_unix);
-                    allocated_bytes = allocated_bytes.saturating_add(info.allocated_bytes);
                     doc_dir = Some(info);
                     continue;
                 }
                 if name == "tmp" || name == "package" {
-                    if effective_detail == ScanDetail::Inventory {
-                        self.account_chunks.push(AccountChunk {
-                            target_key,
-                            dest: AccountDest::TargetOnly,
-                            path: entry_path,
-                            mtime_policy: MtimePolicy::None,
-                        });
-                    } else {
-                        let bytes = sum_tree_bytes(&entry_path, &mut seen_hardlinks);
-                        allocated_bytes = allocated_bytes.saturating_add(bytes);
-                    }
+                    top_account_dirs.push(entry_path);
                     continue;
                 }
                 if let Some(nested_origin) = detect_target_origin(&entry_path) {
@@ -1351,19 +1288,12 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                     continue;
                 }
                 if is_profile_dir(&entry_path) {
-                    let profile = inspect_profile_dir(
+                    profile_probes.push(probe_profile_dir(
                         Path::new(&name),
                         &entry_path,
                         has_legacy_root_lock.then_some(legacy_root_lock.as_path()),
                         self.platform,
-                        effective_detail,
-                        target_key,
-                        &mut seen_hardlinks,
-                        &mut self.account_chunks,
-                    );
-                    last_activity_unix = last_activity_unix.max(profile.last_activity_unix);
-                    allocated_bytes = allocated_bytes.saturating_add(profile.allocated_bytes);
-                    profiles.push(profile);
+                    ));
                     continue;
                 }
                 // Check `<target-triple>/<profile>/` one level deeper.
@@ -1372,19 +1302,12 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                     for sub_name in triple_profiles {
                         let rel = PathBuf::from(&name).join(&sub_name);
                         let full = entry_path.join(&sub_name);
-                        let profile = inspect_profile_dir(
+                        profile_probes.push(probe_profile_dir(
                             &rel,
                             &full,
                             has_legacy_root_lock.then_some(legacy_root_lock.as_path()),
                             self.platform,
-                            effective_detail,
-                            target_key,
-                            &mut seen_hardlinks,
-                            &mut self.account_chunks,
-                        );
-                        last_activity_unix = last_activity_unix.max(profile.last_activity_unix);
-                        allocated_bytes = allocated_bytes.saturating_add(profile.allocated_bytes);
-                        profiles.push(profile);
+                        ));
                     }
                     continue;
                 }
@@ -1395,60 +1318,129 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                 has_unverified_top_entries = true;
             }
             if ft.is_dir() && !ft.is_symlink() {
-                if effective_detail == ScanDetail::Inventory {
-                    self.account_chunks.push(AccountChunk {
-                        target_key,
-                        dest: AccountDest::TargetOnly,
-                        path: entry_path,
-                        mtime_policy: MtimePolicy::None,
-                    });
-                } else {
-                    allocated_bytes = allocated_bytes
-                        .saturating_add(sum_tree_bytes(&entry_path, &mut seen_hardlinks));
-                }
+                top_account_dirs.push(entry_path);
             } else {
                 allocated_bytes = allocated_bytes
-                    .saturating_add(entry_allocated_bytes(&emeta, &mut seen_hardlinks));
+                    .saturating_add(entry_allocated_bytes(&emeta, &mut self.hardlinks));
             }
         }
 
-        profiles.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        profile_probes.sort_by(|a, b| a.profile.rel_path.cmp(&b.profile.rel_path));
         nested_target_roots.sort();
 
-        let layout = classify_target_layout(&profiles);
+        // Downgrade to fast Inventory mode when fast barriers already guarantee `Protected`.
+        let any_profile_locked = profile_probes.iter().any(|p| p.profile.locked_now);
+        let doc_locked = doc_dir.as_ref().is_some_and(|d| d.locked_now);
+        let target_hard_blocked = self.processes.is_none()
+            || self.mounts.is_none()
+            || symlink_or_mount_boundary
+            || has_unverified_top_entries
+            || root_locked_now
+            || any_profile_locked
+            || doc_locked
+            || has_pin_marker
+            || match &git {
+                GitDiscovery::Failed(_) => true,
+                GitDiscovery::Inspected(info) => {
+                    info.git_op_in_progress || info.has_tracked_files_in_target
+                }
+                GitDiscovery::NotInGitRepo => false,
+            }
+            || self.process_hard_blocks_target(target_root, project_dir.as_deref());
 
-        self.targets.push((
-            CargoTarget {
-                root: target_root.to_path_buf(),
-                dev_id,
-                ino,
-                origin,
-                layout,
-                symlink_or_mount_boundary,
-                has_unverified_top_entries,
-                has_pin_marker,
-                parent_target,
-                nested_target_roots,
-                worktree_kind,
-                git,
-                project_dir,
-                profiles,
-                doc_dir,
-                root_lock_file,
-                root_locked_now,
-                root_mtime_unix,
-                allocated_bytes,
-                last_activity_unix,
-            },
-            seen_hardlinks,
-        ));
+        let effective_detail = if target_hard_blocked {
+            ScanDetail::Inventory
+        } else {
+            self.detail
+        };
+
+        // Stream all target subdirectories single-threaded on the main thread:
+        // avoids APFS kernel vnode/B-tree lock contention (~2.8x sys CPU savings),
+        // eliminates per-target thread spawns and cross-thread `libmalloc` magazine retention,
+        // and guarantees 100% deterministic hardlink attribution.
+        if let Some(doc) = &mut doc_dir {
+            let res = account_tree(
+                &doc.path,
+                MtimePolicy::UpToDepth(2),
+                None,
+                &mut self.hardlinks,
+                &mut self.scratch,
+            );
+            doc.allocated_bytes = doc.allocated_bytes.saturating_add(res.bytes);
+            if res.max_mtime > 0 {
+                doc.last_activity_unix = doc.last_activity_unix.max(res.max_mtime);
+                last_activity_unix = last_activity_unix.max(res.max_mtime);
+            }
+            allocated_bytes = allocated_bytes.saturating_add(res.bytes);
+        }
+        for dir_path in top_account_dirs {
+            let res = account_tree(
+                &dir_path,
+                MtimePolicy::None,
+                None,
+                &mut self.hardlinks,
+                &mut self.scratch,
+            );
+            allocated_bytes = allocated_bytes.saturating_add(res.bytes);
+        }
+
+        let mut profiles = Vec::with_capacity(profile_probes.len());
+        for probe in profile_probes {
+            let profile_detail = if probe.profile.locked_now {
+                ScanDetail::Inventory
+            } else {
+                effective_detail
+            };
+            let profile = if profile_detail == ScanDetail::Inventory {
+                inspect_profile_inventory(probe, &mut self.hardlinks, &mut self.scratch)
+            } else {
+                inspect_profile_full(probe, self.platform, &mut self.hardlinks, &mut self.scratch)
+            };
+            allocated_bytes = allocated_bytes.saturating_add(profile.allocated_bytes);
+            last_activity_unix = last_activity_unix.max(profile.last_activity_unix);
+            profiles.push(profile);
+        }
+
+        if last_activity_unix == 0 {
+            last_activity_unix = root_mtime_unix;
+        }
+
+        let layout = classify_target_layout(&profiles);
+        let idx = self.targets.len();
+        self.target_idx_by_id.insert(target_key, idx);
+        self.targets.push(CargoTarget {
+            root: target_root.to_path_buf(),
+            dev_id,
+            ino,
+            origin,
+            layout,
+            symlink_or_mount_boundary,
+            has_unverified_top_entries,
+            has_pin_marker,
+            parent_target,
+            nested_target_roots,
+            worktree_kind,
+            git,
+            project_dir,
+            profiles,
+            doc_dir,
+            root_lock_file,
+            root_locked_now,
+            root_mtime_unix,
+            allocated_bytes,
+            last_activity_unix,
+        });
 
         for (nested_path, nested_origin) in nested_to_inspect {
+            let clean_ref = child_clean_git
+                .as_ref()
+                .map(|(wt, parent_norm)| (wt.as_path(), parent_norm.as_path()));
             self.inspect_target(
                 &nested_path,
                 nested_origin,
                 Some(target_root.to_path_buf()),
                 child_project_dir.as_deref(),
+                clean_ref,
                 false,
             );
         }
@@ -1493,14 +1485,7 @@ fn classify_target_layout(profiles: &[ProfileDir]) -> TargetLayout {
     }
 }
 
-fn inspect_doc_dir(
-    doc_path: &Path,
-    platform: &impl Platform,
-    detail: ScanDetail,
-    target_key: (u64, u64),
-    seen_hardlinks: &mut HashSet<(u64, u64)>,
-    account_chunks: &mut Vec<AccountChunk>,
-) -> DocDirInfo {
+fn probe_doc_dir(doc_path: &Path, platform: &impl Platform) -> DocDirInfo {
     let lock_candidate = doc_path.join(".lock");
     let (lock_file, locked_now) =
         if fs::symlink_metadata(&lock_candidate).is_ok_and(|m| m.file_type().is_file()) {
@@ -1516,42 +1501,25 @@ fn inspect_doc_dir(
         } else {
             (None, false)
         };
-
-    let (allocated_bytes, last_activity_unix) = if detail == ScanDetail::Inventory {
-        account_chunks.push(AccountChunk {
-            target_key,
-            dest: AccountDest::DocDir,
-            path: doc_path.to_path_buf(),
-            mtime_policy: MtimePolicy::UpToDepth(2),
-        });
-        let mtime = fs::symlink_metadata(doc_path)
-            .map(|m| meta_mtime_unix(&m))
-            .unwrap_or(0);
-        (0, mtime)
-    } else {
-        sum_tree_bytes_and_mtime(doc_path, 2, seen_hardlinks)
-    };
+    let last_activity_unix = fs::symlink_metadata(doc_path)
+        .map(|m| meta_mtime_unix(&m))
+        .unwrap_or(0);
 
     DocDirInfo {
         path: doc_path.to_path_buf(),
         lock_file,
         locked_now,
         last_activity_unix,
-        allocated_bytes,
+        allocated_bytes: 0,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn inspect_profile_dir(
+fn probe_profile_dir(
     rel_path: &Path,
     profile_path: &Path,
     legacy_root_lock: Option<&Path>,
     platform: &impl Platform,
-    detail: ScanDetail,
-    target_key: (u64, u64),
-    seen_hardlinks: &mut HashSet<(u64, u64)>,
-    account_chunks: &mut Vec<AccountChunk>,
-) -> ProfileDir {
+) -> ProfileProbe {
     let mut lock_files: SmallVec<[PathBuf; 4]> = SmallVec::new();
     for lock_name in [".cargo-artifact-lock", ".cargo-build-lock", ".cargo-lock"] {
         let candidate = profile_path.join(lock_name);
@@ -1586,537 +1554,317 @@ fn inspect_profile_dir(
     let has_v1_fp_dir = fs::symlink_metadata(&fp_root).is_ok_and(|m| m.file_type().is_dir());
     let has_v1_deps_dir = fs::symlink_metadata(&deps_root).is_ok_and(|m| m.file_type().is_dir());
     let has_build_dir = fs::symlink_metadata(&build_root).is_ok_and(|m| m.file_type().is_dir());
-    let has_inc_dir = fs::symlink_metadata(&inc_root).is_ok_and(|m| m.file_type().is_dir());
+    let inc_meta = fs::symlink_metadata(&inc_root).ok();
+    let has_inc_dir = inc_meta.as_ref().is_some_and(|m| m.file_type().is_dir());
     let profile_mtime_unix = fs::symlink_metadata(profile_path)
         .map(|m| meta_mtime_unix(&m))
         .unwrap_or(0);
-    let inc_root_mtime_unix = if has_inc_dir {
-        fs::symlink_metadata(&inc_root)
-            .map(|m| meta_mtime_unix(&m))
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    let inc_root_mtime_unix = inc_meta
+        .as_ref()
+        .filter(|m| m.file_type().is_dir())
+        .map_or(0, meta_mtime_unix);
 
-    // Skip deep `fingerprint/*.json` & `s-*.lock` parsing for Inventory scans AND for profiles
-    // currently locked by an active Cargo build (which `safety.rs` unconditionally protects).
-    if detail == ScanDetail::Inventory || locked_now {
-        return inspect_profile_inventory(
-            rel_path,
-            profile_path,
+    ProfileProbe {
+        profile: ProfileDir {
+            name: CompactString::from(rel_path.to_string_lossy().as_ref()),
+            rel_path: rel_path.to_path_buf(),
+            layout: TargetLayout::ArtifactsOnly,
             lock_files,
             locked_now,
+            fingerprint_corrupt: false,
+            v2_unit_count: 0,
+            v1_unit_count: 0,
+            incremental_dir_count: 0,
+            v2_units: Vec::new(),
+            v1_units: Vec::new(),
+            dep_fp_pool: Vec::new(),
+            incremental_dirs: Vec::new(),
             profile_mtime_unix,
             inc_root_mtime_unix,
-            has_v1_fp_dir,
-            has_v1_deps_dir,
-            has_build_dir,
-            has_inc_dir,
-            target_key,
-            seen_hardlinks,
-            account_chunks,
-        );
-    }
-
-    let mut fingerprint_corrupt = false;
-    let mut v1_units: Vec<BuildUnit> = Vec::new();
-    let mut v2_units: Vec<BuildUnit> = Vec::new();
-    let mut incremental_dirs: Vec<IncrementalDir> = Vec::new();
-    let mut allocated_bytes: u64 = 0;
-    let mut last_activity_unix: u64 = 0;
-
-    struct OrphanV1Accumulator {
-        pkg_group: CompactString,
-        build_dir: Option<CompactString>,
-        dep_entries: Vec<CompactString>,
-        allocated_bytes: u64,
-        mtime_unix: u64,
-    }
-
-    let mut v1_fp_index_by_name: HashMap<CompactString, usize> = HashMap::new();
-    let mut v1_hash_to_indices: HashMap<CompactString, SmallVec<[usize; 2]>> = HashMap::new();
-    let mut orphan_v1_by_hash: HashMap<CompactString, OrphanV1Accumulator> = HashMap::new();
-
-    // 1. V1 `.fingerprint/<pkg>-<16hex>/`
-    if has_v1_fp_dir {
-        match fs::read_dir(&fp_root) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let Ok(ft) = entry.file_type() else {
-                        continue;
-                    };
-                    let entry_path = entry.path();
-                    if !ft.is_dir() || ft.is_symlink() {
-                        if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                            allocated_bytes = allocated_bytes
-                                .saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
-                        }
-                        continue;
-                    }
-                    let Some(dir_name) = entry.file_name().to_str().map(CompactString::from) else {
-                        fingerprint_corrupt = true;
-                        continue;
-                    };
-                    let Some((pkg_group, unit_hash)) = split_pkg_and_16hex(&dir_name) else {
-                        allocated_bytes = allocated_bytes
-                            .saturating_add(sum_tree_bytes(&entry_path, seen_hardlinks));
-                        continue;
-                    };
-                    let parsed = parse_fingerprint_dir(&entry_path, seen_hardlinks);
-                    if parsed.corrupt {
-                        fingerprint_corrupt = true;
-                    }
-                    let unit_mtime = unit_metadata_mtime(&parsed.metadata);
-                    last_activity_unix = last_activity_unix.max(unit_mtime);
-                    allocated_bytes = allocated_bytes.saturating_add(parsed.allocated_bytes);
-
-                    let idx = v1_units.len();
-                    v1_fp_index_by_name.insert(dir_name.clone(), idx);
-                    v1_hash_to_indices
-                        .entry(unit_hash.clone())
-                        .or_default()
-                        .push(idx);
-                    v1_units.push(BuildUnit {
-                        id: BuildUnitId::V1 {
-                            fingerprint_dir: Some(dir_name),
-                            unit_hash,
-                        },
-                        pkg_group,
-                        metadata: parsed.metadata,
-                        v1_build_dir: None,
-                        v1_dep_entries: Vec::new(),
-                        allocated_bytes: parsed.allocated_bytes,
-                    });
-                }
-            }
-            Err(_) => {
-                fingerprint_corrupt = true;
-            }
-        }
-    }
-
-    // 2. V1 `deps/` (match files and `.dSYM` directories to unique V1 unit_hash, or record
-    //    orphaned `deps/*-<16hex>*` entries whose `.fingerprint/` dir is already absent)
-    if has_v1_deps_dir {
-        match fs::read_dir(&deps_root) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    let Ok(emeta) = fs::symlink_metadata(&entry_path) else {
-                        continue;
-                    };
-                    let bytes = if emeta.file_type().is_dir() && !emeta.file_type().is_symlink() {
-                        sum_tree_bytes(&entry_path, seen_hardlinks)
-                    } else {
-                        entry_allocated_bytes(&emeta, seen_hardlinks)
-                    };
-                    allocated_bytes = allocated_bytes.saturating_add(bytes);
-
-                    if let Some(name) = entry.file_name().to_str()
-                        && let Some(hash) = extract_16hex_from_dep_name(name)
-                    {
-                        if let Some(indices) = v1_hash_to_indices.get(hash) {
-                            if indices.len() == 1 {
-                                let unit = &mut v1_units[indices[0]];
-                                unit.v1_dep_entries.push(CompactString::from(name));
-                                unit.allocated_bytes = unit.allocated_bytes.saturating_add(bytes);
-                            }
-                        } else if has_v1_fp_dir && !fingerprint_corrupt {
-                            let entry_mtime = meta_mtime_unix(&emeta);
-                            let slot = orphan_v1_by_hash
-                                .entry(CompactString::from(hash))
-                                .or_insert_with(|| OrphanV1Accumulator {
-                                    pkg_group: CompactString::new("orphan"),
-                                    build_dir: None,
-                                    dep_entries: Vec::new(),
-                                    allocated_bytes: 0,
-                                    mtime_unix: 0,
-                                });
-                            slot.dep_entries.push(CompactString::from(name));
-                            slot.allocated_bytes = slot.allocated_bytes.saturating_add(bytes);
-                            slot.mtime_unix = slot.mtime_unix.max(entry_mtime);
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                fingerprint_corrupt = true;
-            }
-        }
-    }
-
-    // 3. `build/` (handles V1 `build/<pkg>-<16hex>/`, V2 `build/<pkg>/<16hex>/`, and MixedV1V2)
-    if has_build_dir {
-        match fs::read_dir(&build_root) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let entry_path = entry.path();
-                    let Ok(ft) = entry.file_type() else {
-                        continue;
-                    };
-                    if !ft.is_dir() || ft.is_symlink() {
-                        if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                            allocated_bytes = allocated_bytes
-                                .saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
-                        }
-                        continue;
-                    }
-                    let Some(name) = entry.file_name().to_str().map(CompactString::from) else {
-                        continue;
-                    };
-
-                    if let Some(&v1_idx) = v1_fp_index_by_name.get(&name) {
-                        let bytes = sum_tree_bytes(&entry_path, seen_hardlinks);
-                        allocated_bytes = allocated_bytes.saturating_add(bytes);
-                        let unit = &mut v1_units[v1_idx];
-                        unit.v1_build_dir = Some(name);
-                        unit.allocated_bytes = unit.allocated_bytes.saturating_add(bytes);
-                        continue;
-                    }
-
-                    let mut non_v2_sibling_bytes: u64 = 0;
-                    let mut found_v2_child = false;
-                    match fs::read_dir(&entry_path) {
-                        Ok(children) => {
-                            for child in children.flatten() {
-                                let child_path = child.path();
-                                let Ok(cft) = child.file_type() else {
-                                    continue;
-                                };
-                                if cft.is_symlink() {
-                                    continue;
-                                }
-                                if !cft.is_dir() {
-                                    if let Ok(meta) = fs::symlink_metadata(&child_path) {
-                                        non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(
-                                            entry_allocated_bytes(&meta, seen_hardlinks),
-                                        );
-                                    }
-                                    continue;
-                                }
-                                let child_os = child.file_name();
-                                let Some(child_name) = child_os.to_str() else {
-                                    non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(
-                                        sum_tree_bytes(&child_path, seen_hardlinks),
-                                    );
-                                    continue;
-                                };
-                                if !is_16_lower_hex(child_name) {
-                                    non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(
-                                        sum_tree_bytes(&child_path, seen_hardlinks),
-                                    );
-                                    continue;
-                                }
-
-                                found_v2_child = true;
-                                let unit_hash = CompactString::from(child_name);
-                                let fp_sub = child_path.join("fingerprint");
-                                let parsed = if fs::symlink_metadata(&fp_sub)
-                                    .is_ok_and(|m| m.file_type().is_dir())
-                                {
-                                    parse_fingerprint_dir(&fp_sub, seen_hardlinks)
-                                } else {
-                                    let mtime = fs::symlink_metadata(&child_path)
-                                        .map(|m| meta_mtime_unix(&m))
-                                        .unwrap_or(0);
-                                    ParsedFingerprintDir {
-                                        metadata: UnitMetadata::Incomplete { mtime_unix: mtime },
-                                        allocated_bytes: 0,
-                                        corrupt: false,
-                                    }
-                                };
-                                if parsed.corrupt {
-                                    fingerprint_corrupt = true;
-                                }
-
-                                let other_bytes = sum_tree_bytes_excluding_child(
-                                    &child_path,
-                                    "fingerprint",
-                                    seen_hardlinks,
-                                );
-                                let unit_bytes = parsed.allocated_bytes.saturating_add(other_bytes);
-                                let unit_mtime = unit_metadata_mtime(&parsed.metadata);
-                                last_activity_unix = last_activity_unix.max(unit_mtime);
-                                allocated_bytes = allocated_bytes.saturating_add(unit_bytes);
-
-                                v2_units.push(BuildUnit {
-                                    id: BuildUnitId::V2 {
-                                        pkg: name.clone(),
-                                        unit_hash,
-                                    },
-                                    pkg_group: name.clone(),
-                                    metadata: parsed.metadata,
-                                    v1_build_dir: None,
-                                    v1_dep_entries: Vec::new(),
-                                    allocated_bytes: unit_bytes,
-                                });
-                            }
-                        }
-                        Err(_) => {
-                            fingerprint_corrupt = true;
-                        }
-                    }
-
-                    // Orphaned V1 `build/<pkg>-<16hex>/` whose `.fingerprint/` dir is absent.
-                    if !found_v2_child
-                        && has_v1_fp_dir
-                        && !fingerprint_corrupt
-                        && let Some((pkg_group, hash)) = split_pkg_and_16hex(&name)
-                        && !v1_hash_to_indices.contains_key(&hash)
-                    {
-                        let build_mtime = fs::symlink_metadata(&entry_path)
-                            .map(|m| meta_mtime_unix(&m))
-                            .unwrap_or(0);
-                        let slot =
-                            orphan_v1_by_hash
-                                .entry(hash)
-                                .or_insert_with(|| OrphanV1Accumulator {
-                                    pkg_group: pkg_group.clone(),
-                                    build_dir: None,
-                                    dep_entries: Vec::new(),
-                                    allocated_bytes: 0,
-                                    mtime_unix: 0,
-                                });
-                        slot.pkg_group = pkg_group;
-                        slot.build_dir = Some(name);
-                        slot.allocated_bytes =
-                            slot.allocated_bytes.saturating_add(non_v2_sibling_bytes);
-                        slot.mtime_unix = slot.mtime_unix.max(build_mtime);
-                    }
-
-                    allocated_bytes = allocated_bytes.saturating_add(non_v2_sibling_bytes);
-                }
-            }
-            Err(_) => {
-                fingerprint_corrupt = true;
-            }
-        }
-    }
-
-    if !fingerprint_corrupt {
-        for (unit_hash, orphan) in orphan_v1_by_hash {
-            v1_units.push(BuildUnit {
-                id: BuildUnitId::V1 {
-                    fingerprint_dir: None,
-                    unit_hash,
-                },
-                pkg_group: orphan.pkg_group,
-                metadata: UnitMetadata::Incomplete {
-                    mtime_unix: orphan.mtime_unix,
-                },
-                v1_build_dir: orphan.build_dir,
-                v1_dep_entries: orphan.dep_entries,
-                allocated_bytes: orphan.allocated_bytes,
-            });
-        }
-    }
-
-    // 4. `incremental/` (never fold `inc_root` dir mtime into `last_activity_unix`, because
-    //    R3 removals bump `incremental/`'s mtime and would otherwise reset R4/R5 aging!)
-    if has_inc_dir && let Ok(entries) = fs::read_dir(&inc_root) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if !ft.is_dir() || ft.is_symlink() {
-                if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                    allocated_bytes = allocated_bytes
-                        .saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
-                }
-                continue;
-            }
-            let Some(dir_name) = entry.file_name().to_str().map(CompactString::from) else {
-                continue;
-            };
-            let inc_dir = inspect_incremental_dir(&entry_path, dir_name, platform, seen_hardlinks);
-            last_activity_unix = last_activity_unix.max(inc_dir.latest_mtime_unix);
-            allocated_bytes = allocated_bytes.saturating_add(inc_dir.allocated_bytes);
-            incremental_dirs.push(inc_dir);
-        }
-    }
-
-    // 5. Top-level profile entries (excluding already-accounted subdirs)
-    if let Ok(entries) = fs::read_dir(profile_path) {
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if matches!(
-                name.as_str(),
-                ".fingerprint" | "deps" | "build" | "incremental"
-            ) {
-                continue;
-            }
-            let entry_path = entry.path();
-            let Ok(emeta) = fs::symlink_metadata(&entry_path) else {
-                continue;
-            };
-            last_activity_unix = last_activity_unix.max(meta_mtime_unix(&emeta));
-            if emeta.file_type().is_dir() && !emeta.file_type().is_symlink() {
-                allocated_bytes =
-                    allocated_bytes.saturating_add(sum_tree_bytes(&entry_path, seen_hardlinks));
-            } else {
-                allocated_bytes =
-                    allocated_bytes.saturating_add(entry_allocated_bytes(&emeta, seen_hardlinks));
-            }
-        }
-    }
-
-    if last_activity_unix == 0 {
-        last_activity_unix = profile_mtime_unix;
-    }
-
-    let has_v2 = !v2_units.is_empty();
-    let has_v1 = !v1_units.is_empty() || has_v1_fp_dir || has_v1_deps_dir;
-    let layout = classify_profile_layout(has_v2, has_v1, has_build_dir, has_inc_dir);
-
-    ProfileDir {
-        name: CompactString::from(rel_path.to_string_lossy().as_ref()),
-        rel_path: rel_path.to_path_buf(),
-        layout,
-        lock_files,
-        locked_now,
-        fingerprint_corrupt,
-        v2_unit_count: v2_units.len(),
-        v1_unit_count: v1_units.len(),
-        incremental_dir_count: incremental_dirs.len(),
-        v2_units,
-        v1_units,
-        incremental_dirs,
-        profile_mtime_unix,
-        inc_root_mtime_unix,
-        allocated_bytes,
-        last_activity_unix,
+            allocated_bytes: 0,
+            last_activity_unix: 0,
+        },
+        full_path: profile_path.to_path_buf(),
+        has_v1_fp_dir,
+        has_v1_deps_dir,
+        has_build_dir,
+        has_inc_dir,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn inspect_profile_inventory(
-    rel_path: &Path,
+#[cfg(unix)]
+fn open_dir_nofollow(path: &Path) -> rustix::io::Result<rustix::fs::Dir> {
+    use rustix::fs::{Dir, Mode, OFlags, open};
+
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    Dir::new(fd)
+}
+
+#[cfg(unix)]
+fn open_child_dir_nofollow(
+    parent_fd: rustix::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    openat(
+        parent_fd,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// Classify a directory entry: returns `Some(true)` for a real directory, `Some(false)` after
+/// accounting a non-directory regular entry, or `None` to skip symlinks/unstatable entries.
+#[cfg(unix)]
+fn dir_entry_is_dir_or_account(
+    dir: &rustix::fs::Dir,
+    entry: &rustix::fs::DirEntry,
+    allocated_bytes: &mut u64,
+    hardlinks: &mut HardlinkSet,
+) -> Option<bool> {
+    use rustix::fs::{AtFlags, FileType, statat};
+
+    let ft = entry.file_type();
+    if ft == FileType::Symlink {
+        return None;
+    }
+    if ft == FileType::Directory {
+        return Some(true);
+    }
+    if ft == FileType::RegularFile {
+        let ino = entry.ino();
+        if ino != 0 && hardlinks.contains_primary(ino) {
+            return Some(false);
+        }
+    }
+    let fd = dir.fd().ok()?;
+    let st = statat(fd, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW).ok()?;
+    let mode_ft = FileType::from_raw_mode(st.st_mode);
+    if mode_ft == FileType::Symlink {
+        return None;
+    }
+    if mode_ft == FileType::Directory {
+        Some(true)
+    } else {
+        *allocated_bytes =
+            allocated_bytes.saturating_add(stat_allocated_bytes(&st, false, hardlinks));
+        Some(false)
+    }
+}
+
+fn account_profile_top_entries(
     profile_path: &Path,
-    lock_files: SmallVec<[PathBuf; 4]>,
-    locked_now: bool,
-    profile_mtime_unix: u64,
-    inc_root_mtime_unix: u64,
+    profile: &mut ProfileDir,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+) {
+    let Ok(entries) = fs::read_dir(profile_path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let os_name = entry.file_name();
+        let Some(name) = os_name.to_str() else {
+            continue;
+        };
+        if matches!(name, ".fingerprint" | "deps" | "build" | "incremental") {
+            continue;
+        }
+        let entry_path = entry.path();
+        let Ok(emeta) = fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        profile.last_activity_unix = profile.last_activity_unix.max(meta_mtime_unix(&emeta));
+        if emeta.file_type().is_dir() && !emeta.file_type().is_symlink() {
+            let res = account_tree(&entry_path, MtimePolicy::None, None, hardlinks, scratch);
+            profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+        } else {
+            profile.allocated_bytes = profile
+                .allocated_bytes
+                .saturating_add(entry_allocated_bytes(&emeta, hardlinks));
+        }
+    }
+}
+
+fn finish_profile_metadata(
+    profile: &mut ProfileDir,
     has_v1_fp_dir: bool,
     has_v1_deps_dir: bool,
     has_build_dir: bool,
     has_inc_dir: bool,
-    target_key: (u64, u64),
-    seen_hardlinks: &mut HashSet<(u64, u64)>,
-    account_chunks: &mut Vec<AccountChunk>,
+) {
+    if profile.last_activity_unix == 0 {
+        profile.last_activity_unix = profile.profile_mtime_unix;
+    }
+    let has_v2 = profile.v2_unit_count > 0;
+    let has_v1 = profile.v1_unit_count > 0 || has_v1_fp_dir || has_v1_deps_dir;
+    profile.layout = classify_profile_layout(has_v2, has_v1, has_build_dir, has_inc_dir);
+}
+
+fn inspect_profile_inventory(
+    probe: ProfileProbe,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
 ) -> ProfileDir {
-    let dest = AccountDest::Profile(rel_path.to_path_buf());
+    let ProfileProbe {
+        mut profile,
+        full_path,
+        has_v1_fp_dir,
+        has_v1_deps_dir,
+        has_build_dir,
+        has_inc_dir,
+    } = probe;
+
     let mut v1_fp_names: HashSet<CompactString> = HashSet::new();
-    let mut v1_unit_count = 0usize;
-    let mut v2_unit_count = 0usize;
-    let mut incremental_dir_count = 0usize;
-    let mut allocated_bytes: u64 = 0;
-    let mut last_activity_unix: u64 = 0;
+    let fp_root = full_path.join(".fingerprint");
+    let deps_root = full_path.join("deps");
+    let build_root = full_path.join("build");
+    let inc_root = full_path.join("incremental");
 
-    // 1. `.fingerprint/` (V1): single pass for counting + deferred byte/mtime accounting.
-    if has_v1_fp_dir && let Ok(entries) = fs::read_dir(profile_path.join(".fingerprint")) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
-                continue;
-            }
-            if ft.is_dir() {
-                if let Some(name) = entry.file_name().to_str()
-                    && split_pkg_and_16hex(name).is_some()
+    #[cfg(unix)]
+    {
+        // 1. `.fingerprint/` (V1)
+        if has_v1_fp_dir && let Ok(mut dir) = open_dir_nofollow(&fp_root) {
+            while let Some(entry_res) = dir.read() {
+                let Ok(entry) = entry_res else {
+                    continue;
+                };
+                let name = entry.file_name();
+                let bytes = name.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if dir_entry_is_dir_or_account(
+                    &dir,
+                    &entry,
+                    &mut profile.allocated_bytes,
+                    hardlinks,
+                ) != Some(true)
                 {
-                    v1_unit_count += 1;
-                    v1_fp_names.insert(CompactString::from(name));
+                    continue;
                 }
-                account_chunks.push(AccountChunk {
-                    target_key,
-                    dest: dest.clone(),
-                    path: entry_path,
-                    mtime_policy: MtimePolicy::UpToDepth(1),
-                });
-            } else if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                allocated_bytes =
-                    allocated_bytes.saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
+                if let Ok(name_str) = std::str::from_utf8(bytes)
+                    && split_pkg_and_16hex(name_str).is_some()
+                {
+                    profile.v1_unit_count += 1;
+                    v1_fp_names.insert(CompactString::from(name_str));
+                }
+                let Ok(fd) = dir.fd() else {
+                    break;
+                };
+                if let Ok(child_fd) = open_child_dir_nofollow(fd, name) {
+                    let mut out = DirAccountResult::default();
+                    sum_dir_fd_recursive(
+                        child_fd,
+                        0,
+                        MtimePolicy::UpToDepth(1),
+                        None,
+                        hardlinks,
+                        scratch,
+                        &mut out,
+                    );
+                    profile.allocated_bytes = profile.allocated_bytes.saturating_add(out.bytes);
+                    profile.last_activity_unix = profile.last_activity_unix.max(out.max_mtime);
+                }
             }
         }
-    }
 
-    // 2. `deps/` (V1)
-    if has_v1_deps_dir {
-        account_chunks.push(AccountChunk {
-            target_key,
-            dest: dest.clone(),
-            path: profile_path.join("deps"),
-            mtime_policy: MtimePolicy::None,
-        });
-    }
+        // 2. `deps/` (V1)
+        if has_v1_deps_dir {
+            let res = account_tree(&deps_root, MtimePolicy::None, None, hardlinks, scratch);
+            profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+        }
 
-    // 3. `build/`: single pass for counting V2 units + fine-grained parallel byte/mtime chunks.
-    if has_build_dir && let Ok(entries) = fs::read_dir(profile_path.join("build")) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            if ft.is_symlink() {
-                continue;
-            }
-            if !ft.is_dir() {
-                if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                    allocated_bytes = allocated_bytes
-                        .saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
+        // 3. `build/` (V1 or V2)
+        if has_build_dir && let Ok(mut dir) = open_dir_nofollow(&build_root) {
+            while let Some(entry_res) = dir.read() {
+                let Ok(entry) = entry_res else {
+                    continue;
+                };
+                let name = entry.file_name();
+                let bytes = name.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
                 }
-                continue;
-            }
-            let os_name = entry.file_name();
-            if let Some(name) = os_name.to_str()
-                && v1_fp_names.contains(name)
-            {
-                account_chunks.push(AccountChunk {
-                    target_key,
-                    dest: dest.clone(),
-                    path: entry_path,
-                    mtime_policy: MtimePolicy::None,
-                });
-                continue;
-            }
-            let mut found_v2_child = false;
-            if let Ok(children) = fs::read_dir(&entry_path) {
-                for child in children.flatten() {
-                    if child
-                        .file_type()
-                        .is_ok_and(|cft| cft.is_dir() && !cft.is_symlink())
-                        && child.file_name().to_str().is_some_and(is_16_lower_hex)
-                    {
-                        found_v2_child = true;
-                        v2_unit_count += 1;
-                    }
+                if dir_entry_is_dir_or_account(
+                    &dir,
+                    &entry,
+                    &mut profile.allocated_bytes,
+                    hardlinks,
+                ) != Some(true)
+                {
+                    continue;
                 }
-            }
-            account_chunks.push(AccountChunk {
-                target_key,
-                dest: dest.clone(),
-                path: entry_path,
-                mtime_policy: if found_v2_child {
-                    MtimePolicy::V2PkgDir
-                } else {
+                let is_v1_build = std::str::from_utf8(bytes).is_ok_and(|s| v1_fp_names.contains(s));
+                let policy = if is_v1_build {
                     MtimePolicy::None
-                },
-            });
+                } else {
+                    MtimePolicy::V2PkgDir
+                };
+                let Ok(fd) = dir.fd() else {
+                    break;
+                };
+                if let Ok(child_fd) = open_child_dir_nofollow(fd, name) {
+                    let mut out = DirAccountResult::default();
+                    sum_dir_fd_recursive(child_fd, 0, policy, None, hardlinks, scratch, &mut out);
+                    profile.allocated_bytes = profile.allocated_bytes.saturating_add(out.bytes);
+                    profile.v2_unit_count = profile.v2_unit_count.saturating_add(out.v2_unit_count);
+                    profile.last_activity_unix = profile.last_activity_unix.max(out.max_mtime);
+                }
+            }
+        }
+
+        // 4. `incremental/`
+        if has_inc_dir && let Ok(mut dir) = open_dir_nofollow(&inc_root) {
+            while let Some(entry_res) = dir.read() {
+                let Ok(entry) = entry_res else {
+                    continue;
+                };
+                let name = entry.file_name();
+                let bytes = name.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if dir_entry_is_dir_or_account(
+                    &dir,
+                    &entry,
+                    &mut profile.allocated_bytes,
+                    hardlinks,
+                ) != Some(true)
+                {
+                    continue;
+                }
+                profile.incremental_dir_count += 1;
+                let Ok(fd) = dir.fd() else {
+                    break;
+                };
+                if let Ok(child_fd) = open_child_dir_nofollow(fd, name) {
+                    let mut out = DirAccountResult::default();
+                    sum_dir_fd_recursive(
+                        child_fd,
+                        0,
+                        MtimePolicy::IncrementalCrateDir,
+                        None,
+                        hardlinks,
+                        scratch,
+                        &mut out,
+                    );
+                    profile.allocated_bytes = profile.allocated_bytes.saturating_add(out.bytes);
+                    profile.last_activity_unix = profile.last_activity_unix.max(out.max_mtime);
+                }
+            }
         }
     }
 
-    // 4. `incremental/`: single pass for counting + parallel chunks with `s-*.lock`/`s-*` mtime
-    //    (excluding `incremental/` and depth-0 `<crate>/` dir mtimes so R3 pruning never resets age).
-    if has_inc_dir {
-        let inc_root = profile_path.join("incremental");
-        if let Ok(entries) = fs::read_dir(&inc_root) {
+    #[cfg(not(unix))]
+    {
+        if has_v1_fp_dir && let Ok(entries) = fs::read_dir(&fp_root) {
             for entry in entries.flatten() {
-                let entry_path = entry.path();
                 let Ok(ft) = entry.file_type() else {
                     continue;
                 };
@@ -2124,73 +1872,866 @@ fn inspect_profile_inventory(
                     continue;
                 }
                 if ft.is_dir() {
-                    incremental_dir_count += 1;
-                    account_chunks.push(AccountChunk {
-                        target_key,
-                        dest: dest.clone(),
-                        path: entry_path,
-                        mtime_policy: MtimePolicy::IncrementalCrateDir,
-                    });
-                } else if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                    allocated_bytes = allocated_bytes
-                        .saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
+                    if let Some(name) = entry.file_name().to_str()
+                        && split_pkg_and_16hex(name).is_some()
+                    {
+                        profile.v1_unit_count += 1;
+                        v1_fp_names.insert(CompactString::from(name));
+                    }
+                    let res = account_tree(
+                        &entry.path(),
+                        MtimePolicy::UpToDepth(1),
+                        None,
+                        hardlinks,
+                        scratch,
+                    );
+                    profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+                    profile.last_activity_unix = profile.last_activity_unix.max(res.max_mtime);
+                } else if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                    profile.allocated_bytes = profile
+                        .allocated_bytes
+                        .saturating_add(entry_allocated_bytes(&meta, hardlinks));
+                }
+            }
+        }
+
+        if has_v1_deps_dir {
+            let res = account_tree(&deps_root, MtimePolicy::None, None, hardlinks, scratch);
+            profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+        }
+
+        if has_build_dir && let Ok(entries) = fs::read_dir(&build_root) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if !ft.is_dir() {
+                    if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                        profile.allocated_bytes = profile
+                            .allocated_bytes
+                            .saturating_add(entry_allocated_bytes(&meta, hardlinks));
+                    }
+                    continue;
+                }
+                let is_v1_build = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| v1_fp_names.contains(name));
+                let policy = if is_v1_build {
+                    MtimePolicy::None
+                } else {
+                    MtimePolicy::V2PkgDir
+                };
+                let res = account_tree(&entry.path(), policy, None, hardlinks, scratch);
+                profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+                profile.v2_unit_count = profile.v2_unit_count.saturating_add(res.v2_unit_count);
+                profile.last_activity_unix = profile.last_activity_unix.max(res.max_mtime);
+            }
+        }
+
+        if has_inc_dir && let Ok(entries) = fs::read_dir(&inc_root) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if ft.is_dir() {
+                    profile.incremental_dir_count += 1;
+                    let res = account_tree(
+                        &entry.path(),
+                        MtimePolicy::IncrementalCrateDir,
+                        None,
+                        hardlinks,
+                        scratch,
+                    );
+                    profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+                    profile.last_activity_unix = profile.last_activity_unix.max(res.max_mtime);
+                } else if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                    profile.allocated_bytes = profile
+                        .allocated_bytes
+                        .saturating_add(entry_allocated_bytes(&meta, hardlinks));
                 }
             }
         }
     }
 
-    // 5. Top-level profile files and auxiliary dirs (e.g. binaries, examples/).
-    if let Ok(entries) = fs::read_dir(profile_path) {
-        for entry in entries.flatten() {
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if matches!(
-                name.as_str(),
-                ".fingerprint" | "deps" | "build" | "incremental"
-            ) {
-                continue;
+    account_profile_top_entries(&full_path, &mut profile, hardlinks, scratch);
+    finish_profile_metadata(
+        &mut profile,
+        has_v1_fp_dir,
+        has_v1_deps_dir,
+        has_build_dir,
+        has_inc_dir,
+    );
+    profile
+}
+
+fn inspect_profile_full(
+    probe: ProfileProbe,
+    platform: &impl Platform,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+) -> ProfileDir {
+    let ProfileProbe {
+        mut profile,
+        full_path,
+        has_v1_fp_dir,
+        has_v1_deps_dir,
+        has_build_dir,
+        has_inc_dir,
+    } = probe;
+
+    let fp_root = full_path.join(".fingerprint");
+    let deps_root = full_path.join("deps");
+    let build_root = full_path.join("build");
+    let inc_root = full_path.join("incremental");
+
+    let mut v1_fp_index_by_name: HashMap<CompactString, usize> = HashMap::new();
+    let mut v1_hash_to_indices: HashMap<u64, SmallVec<[usize; 2]>, FastU64BuildHasher> =
+        HashMap::with_hasher(FastU64BuildHasher);
+    let mut orphan_idx_by_hash: HashMap<u64, usize, FastU64BuildHasher> =
+        HashMap::with_hasher(FastU64BuildHasher);
+
+    // 1. V1 `.fingerprint/<pkg>-<16hex>/`
+    if has_v1_fp_dir {
+        #[cfg(unix)]
+        match open_dir_nofollow(&fp_root) {
+            Ok(mut dir) => {
+                while let Some(entry_res) = dir.read() {
+                    let Ok(entry) = entry_res else {
+                        continue;
+                    };
+                    let name = entry.file_name();
+                    let bytes = name.to_bytes();
+                    if bytes == b"." || bytes == b".." {
+                        continue;
+                    }
+                    if dir_entry_is_dir_or_account(
+                        &dir,
+                        &entry,
+                        &mut profile.allocated_bytes,
+                        hardlinks,
+                    ) != Some(true)
+                    {
+                        continue;
+                    }
+                    let Ok(fd) = dir.fd() else {
+                        break;
+                    };
+                    let Ok(name_str) = std::str::from_utf8(bytes) else {
+                        profile.fingerprint_corrupt = true;
+                        if let Ok(child_fd) = open_child_dir_nofollow(fd, name) {
+                            let mut out = DirAccountResult::default();
+                            sum_dir_fd_recursive(
+                                child_fd,
+                                0,
+                                MtimePolicy::None,
+                                None,
+                                hardlinks,
+                                scratch,
+                                &mut out,
+                            );
+                            profile.allocated_bytes =
+                                profile.allocated_bytes.saturating_add(out.bytes);
+                        }
+                        continue;
+                    };
+                    let dir_name = CompactString::from(name_str);
+                    let Some((pkg_group, unit_hash)) = split_pkg_and_16hex(&dir_name) else {
+                        if let Ok(child_fd) = open_child_dir_nofollow(fd, name) {
+                            let mut out = DirAccountResult::default();
+                            sum_dir_fd_recursive(
+                                child_fd,
+                                0,
+                                MtimePolicy::None,
+                                None,
+                                hardlinks,
+                                scratch,
+                                &mut out,
+                            );
+                            profile.allocated_bytes =
+                                profile.allocated_bytes.saturating_add(out.bytes);
+                        }
+                        continue;
+                    };
+                    let parsed = match open_child_dir_nofollow(fd, name) {
+                        Ok(child_fd) => parse_fingerprint_dir_fd(
+                            child_fd,
+                            hardlinks,
+                            scratch,
+                            &mut profile.dep_fp_pool,
+                        ),
+                        Err(_) => {
+                            let mtime =
+                                rustix::fs::statat(fd, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+                                    .map(|st| u64::try_from(st.st_mtime).unwrap_or(0))
+                                    .unwrap_or(0);
+                            ParsedFingerprintDir {
+                                metadata: UnitMetadata::Incomplete { mtime_unix: mtime },
+                                allocated_bytes: 0,
+                                corrupt: true,
+                            }
+                        }
+                    };
+                    if parsed.corrupt {
+                        profile.fingerprint_corrupt = true;
+                    }
+                    profile.last_activity_unix = profile
+                        .last_activity_unix
+                        .max(unit_metadata_mtime(&parsed.metadata));
+                    profile.allocated_bytes = profile
+                        .allocated_bytes
+                        .saturating_add(parsed.allocated_bytes);
+
+                    let u_idx = profile.v1_units.len();
+                    v1_fp_index_by_name.insert(dir_name.clone(), u_idx);
+                    if let Some(hash_u64) = parse_16_lower_hex_u64(&unit_hash) {
+                        v1_hash_to_indices.entry(hash_u64).or_default().push(u_idx);
+                    }
+                    profile.v1_units.push(BuildUnit {
+                        id: BuildUnitId::V1 {
+                            fingerprint_dir: Some(dir_name),
+                            unit_hash,
+                        },
+                        metadata: parsed.metadata,
+                        v1: Some(Box::new(V1UnitExtras {
+                            pkg_group,
+                            build_dir: None,
+                            dep_entry_count: 0,
+                        })),
+                        allocated_bytes: parsed.allocated_bytes,
+                    });
+                }
             }
-            let entry_path = entry.path();
-            let Ok(emeta) = fs::symlink_metadata(&entry_path) else {
-                continue;
-            };
-            last_activity_unix = last_activity_unix.max(meta_mtime_unix(&emeta));
-            if emeta.file_type().is_dir() && !emeta.file_type().is_symlink() {
-                account_chunks.push(AccountChunk {
-                    target_key,
-                    dest: dest.clone(),
-                    path: entry_path,
-                    mtime_policy: MtimePolicy::None,
-                });
-            } else {
-                allocated_bytes =
-                    allocated_bytes.saturating_add(entry_allocated_bytes(&emeta, seen_hardlinks));
+            Err(_) => {
+                profile.fingerprint_corrupt = true;
+            }
+        }
+        #[cfg(not(unix))]
+        match fs::read_dir(&fp_root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let Ok(ft) = entry.file_type() else {
+                        continue;
+                    };
+                    if ft.is_symlink() {
+                        continue;
+                    }
+                    if !ft.is_dir() {
+                        if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                            profile.allocated_bytes = profile
+                                .allocated_bytes
+                                .saturating_add(entry_allocated_bytes(&meta, hardlinks));
+                        }
+                        continue;
+                    }
+                    let Some(dir_name) = entry.file_name().to_str().map(CompactString::from) else {
+                        profile.fingerprint_corrupt = true;
+                        let res = account_tree(
+                            &entry.path(),
+                            MtimePolicy::None,
+                            None,
+                            hardlinks,
+                            scratch,
+                        );
+                        profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+                        continue;
+                    };
+                    let Some((pkg_group, unit_hash)) = split_pkg_and_16hex(&dir_name) else {
+                        let res = account_tree(
+                            &entry.path(),
+                            MtimePolicy::None,
+                            None,
+                            hardlinks,
+                            scratch,
+                        );
+                        profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+                        continue;
+                    };
+                    let parsed = parse_fingerprint_dir_path(
+                        &entry.path(),
+                        hardlinks,
+                        scratch,
+                        &mut profile.dep_fp_pool,
+                    );
+                    if parsed.corrupt {
+                        profile.fingerprint_corrupt = true;
+                    }
+                    profile.last_activity_unix = profile
+                        .last_activity_unix
+                        .max(unit_metadata_mtime(&parsed.metadata));
+                    profile.allocated_bytes = profile
+                        .allocated_bytes
+                        .saturating_add(parsed.allocated_bytes);
+
+                    let u_idx = profile.v1_units.len();
+                    v1_fp_index_by_name.insert(dir_name.clone(), u_idx);
+                    if let Some(hash_u64) = parse_16_lower_hex_u64(&unit_hash) {
+                        v1_hash_to_indices.entry(hash_u64).or_default().push(u_idx);
+                    }
+                    profile.v1_units.push(BuildUnit {
+                        id: BuildUnitId::V1 {
+                            fingerprint_dir: Some(dir_name),
+                            unit_hash,
+                        },
+                        metadata: parsed.metadata,
+                        v1: Some(Box::new(V1UnitExtras {
+                            pkg_group,
+                            build_dir: None,
+                            dep_entry_count: 0,
+                        })),
+                        allocated_bytes: parsed.allocated_bytes,
+                    });
+                }
+            }
+            Err(_) => {
+                profile.fingerprint_corrupt = true;
             }
         }
     }
 
-    let has_v2 = v2_unit_count > 0;
-    let has_v1 = v1_unit_count > 0 || has_v1_fp_dir || has_v1_deps_dir;
-    let layout = classify_profile_layout(has_v2, has_v1, has_build_dir, has_inc_dir);
+    // 2. V1 `deps/` — aggregates bytes, mtime, and entry counts per 16-hex hash with zero
+    //    retention of tens of thousands of `.rcgu.o` filename strings.
+    let mut deps_by_hash: HashMap<u64, V1DepHashStats, FastU64BuildHasher> =
+        HashMap::with_hasher(FastU64BuildHasher);
+    if has_v1_deps_dir {
+        let (deps_bytes, corrupt) = inspect_v1_deps_dir(
+            &deps_root,
+            &v1_hash_to_indices,
+            hardlinks,
+            scratch,
+            &mut deps_by_hash,
+        );
+        profile.allocated_bytes = profile.allocated_bytes.saturating_add(deps_bytes);
+        if corrupt {
+            profile.fingerprint_corrupt = true;
+        }
+    }
 
-    ProfileDir {
-        name: CompactString::from(rel_path.to_string_lossy().as_ref()),
-        rel_path: rel_path.to_path_buf(),
-        layout,
-        lock_files,
-        locked_now,
-        fingerprint_corrupt: false,
-        v2_unit_count,
-        v1_unit_count,
-        incremental_dir_count,
-        v2_units: Vec::new(),
-        v1_units: Vec::new(),
-        incremental_dirs: Vec::new(),
-        profile_mtime_unix,
-        inc_root_mtime_unix,
-        allocated_bytes,
-        last_activity_unix,
+    // 3. `build/` (V1 `build/<pkg>-<16hex>/`, V2 `build/<pkg>/<16hex>/`, or orphaned V1 build dir)
+    let mut non_v2_build_dirs: Vec<(CompactString, u64, u64)> = Vec::new();
+    if has_build_dir {
+        #[cfg(unix)]
+        match open_dir_nofollow(&build_root) {
+            Ok(mut dir) => {
+                while let Some(entry_res) = dir.read() {
+                    let Ok(entry) = entry_res else {
+                        continue;
+                    };
+                    let name = entry.file_name();
+                    let bytes = name.to_bytes();
+                    if bytes == b"." || bytes == b".." {
+                        continue;
+                    }
+                    if dir_entry_is_dir_or_account(
+                        &dir,
+                        &entry,
+                        &mut profile.allocated_bytes,
+                        hardlinks,
+                    ) != Some(true)
+                    {
+                        continue;
+                    }
+                    let Ok(fd) = dir.fd() else {
+                        break;
+                    };
+                    let Ok(name_str) = std::str::from_utf8(bytes) else {
+                        if let Ok(child_fd) = open_child_dir_nofollow(fd, name) {
+                            let mut out = DirAccountResult::default();
+                            sum_dir_fd_recursive(
+                                child_fd,
+                                0,
+                                MtimePolicy::None,
+                                None,
+                                hardlinks,
+                                scratch,
+                                &mut out,
+                            );
+                            profile.allocated_bytes =
+                                profile.allocated_bytes.saturating_add(out.bytes);
+                        }
+                        continue;
+                    };
+                    if let Some(&v1_idx) = v1_fp_index_by_name.get(name_str) {
+                        let mut out = DirAccountResult::default();
+                        if let Ok(child_fd) = open_child_dir_nofollow(fd, name) {
+                            sum_dir_fd_recursive(
+                                child_fd,
+                                0,
+                                MtimePolicy::None,
+                                None,
+                                hardlinks,
+                                scratch,
+                                &mut out,
+                            );
+                        }
+                        profile.allocated_bytes = profile.allocated_bytes.saturating_add(out.bytes);
+                        let unit = &mut profile.v1_units[v1_idx];
+                        if let Some(extras) = unit.v1.as_deref_mut() {
+                            extras.build_dir = Some(CompactString::from(name_str));
+                        }
+                        unit.allocated_bytes = unit.allocated_bytes.saturating_add(out.bytes);
+                    } else {
+                        let pkg_name = CompactString::from(name_str);
+                        let pkg_res = match open_child_dir_nofollow(fd, name) {
+                            Ok(pkg_fd) => inspect_v2_pkg_dir_fd_into(
+                                pkg_fd,
+                                &pkg_name,
+                                hardlinks,
+                                scratch,
+                                &mut profile.v2_units,
+                                &mut profile.dep_fp_pool,
+                            ),
+                            Err(_) => BuildPkgDirResult {
+                                total_bytes: 0,
+                                non_v2_sibling_bytes: 0,
+                                dir_mtime_unix: 0,
+                                max_mtime: 0,
+                                found_v2_child: false,
+                                corrupt: true,
+                            },
+                        };
+                        profile.allocated_bytes =
+                            profile.allocated_bytes.saturating_add(pkg_res.total_bytes);
+                        profile.last_activity_unix =
+                            profile.last_activity_unix.max(pkg_res.max_mtime);
+                        if pkg_res.corrupt {
+                            profile.fingerprint_corrupt = true;
+                        }
+                        if !pkg_res.found_v2_child && has_v1_fp_dir {
+                            non_v2_build_dirs.push((
+                                pkg_name,
+                                pkg_res.non_v2_sibling_bytes,
+                                pkg_res.dir_mtime_unix,
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                profile.fingerprint_corrupt = true;
+            }
+        }
+        #[cfg(not(unix))]
+        match fs::read_dir(&build_root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let Ok(ft) = entry.file_type() else {
+                        continue;
+                    };
+                    if ft.is_symlink() {
+                        continue;
+                    }
+                    if !ft.is_dir() {
+                        if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                            profile.allocated_bytes = profile
+                                .allocated_bytes
+                                .saturating_add(entry_allocated_bytes(&meta, hardlinks));
+                        }
+                        continue;
+                    }
+                    let Some(name_str) = entry.file_name().to_str().map(CompactString::from) else {
+                        let res = account_tree(
+                            &entry.path(),
+                            MtimePolicy::None,
+                            None,
+                            hardlinks,
+                            scratch,
+                        );
+                        profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+                        continue;
+                    };
+                    if let Some(&v1_idx) = v1_fp_index_by_name.get(name_str.as_str()) {
+                        let bytes = account_tree(
+                            &entry.path(),
+                            MtimePolicy::None,
+                            None,
+                            hardlinks,
+                            scratch,
+                        )
+                        .bytes;
+                        profile.allocated_bytes = profile.allocated_bytes.saturating_add(bytes);
+                        let unit = &mut profile.v1_units[v1_idx];
+                        if let Some(extras) = unit.v1.as_deref_mut() {
+                            extras.build_dir = Some(name_str);
+                        }
+                        unit.allocated_bytes = unit.allocated_bytes.saturating_add(bytes);
+                    } else {
+                        let pkg_res = inspect_v2_pkg_dir_path_into(
+                            &entry.path(),
+                            &name_str,
+                            hardlinks,
+                            scratch,
+                            &mut profile.v2_units,
+                            &mut profile.dep_fp_pool,
+                        );
+                        profile.allocated_bytes =
+                            profile.allocated_bytes.saturating_add(pkg_res.total_bytes);
+                        profile.last_activity_unix =
+                            profile.last_activity_unix.max(pkg_res.max_mtime);
+                        if pkg_res.corrupt {
+                            profile.fingerprint_corrupt = true;
+                        }
+                        if !pkg_res.found_v2_child && has_v1_fp_dir {
+                            non_v2_build_dirs.push((
+                                name_str,
+                                pkg_res.non_v2_sibling_bytes,
+                                pkg_res.dir_mtime_unix,
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                profile.fingerprint_corrupt = true;
+            }
+        }
+    }
+
+    // Attach V1 `deps/` stats and orphaned V1 units only when `.fingerprint/` was clean.
+    let allow_orphans = has_v1_fp_dir && !profile.fingerprint_corrupt;
+    for (hash_u64, stats) in deps_by_hash {
+        if let Some(indices) = v1_hash_to_indices.get(&hash_u64) {
+            if indices.len() == 1 {
+                let unit = &mut profile.v1_units[indices[0]];
+                unit.allocated_bytes = unit.allocated_bytes.saturating_add(stats.bytes);
+                if let Some(extras) = unit.v1.as_deref_mut() {
+                    extras.dep_entry_count = extras.dep_entry_count.saturating_add(stats.count);
+                }
+            }
+        } else if allow_orphans {
+            let new_idx = profile.v1_units.len();
+            orphan_idx_by_hash.insert(hash_u64, new_idx);
+            profile.v1_units.push(BuildUnit {
+                id: BuildUnitId::V1 {
+                    fingerprint_dir: None,
+                    unit_hash: format_16_lower_hex(hash_u64),
+                },
+                metadata: UnitMetadata::Incomplete {
+                    mtime_unix: stats.max_mtime,
+                },
+                v1: Some(Box::new(V1UnitExtras {
+                    pkg_group: CompactString::new("orphan"),
+                    build_dir: None,
+                    dep_entry_count: stats.count,
+                })),
+                allocated_bytes: stats.bytes,
+            });
+        }
+    }
+    if allow_orphans {
+        for (pkg_name, bytes, build_mtime) in non_v2_build_dirs {
+            if let Some((pkg_group, hash_str)) = split_pkg_and_16hex(&pkg_name)
+                && let Some(hash_u64) = parse_16_lower_hex_u64(&hash_str)
+                && !v1_hash_to_indices.contains_key(&hash_u64)
+            {
+                let u_idx = *orphan_idx_by_hash.entry(hash_u64).or_insert_with(|| {
+                    let new_idx = profile.v1_units.len();
+                    profile.v1_units.push(BuildUnit {
+                        id: BuildUnitId::V1 {
+                            fingerprint_dir: None,
+                            unit_hash: hash_str,
+                        },
+                        metadata: UnitMetadata::Incomplete { mtime_unix: 0 },
+                        v1: Some(Box::new(V1UnitExtras {
+                            pkg_group: pkg_group.clone(),
+                            build_dir: None,
+                            dep_entry_count: 0,
+                        })),
+                        allocated_bytes: 0,
+                    });
+                    new_idx
+                });
+                let unit = &mut profile.v1_units[u_idx];
+                if let Some(extras) = unit.v1.as_deref_mut() {
+                    extras.pkg_group = pkg_group;
+                    extras.build_dir = Some(pkg_name);
+                }
+                unit.allocated_bytes = unit.allocated_bytes.saturating_add(bytes);
+                if let UnitMetadata::Incomplete { mtime_unix } = &mut unit.metadata {
+                    *mtime_unix = (*mtime_unix).max(build_mtime);
+                }
+            }
+        }
+    }
+
+    // 4. `incremental/`
+    if has_inc_dir {
+        #[cfg(unix)]
+        if let Ok(mut dir) = open_dir_nofollow(&inc_root) {
+            while let Some(entry_res) = dir.read() {
+                let Ok(entry) = entry_res else {
+                    continue;
+                };
+                let name = entry.file_name();
+                let bytes = name.to_bytes();
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if dir_entry_is_dir_or_account(
+                    &dir,
+                    &entry,
+                    &mut profile.allocated_bytes,
+                    hardlinks,
+                ) != Some(true)
+                {
+                    continue;
+                }
+                let Ok(fd) = dir.fd() else {
+                    break;
+                };
+                let Ok(name_str) = std::str::from_utf8(bytes) else {
+                    if let Ok(child_fd) = open_child_dir_nofollow(fd, name) {
+                        let mut out = DirAccountResult::default();
+                        sum_dir_fd_recursive(
+                            child_fd,
+                            0,
+                            MtimePolicy::None,
+                            None,
+                            hardlinks,
+                            scratch,
+                            &mut out,
+                        );
+                        profile.allocated_bytes = profile.allocated_bytes.saturating_add(out.bytes);
+                    }
+                    continue;
+                };
+                let dir_name = CompactString::from(name_str);
+                let inc_dir = inspect_incremental_dir_fd(
+                    &inc_root, fd, name, dir_name, platform, hardlinks, scratch,
+                );
+                profile.last_activity_unix =
+                    profile.last_activity_unix.max(inc_dir.latest_mtime_unix);
+                profile.allocated_bytes = profile
+                    .allocated_bytes
+                    .saturating_add(inc_dir.allocated_bytes);
+                profile.incremental_dirs.push(inc_dir);
+            }
+        }
+        #[cfg(not(unix))]
+        if let Ok(entries) = fs::read_dir(&inc_root) {
+            for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                if !ft.is_dir() {
+                    if let Ok(meta) = fs::symlink_metadata(entry.path()) {
+                        profile.allocated_bytes = profile
+                            .allocated_bytes
+                            .saturating_add(entry_allocated_bytes(&meta, hardlinks));
+                    }
+                    continue;
+                }
+                let Some(dir_name) = entry.file_name().to_str().map(CompactString::from) else {
+                    let res =
+                        account_tree(&entry.path(), MtimePolicy::None, None, hardlinks, scratch);
+                    profile.allocated_bytes = profile.allocated_bytes.saturating_add(res.bytes);
+                    continue;
+                };
+                let inc_dir = inspect_incremental_dir_path(
+                    &entry.path(),
+                    dir_name,
+                    platform,
+                    hardlinks,
+                    scratch,
+                );
+                profile.last_activity_unix =
+                    profile.last_activity_unix.max(inc_dir.latest_mtime_unix);
+                profile.allocated_bytes = profile
+                    .allocated_bytes
+                    .saturating_add(inc_dir.allocated_bytes);
+                profile.incremental_dirs.push(inc_dir);
+            }
+        }
+    }
+
+    // 5. Top-level profile entries (excluding already-accounted subdirs)
+    account_profile_top_entries(&full_path, &mut profile, hardlinks, scratch);
+
+    // Compact `dep_fp_pool` in-place while spans are strictly monotonic (before sorting units).
+    compact_profile_dep_fp_pool(&mut profile);
+
+    profile.v2_units.sort_by(|a, b| match (&a.id, &b.id) {
+        (
+            BuildUnitId::V2 {
+                pkg: pa,
+                unit_hash: ha,
+            },
+            BuildUnitId::V2 {
+                pkg: pb,
+                unit_hash: hb,
+            },
+        ) => pa.cmp(pb).then_with(|| ha.cmp(hb)),
+        _ => std::cmp::Ordering::Equal,
+    });
+    profile.v1_units.sort_by(|a, b| match (&a.id, &b.id) {
+        (
+            BuildUnitId::V1 {
+                fingerprint_dir: fa,
+                unit_hash: ha,
+            },
+            BuildUnitId::V1 {
+                fingerprint_dir: fb,
+                unit_hash: hb,
+            },
+        ) => fa.cmp(fb).then_with(|| ha.cmp(hb)),
+        _ => std::cmp::Ordering::Equal,
+    });
+    profile
+        .incremental_dirs
+        .sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
+
+    profile.v2_unit_count = profile.v2_units.len();
+    profile.v1_unit_count = profile.v1_units.len();
+    profile.incremental_dir_count = profile.incremental_dirs.len();
+
+    finish_profile_metadata(
+        &mut profile,
+        has_v1_fp_dir,
+        has_v1_deps_dir,
+        has_build_dir,
+        has_inc_dir,
+    );
+    profile
+}
+
+fn collect_layer_anchor_hashes(units: &[BuildUnit]) -> HashSet<u64, FastU64BuildHasher> {
+    let mut anchors = HashSet::with_capacity_and_hasher(units.len(), FastU64BuildHasher);
+    for unit in units {
+        if let UnitMetadata::Complete { targets, .. } = &unit.metadata {
+            for anchor in targets {
+                if let Some(h) = anchor.fingerprint_hash {
+                    anchors.insert(h);
+                }
+            }
+        }
+    }
+    anchors
+}
+
+#[inline]
+fn compact_unit_dep_span(
+    pool: &mut [u64],
+    anchors: &HashSet<u64, FastU64BuildHasher>,
+    unit: &mut BuildUnit,
+    write: &mut usize,
+) {
+    if let UnitMetadata::Complete {
+        dep_fp_start,
+        dep_fp_len,
+        ..
+    } = &mut unit.metadata
+        && *dep_fp_len > 0
+    {
+        let start = *dep_fp_start as usize;
+        let end = start.saturating_add(*dep_fp_len as usize).min(pool.len());
+        let new_start = *write;
+        if !anchors.is_empty() {
+            for read in start..end {
+                let h = pool[read];
+                if anchors.contains(&h) {
+                    pool[*write] = h;
+                    *write += 1;
+                }
+            }
+        }
+        let new_len = *write - new_start;
+        if new_len == 0 {
+            *dep_fp_start = 0;
+            *dep_fp_len = 0;
+        } else {
+            *dep_fp_start = new_start as u32;
+            *dep_fp_len = new_len as u32;
+        }
+    }
+}
+
+/// Drop dependency hashes that do not match any unit's companion anchor in the same profile layer.
+///
+/// Must be called while `dep_fp_pool` spans are still in monotonic, non-overlapping allocation order
+/// (before sorting `v2_units` / `v1_units`), so compaction runs strictly in-place with zero copies.
+fn compact_profile_dep_fp_pool(profile: &mut ProfileDir) {
+    if profile.fingerprint_corrupt {
+        profile.dep_fp_pool = Vec::new();
+        return;
+    }
+    if profile.dep_fp_pool.is_empty() {
+        return;
+    }
+
+    let mut write = 0usize;
+    if profile.v1_units.is_empty() {
+        let v2_anchors = collect_layer_anchor_hashes(&profile.v2_units);
+        for unit in &mut profile.v2_units {
+            compact_unit_dep_span(&mut profile.dep_fp_pool, &v2_anchors, unit, &mut write);
+        }
+    } else if profile.v2_units.is_empty() {
+        let v1_anchors = collect_layer_anchor_hashes(&profile.v1_units);
+        for unit in &mut profile.v1_units {
+            compact_unit_dep_span(&mut profile.dep_fp_pool, &v1_anchors, unit, &mut write);
+        }
+    } else {
+        let v2_anchors = collect_layer_anchor_hashes(&profile.v2_units);
+        let v1_anchors = collect_layer_anchor_hashes(&profile.v1_units);
+        let mut spans: Vec<(u32, bool, usize)> =
+            Vec::with_capacity(profile.v2_units.len() + profile.v1_units.len());
+        for (idx, u) in profile.v2_units.iter().enumerate() {
+            if let UnitMetadata::Complete {
+                dep_fp_start,
+                dep_fp_len,
+                ..
+            } = u.metadata
+                && dep_fp_len > 0
+            {
+                spans.push((dep_fp_start, true, idx));
+            }
+        }
+        for (idx, u) in profile.v1_units.iter().enumerate() {
+            if let UnitMetadata::Complete {
+                dep_fp_start,
+                dep_fp_len,
+                ..
+            } = u.metadata
+                && dep_fp_len > 0
+            {
+                spans.push((dep_fp_start, false, idx));
+            }
+        }
+        spans.sort_unstable_by_key(|x| x.0);
+        for (_, is_v2, idx) in spans {
+            if is_v2 {
+                compact_unit_dep_span(
+                    &mut profile.dep_fp_pool,
+                    &v2_anchors,
+                    &mut profile.v2_units[idx],
+                    &mut write,
+                );
+            } else {
+                compact_unit_dep_span(
+                    &mut profile.dep_fp_pool,
+                    &v1_anchors,
+                    &mut profile.v1_units[idx],
+                    &mut write,
+                );
+            }
+        }
+    }
+
+    if write == 0 {
+        profile.dep_fp_pool = Vec::new();
+    } else {
+        profile.dep_fp_pool.truncate(write);
+        if write.saturating_mul(2) < profile.dep_fp_pool.capacity() {
+            profile.dep_fp_pool.shrink_to_fit();
+        }
     }
 }
 
@@ -2220,29 +2761,227 @@ struct ParsedFingerprintDir {
     corrupt: bool,
 }
 
-#[derive(Deserialize)]
-struct RawFingerprintJson {
-    rustc: u64,
-    #[serde(default)]
-    deps: Vec<(
-        serde::de::IgnoredAny,
-        serde::de::IgnoredAny,
-        serde::de::IgnoredAny,
-        u64,
-    )>,
+struct FingerprintDepsSeed<'a>(&'a mut Vec<u64>);
+
+impl<'de> serde::de::DeserializeSeed<'de> for FingerprintDepsSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        struct DepsVisitor<'a>(&'a mut Vec<u64>);
+        impl<'de> serde::de::Visitor<'de> for DepsVisitor<'_> {
+            type Value = ();
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a sequence of 4-element fingerprint dep tuples")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                while let Some((_, _, _, dep_hash)) = seq.next_element::<(
+                    serde::de::IgnoredAny,
+                    serde::de::IgnoredAny,
+                    serde::de::IgnoredAny,
+                    u64,
+                )>()? {
+                    self.0.push(dep_hash);
+                }
+                Ok(())
+            }
+        }
+        deserializer.deserialize_seq(DepsVisitor(self.0))
+    }
 }
 
-fn parse_fingerprint_dir(
+struct FingerprintJsonSeed<'a> {
+    dep_hashes: &'a mut Vec<u64>,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for FingerprintJsonSeed<'_> {
+    type Value = u64;
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<u64, D::Error> {
+        struct ObjVisitor<'a>(&'a mut Vec<u64>);
+        impl<'de> serde::de::Visitor<'de> for ObjVisitor<'_> {
+            type Value = u64;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a Cargo fingerprint JSON object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<u64, A::Error> {
+                enum Field {
+                    Rustc,
+                    Deps,
+                    Ignore,
+                }
+                impl<'de> Deserialize<'de> for Field {
+                    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                        struct FieldVisitor;
+                        impl serde::de::Visitor<'_> for FieldVisitor {
+                            type Value = Field;
+                            fn expecting(
+                                &self,
+                                f: &mut std::fmt::Formatter<'_>,
+                            ) -> std::fmt::Result {
+                                f.write_str("fingerprint JSON field name")
+                            }
+                            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Field, E> {
+                                Ok(match v {
+                                    "rustc" => Field::Rustc,
+                                    "deps" => Field::Deps,
+                                    _ => Field::Ignore,
+                                })
+                            }
+                        }
+                        d.deserialize_identifier(FieldVisitor)
+                    }
+                }
+
+                let mut rustc: Option<u64> = None;
+                let mut seen_deps = false;
+                while let Some(field) = map.next_key::<Field>()? {
+                    match field {
+                        Field::Rustc => {
+                            if rustc.is_some() {
+                                return Err(serde::de::Error::duplicate_field("rustc"));
+                            }
+                            rustc = Some(map.next_value::<u64>()?);
+                        }
+                        Field::Deps => {
+                            if seen_deps {
+                                return Err(serde::de::Error::duplicate_field("deps"));
+                            }
+                            seen_deps = true;
+                            map.next_value_seed(FingerprintDepsSeed(self.0))?;
+                        }
+                        Field::Ignore => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                rustc.ok_or_else(|| serde::de::Error::missing_field("rustc"))
+            }
+        }
+        deserializer.deserialize_map(ObjVisitor(self.dep_hashes))
+    }
+}
+
+fn parse_fingerprint_json_into(bytes: &[u8], dep_hashes: &mut Vec<u64>) -> Option<u64> {
+    let start_len = dep_hashes.len();
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    match serde::de::DeserializeSeed::deserialize(FingerprintJsonSeed { dep_hashes }, &mut de) {
+        Ok(rustc) if de.end().is_ok() => Some(rustc),
+        _ => {
+            dep_hashes.truncate(start_len);
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn read_file_into_buf(file: fs::File, max_bytes: u64, buf: &mut Vec<u8>) -> bool {
+    if buf.capacity() > 256 * 1024 {
+        *buf = Vec::new();
+    } else {
+        buf.clear();
+    }
+    if file.take(max_bytes + 1).read_to_end(buf).is_err() {
+        return false;
+    }
+    (buf.len() as u64) <= max_bytes
+}
+
+#[cfg(unix)]
+fn read_fd_bounded(
+    fd: &std::os::fd::OwnedFd,
+    expected_size: u64,
+    max_bytes: u64,
+    buf: &mut Vec<u8>,
+) -> Option<usize> {
+    if expected_size > max_bytes {
+        return None;
+    }
+    let max_len = usize::try_from(max_bytes).ok()?;
+    let want = usize::try_from(expected_size).ok()?;
+    if buf.len() > 256 * 1024 {
+        *buf = Vec::new();
+    }
+    let initial_cap = want
+        .saturating_add(1)
+        .min(max_len.saturating_add(1))
+        .max(4096);
+    if buf.len() < initial_cap {
+        buf.resize(initial_cap, 0);
+    }
+
+    let mut total = 0usize;
+    loop {
+        let target = if total < want {
+            want.saturating_add(1).min(max_len.saturating_add(1))
+        } else {
+            total.saturating_add(4096).min(max_len.saturating_add(1))
+        };
+        if buf.len() < target {
+            buf.resize(target, 0);
+        }
+        let slice = &mut buf[total..target];
+        let offered = slice.len();
+        match rustix::io::read(fd, slice) {
+            Ok(0) => break,
+            Ok(n) => {
+                total += n;
+                if total > max_len {
+                    return None;
+                }
+                // On a regular file, offering `want + 1` bytes and receiving `want` bytes means
+                // the kernel already observed EOF in this single `read()` syscall.
+                if want > 0 && total == want && n < offered {
+                    break;
+                }
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return None,
+        }
+    }
+    Some(total)
+}
+
+fn finalize_dep_pool_tail(pool: &mut Vec<u64>, start: usize) -> Option<(u32, u32)> {
+    let len = pool.len().saturating_sub(start);
+    if len == 0 {
+        return Some((0, 0));
+    }
+    if len > 1 {
+        let tail = &mut pool[start..];
+        tail.sort_unstable();
+        let mut write = 1usize;
+        for read in 1..tail.len() {
+            if tail[read] != tail[write - 1] {
+                tail[write] = tail[read];
+                write += 1;
+            }
+        }
+        pool.truncate(start + write);
+    }
+    let final_len = pool.len() - start;
+    match (u32::try_from(start), u32::try_from(final_len)) {
+        (Ok(s), Ok(l)) => Some((s, l)),
+        _ => {
+            pool.truncate(start);
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn parse_fingerprint_dir_path(
     fp_dir: &Path,
-    seen_hardlinks: &mut HashSet<(u64, u64)>,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+    dep_fp_pool: &mut Vec<u64>,
 ) -> ParsedFingerprintDir {
     let mut allocated_bytes: u64 = 0;
     let mut max_mtime: u64 = fs::symlink_metadata(fp_dir)
         .map(|m| meta_mtime_unix(&m))
         .unwrap_or(0);
     let mut corrupt = false;
-    let mut targets: SmallVec<[UnitTargetAnchor; 2]> = SmallVec::new();
-    let mut dep_fp_hashes: SmallVec<[u64; 8]> = SmallVec::new();
+    let mut targets: SmallVec<[UnitTargetAnchor; 1]> = SmallVec::new();
+    let dep_start = dep_fp_pool.len();
     let mut rustc_hash: Option<u64> = None;
 
     let Ok(entries) = fs::read_dir(fp_dir) else {
@@ -2260,10 +2999,10 @@ fn parse_fingerprint_dir(
         let Ok(meta) = fs::symlink_metadata(&entry_path) else {
             continue;
         };
-        allocated_bytes =
-            allocated_bytes.saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
+        allocated_bytes = allocated_bytes.saturating_add(entry_allocated_bytes(&meta, hardlinks));
 
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        let os_name = entry.file_name();
+        let Some(name) = os_name.to_str() else {
             continue;
         };
         if name == "invoked.timestamp" {
@@ -2282,25 +3021,23 @@ fn parse_fingerprint_dir(
             corrupt = true;
             continue;
         }
-        let Ok(bytes) = fs::read(&entry_path) else {
+        let Ok(file) = fs::File::open(&entry_path) else {
             corrupt = true;
             continue;
         };
-        let Ok(parsed) = serde_json::from_slice::<RawFingerprintJson>(&bytes) else {
+        if !read_file_into_buf(file, MAX_FINGERPRINT_JSON_BYTES, &mut scratch.read_buf) {
             corrupt = true;
             continue;
-        };
-
-        rustc_hash = Some(parsed.rustc);
-        for (_, _, _, dep_hash) in parsed.deps {
-            if !dep_fp_hashes.contains(&dep_hash) {
-                dep_fp_hashes.push(dep_hash);
-            }
         }
+        let Some(rustc) = parse_fingerprint_json_into(&scratch.read_buf, dep_fp_pool) else {
+            corrupt = true;
+            continue;
+        };
+        rustc_hash = Some(rustc);
 
         let (target_kind, target_name) = parse_fingerprint_target_stem(stem);
         let companion_path = fp_dir.join(stem);
-        let fingerprint_hash = read_companion_fingerprint_hash(&companion_path);
+        let fingerprint_hash = read_companion_fingerprint_hash_path(&companion_path);
         targets.push(UnitTargetAnchor {
             target_kind,
             target_name,
@@ -2309,21 +3046,783 @@ fn parse_fingerprint_dir(
     }
 
     let metadata = match rustc_hash {
-        Some(rustc) if !targets.is_empty() => UnitMetadata::Complete {
-            targets,
-            rustc_hash: rustc,
-            dep_fp_hashes,
-            mtime_unix: max_mtime,
-        },
-        _ => UnitMetadata::Incomplete {
-            mtime_unix: max_mtime,
-        },
+        Some(rustc) if !targets.is_empty() => {
+            if let Some((dep_fp_start, dep_fp_len)) = finalize_dep_pool_tail(dep_fp_pool, dep_start)
+            {
+                UnitMetadata::Complete {
+                    targets,
+                    rustc_hash: rustc,
+                    dep_fp_start,
+                    dep_fp_len,
+                    mtime_unix: max_mtime,
+                }
+            } else {
+                corrupt = true;
+                UnitMetadata::Incomplete {
+                    mtime_unix: max_mtime,
+                }
+            }
+        }
+        _ => {
+            dep_fp_pool.truncate(dep_start);
+            UnitMetadata::Incomplete {
+                mtime_unix: max_mtime,
+            }
+        }
     };
 
     ParsedFingerprintDir {
         metadata,
         allocated_bytes,
         corrupt,
+    }
+}
+
+#[cfg(unix)]
+fn parse_fingerprint_dir_fd(
+    fp_fd: std::os::fd::OwnedFd,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+    dep_fp_pool: &mut Vec<u64>,
+) -> ParsedFingerprintDir {
+    use std::ffi::CStr;
+
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, openat, statat};
+
+    let Ok(mut dir) = Dir::new(fp_fd) else {
+        return ParsedFingerprintDir {
+            metadata: UnitMetadata::Incomplete { mtime_unix: 0 },
+            allocated_bytes: 0,
+            corrupt: true,
+        };
+    };
+
+    let mut max_mtime: u64 = dir
+        .stat()
+        .map(|st| u64::try_from(st.st_mtime).unwrap_or(0))
+        .unwrap_or(0);
+    let mut allocated_bytes: u64 = 0;
+    let mut corrupt = false;
+    let mut rustc_hash: Option<u64> = None;
+
+    let arena_mark = scratch.name_arena.len();
+    let dep_start = dep_fp_pool.len();
+    let mut json_stems: SmallVec<[(usize, usize); 2]> = SmallVec::new();
+    let mut companion_cstrs: SmallVec<[(usize, usize, u8); 4]> = SmallVec::new();
+
+    while let Some(entry_res) = dir.read() {
+        let Ok(entry) = entry_res else {
+            continue;
+        };
+        let name = entry.file_name();
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let Ok(fd) = dir.fd() else {
+            break;
+        };
+        let d_ft = entry.file_type();
+        let name_str = std::str::from_utf8(bytes).ok();
+
+        // Fast path for regular `*.json` fingerprint files: `openat` + `fstat` avoids a duplicate
+        // VFS path lookup compared to `statat` + `openat`, and `read_fd_bounded` reads in 1 syscall.
+        if d_ft == FileType::RegularFile
+            && let Some(stem) = name_str.and_then(|s| s.strip_suffix(".json"))
+            && let Ok(json_fd) = openat(
+                fd,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        {
+            let Ok(st) = fstat(&json_fd) else {
+                corrupt = true;
+                continue;
+            };
+            let mode_ft = FileType::from_raw_mode(st.st_mode);
+            let is_dir = mode_ft == FileType::Directory;
+            allocated_bytes =
+                allocated_bytes.saturating_add(stat_allocated_bytes(&st, is_dir, hardlinks));
+            if mode_ft != FileType::RegularFile {
+                continue;
+            }
+            max_mtime = max_mtime.max(u64::try_from(st.st_mtime).unwrap_or(0));
+            let file_size = u64::try_from(st.st_size).unwrap_or(u64::MAX);
+            let Some(read_len) = read_fd_bounded(
+                &json_fd,
+                file_size,
+                MAX_FINGERPRINT_JSON_BYTES,
+                &mut scratch.read_buf,
+            ) else {
+                corrupt = true;
+                continue;
+            };
+            let Some(rustc) =
+                parse_fingerprint_json_into(&scratch.read_buf[..read_len], dep_fp_pool)
+            else {
+                corrupt = true;
+                continue;
+            };
+            rustc_hash = Some(rustc);
+
+            let stem_start = scratch.name_arena.len();
+            scratch.name_arena.extend_from_slice(stem.as_bytes());
+            json_stems.push((stem_start, scratch.name_arena.len()));
+            continue;
+        }
+
+        let Ok(st) = statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        let mode_ft = FileType::from_raw_mode(st.st_mode);
+        let is_dir = mode_ft == FileType::Directory;
+        allocated_bytes =
+            allocated_bytes.saturating_add(stat_allocated_bytes(&st, is_dir, hardlinks));
+
+        let Some(name_str) = name_str else {
+            continue;
+        };
+        if name_str == "invoked.timestamp" {
+            max_mtime = max_mtime.max(u64::try_from(st.st_mtime).unwrap_or(0));
+            continue;
+        }
+        if mode_ft != FileType::RegularFile {
+            continue;
+        }
+        if let Some(stem) = name_str.strip_suffix(".json") {
+            max_mtime = max_mtime.max(u64::try_from(st.st_mtime).unwrap_or(0));
+            let file_size = u64::try_from(st.st_size).unwrap_or(u64::MAX);
+            if file_size > MAX_FINGERPRINT_JSON_BYTES {
+                corrupt = true;
+                continue;
+            }
+            let Ok(json_fd) = openat(
+                fd,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) else {
+                corrupt = true;
+                continue;
+            };
+            let Some(read_len) = read_fd_bounded(
+                &json_fd,
+                file_size,
+                MAX_FINGERPRINT_JSON_BYTES,
+                &mut scratch.read_buf,
+            ) else {
+                corrupt = true;
+                continue;
+            };
+            let Some(rustc) =
+                parse_fingerprint_json_into(&scratch.read_buf[..read_len], dep_fp_pool)
+            else {
+                corrupt = true;
+                continue;
+            };
+            rustc_hash = Some(rustc);
+
+            let stem_start = scratch.name_arena.len();
+            scratch.name_arena.extend_from_slice(stem.as_bytes());
+            json_stems.push((stem_start, scratch.name_arena.len()));
+        } else {
+            let file_size = u64::try_from(st.st_size).unwrap_or(u64::MAX);
+            if file_size <= MAX_COMPANION_HASH_BYTES {
+                let c_start = scratch.name_arena.len();
+                scratch
+                    .name_arena
+                    .extend_from_slice(name.to_bytes_with_nul());
+                companion_cstrs.push((c_start, scratch.name_arena.len(), file_size as u8));
+            }
+        }
+    }
+
+    let mut targets: SmallVec<[UnitTargetAnchor; 1]> = SmallVec::with_capacity(json_stems.len());
+    if let Ok(fd) = dir.fd() {
+        for &(stem_start, stem_end) in &json_stems {
+            let stem_bytes = &scratch.name_arena[stem_start..stem_end];
+            let Ok(stem_str) = std::str::from_utf8(stem_bytes) else {
+                continue;
+            };
+            let (target_kind, target_name) = parse_fingerprint_target_stem(stem_str);
+            let fingerprint_hash = companion_cstrs
+                .iter()
+                .find(|&&(cs, ce, _)| &scratch.name_arena[cs..ce - 1] == stem_bytes)
+                .and_then(|&(cs, ce, expected_size)| {
+                    let cstr = CStr::from_bytes_with_nul(&scratch.name_arena[cs..ce]).ok()?;
+                    read_companion_fingerprint_hash_fd(fd, cstr, u64::from(expected_size))
+                });
+            targets.push(UnitTargetAnchor {
+                target_kind,
+                target_name,
+                fingerprint_hash,
+            });
+        }
+    }
+
+    scratch.name_arena.truncate(arena_mark);
+
+    let metadata = match rustc_hash {
+        Some(rustc) if !targets.is_empty() => {
+            if let Some((dep_fp_start, dep_fp_len)) = finalize_dep_pool_tail(dep_fp_pool, dep_start)
+            {
+                UnitMetadata::Complete {
+                    targets,
+                    rustc_hash: rustc,
+                    dep_fp_start,
+                    dep_fp_len,
+                    mtime_unix: max_mtime,
+                }
+            } else {
+                corrupt = true;
+                UnitMetadata::Incomplete {
+                    mtime_unix: max_mtime,
+                }
+            }
+        }
+        _ => {
+            dep_fp_pool.truncate(dep_start);
+            UnitMetadata::Incomplete {
+                mtime_unix: max_mtime,
+            }
+        }
+    };
+
+    ParsedFingerprintDir {
+        metadata,
+        allocated_bytes,
+        corrupt,
+    }
+}
+
+#[cfg(unix)]
+fn read_companion_fingerprint_hash_fd(
+    dir_fd: rustix::fd::BorrowedFd<'_>,
+    name: &std::ffi::CStr,
+    expected_size: u64,
+) -> Option<u64> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    if expected_size > MAX_COMPANION_HASH_BYTES {
+        return None;
+    }
+    let fd = openat(
+        dir_fd,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let want = expected_size as usize;
+    let mut raw = [0u8; MAX_COMPANION_HASH_BYTES as usize + 1];
+    let mut len = 0usize;
+    loop {
+        let offered = raw.len() - len;
+        match rustix::io::read(&fd, &mut raw[len..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                len += n;
+                if len as u64 > MAX_COMPANION_HASH_BYTES {
+                    return None;
+                }
+                if want > 0 && len == want && n < offered {
+                    break;
+                }
+            }
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(_) => return None,
+        }
+    }
+    decode_le_u64_hex(&raw[..len])
+}
+
+#[cfg(not(unix))]
+fn read_companion_fingerprint_hash_path(path: &Path) -> Option<u64> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_COMPANION_HASH_BYTES {
+        return None;
+    }
+    let raw = fs::read(path).ok()?;
+    decode_le_u64_hex(&raw)
+}
+
+struct BuildPkgDirResult {
+    total_bytes: u64,
+    non_v2_sibling_bytes: u64,
+    dir_mtime_unix: u64,
+    max_mtime: u64,
+    found_v2_child: bool,
+    corrupt: bool,
+}
+
+#[cfg(unix)]
+fn inspect_v2_pkg_dir_fd_into(
+    pkg_fd: std::os::fd::OwnedFd,
+    pkg_name: &CompactString,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+    out_units: &mut Vec<BuildUnit>,
+    out_deps: &mut Vec<u64>,
+) -> BuildPkgDirResult {
+    use std::ffi::CStr;
+
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, openat, statat};
+    use rustix::io::Errno;
+
+    let Ok(mut dir) = Dir::new(pkg_fd) else {
+        return BuildPkgDirResult {
+            total_bytes: 0,
+            non_v2_sibling_bytes: 0,
+            dir_mtime_unix: 0,
+            max_mtime: 0,
+            found_v2_child: false,
+            corrupt: true,
+        };
+    };
+
+    let dir_mtime_unix = dir
+        .stat()
+        .map(|st| u64::try_from(st.st_mtime).unwrap_or(0))
+        .unwrap_or(0);
+    let mut total_bytes: u64 = 0;
+    let mut non_v2_sibling_bytes: u64 = 0;
+    let mut max_mtime: u64 = 0;
+    let mut found_v2_child = false;
+    let mut corrupt = false;
+
+    let arena_mark = scratch.name_arena.len();
+    let spans_mark = scratch.name_spans.len();
+
+    while let Some(entry_res) = dir.read() {
+        let Ok(entry) = entry_res else {
+            continue;
+        };
+        let name = entry.file_name();
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let ft = entry.file_type();
+        if ft == FileType::Symlink {
+            continue;
+        }
+        if ft == FileType::Directory {
+            let start = scratch.name_arena.len();
+            scratch
+                .name_arena
+                .extend_from_slice(name.to_bytes_with_nul());
+            scratch.name_spans.push((start, scratch.name_arena.len()));
+            continue;
+        }
+        if ft == FileType::RegularFile {
+            let ino = entry.ino();
+            if ino != 0 && hardlinks.contains_primary(ino) {
+                continue;
+            }
+        }
+        let Ok(fd) = dir.fd() else {
+            break;
+        };
+        let Ok(st) = statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
+            continue;
+        };
+        let mode_ft = FileType::from_raw_mode(st.st_mode);
+        if mode_ft == FileType::Symlink {
+            continue;
+        }
+        if mode_ft == FileType::Directory {
+            let start = scratch.name_arena.len();
+            scratch
+                .name_arena
+                .extend_from_slice(name.to_bytes_with_nul());
+            scratch.name_spans.push((start, scratch.name_arena.len()));
+            continue;
+        }
+        non_v2_sibling_bytes =
+            non_v2_sibling_bytes.saturating_add(stat_allocated_bytes(&st, false, hardlinks));
+    }
+
+    let spans_end = scratch.name_spans.len();
+    for span_idx in spans_mark..spans_end {
+        let Ok(fd) = dir.fd() else {
+            break;
+        };
+        let (start, end) = scratch.name_spans[span_idx];
+        let Ok(child_cstr) = CStr::from_bytes_with_nul(&scratch.name_arena[start..end]) else {
+            continue;
+        };
+        let is_v2_hash = std::str::from_utf8(child_cstr.to_bytes())
+            .ok()
+            .filter(|s| is_16_lower_hex(s))
+            .map(CompactString::from);
+
+        let Ok(child_fd) = openat(
+            fd,
+            child_cstr,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            continue;
+        };
+
+        let Some(unit_hash) = is_v2_hash else {
+            let mut sub_out = DirAccountResult::default();
+            sum_dir_fd_recursive(
+                child_fd,
+                0,
+                MtimePolicy::None,
+                None,
+                hardlinks,
+                scratch,
+                &mut sub_out,
+            );
+            non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(sub_out.bytes);
+            continue;
+        };
+
+        found_v2_child = true;
+        let parsed = match openat(
+            &child_fd,
+            c"fingerprint",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fp_fd) => parse_fingerprint_dir_fd(fp_fd, hardlinks, scratch, out_deps),
+            Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => {
+                let mtime = fstat(&child_fd)
+                    .map(|st| u64::try_from(st.st_mtime).unwrap_or(0))
+                    .unwrap_or(0);
+                ParsedFingerprintDir {
+                    metadata: UnitMetadata::Incomplete { mtime_unix: mtime },
+                    allocated_bytes: 0,
+                    corrupt: false,
+                }
+            }
+            Err(_) => {
+                let mtime = fstat(&child_fd)
+                    .map(|st| u64::try_from(st.st_mtime).unwrap_or(0))
+                    .unwrap_or(0);
+                ParsedFingerprintDir {
+                    metadata: UnitMetadata::Incomplete { mtime_unix: mtime },
+                    allocated_bytes: 0,
+                    corrupt: true,
+                }
+            }
+        };
+        if parsed.corrupt {
+            corrupt = true;
+        }
+
+        let mut other_out = DirAccountResult::default();
+        sum_dir_fd_recursive(
+            child_fd,
+            0,
+            MtimePolicy::None,
+            Some(b"fingerprint"),
+            hardlinks,
+            scratch,
+            &mut other_out,
+        );
+        let unit_bytes = parsed.allocated_bytes.saturating_add(other_out.bytes);
+        let unit_mtime = unit_metadata_mtime(&parsed.metadata);
+        max_mtime = max_mtime.max(unit_mtime);
+        total_bytes = total_bytes.saturating_add(unit_bytes);
+        out_units.push(BuildUnit {
+            id: BuildUnitId::V2 {
+                pkg: pkg_name.clone(),
+                unit_hash,
+            },
+            metadata: parsed.metadata,
+            v1: None,
+            allocated_bytes: unit_bytes,
+        });
+    }
+
+    scratch.name_arena.truncate(arena_mark);
+    scratch.name_spans.truncate(spans_mark);
+
+    total_bytes = total_bytes.saturating_add(non_v2_sibling_bytes);
+    BuildPkgDirResult {
+        total_bytes,
+        non_v2_sibling_bytes,
+        dir_mtime_unix,
+        max_mtime,
+        found_v2_child,
+        corrupt,
+    }
+}
+
+#[cfg(not(unix))]
+fn inspect_v2_pkg_dir_path_into(
+    pkg_path: &Path,
+    pkg_name: &CompactString,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+    out_units: &mut Vec<BuildUnit>,
+    out_deps: &mut Vec<u64>,
+) -> BuildPkgDirResult {
+    let dir_mtime_unix = fs::symlink_metadata(pkg_path)
+        .map(|m| meta_mtime_unix(&m))
+        .unwrap_or(0);
+    let mut total_bytes: u64 = 0;
+    let mut non_v2_sibling_bytes: u64 = 0;
+    let mut max_mtime: u64 = 0;
+    let mut found_v2_child = false;
+    let mut corrupt = false;
+
+    match fs::read_dir(pkg_path) {
+        Ok(children) => {
+            for child in children.flatten() {
+                let child_path = child.path();
+                let Ok(cft) = child.file_type() else {
+                    continue;
+                };
+                if cft.is_symlink() {
+                    continue;
+                }
+                if !cft.is_dir() {
+                    if let Ok(meta) = fs::symlink_metadata(&child_path) {
+                        non_v2_sibling_bytes = non_v2_sibling_bytes
+                            .saturating_add(entry_allocated_bytes(&meta, hardlinks));
+                    }
+                    continue;
+                }
+                let child_os = child.file_name();
+                let Some(child_name) = child_os.to_str() else {
+                    non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(
+                        account_tree(&child_path, MtimePolicy::None, None, hardlinks, scratch)
+                            .bytes,
+                    );
+                    continue;
+                };
+                if !is_16_lower_hex(child_name) {
+                    non_v2_sibling_bytes = non_v2_sibling_bytes.saturating_add(
+                        account_tree(&child_path, MtimePolicy::None, None, hardlinks, scratch)
+                            .bytes,
+                    );
+                    continue;
+                }
+
+                found_v2_child = true;
+                let unit_hash = CompactString::from(child_name);
+                let fp_sub = child_path.join("fingerprint");
+                let parsed = if fs::symlink_metadata(&fp_sub).is_ok_and(|m| m.file_type().is_dir())
+                {
+                    parse_fingerprint_dir_path(&fp_sub, hardlinks, scratch, out_deps)
+                } else {
+                    let mtime = fs::symlink_metadata(&child_path)
+                        .map(|m| meta_mtime_unix(&m))
+                        .unwrap_or(0);
+                    ParsedFingerprintDir {
+                        metadata: UnitMetadata::Incomplete { mtime_unix: mtime },
+                        allocated_bytes: 0,
+                        corrupt: false,
+                    }
+                };
+                if parsed.corrupt {
+                    corrupt = true;
+                }
+                let other_bytes = account_tree(
+                    &child_path,
+                    MtimePolicy::None,
+                    Some(b"fingerprint"),
+                    hardlinks,
+                    scratch,
+                )
+                .bytes;
+                let unit_bytes = parsed.allocated_bytes.saturating_add(other_bytes);
+                let unit_mtime = unit_metadata_mtime(&parsed.metadata);
+                max_mtime = max_mtime.max(unit_mtime);
+                total_bytes = total_bytes.saturating_add(unit_bytes);
+                out_units.push(BuildUnit {
+                    id: BuildUnitId::V2 {
+                        pkg: pkg_name.clone(),
+                        unit_hash,
+                    },
+                    metadata: parsed.metadata,
+                    v1: None,
+                    allocated_bytes: unit_bytes,
+                });
+            }
+        }
+        Err(_) => {
+            corrupt = true;
+        }
+    }
+
+    total_bytes = total_bytes.saturating_add(non_v2_sibling_bytes);
+    BuildPkgDirResult {
+        total_bytes,
+        non_v2_sibling_bytes,
+        dir_mtime_unix,
+        max_mtime,
+        found_v2_child,
+        corrupt,
+    }
+}
+
+fn inspect_v1_deps_dir(
+    deps_root: &Path,
+    v1_hash_to_indices: &HashMap<u64, SmallVec<[usize; 2]>, FastU64BuildHasher>,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+    out_by_hash: &mut HashMap<u64, V1DepHashStats, FastU64BuildHasher>,
+) -> (u64, bool) {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, fstat, open, openat, statat};
+
+        let Ok(deps_fd) = open(
+            deps_root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return (0, true);
+        };
+        let Ok(mut dir) = Dir::new(deps_fd) else {
+            return (0, true);
+        };
+
+        let mut total_bytes: u64 = 0;
+
+        while let Some(entry_res) = dir.read() {
+            let Ok(entry) = entry_res else {
+                continue;
+            };
+            let name = entry.file_name();
+            let bytes_name = name.to_bytes();
+            if bytes_name == b"." || bytes_name == b".." {
+                continue;
+            }
+            let hash_u64 = std::str::from_utf8(bytes_name)
+                .ok()
+                .and_then(extract_16hex_from_dep_name)
+                .and_then(parse_16_lower_hex_u64);
+            let need_mtime = hash_u64.is_some_and(|h| !v1_hash_to_indices.contains_key(&h));
+
+            let ft = entry.file_type();
+            let (entry_bytes, entry_mtime) = if ft == FileType::Directory {
+                let Ok(fd) = dir.fd() else {
+                    break;
+                };
+                if let Ok(child_fd) = openat(
+                    fd,
+                    name,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    let mtime = if need_mtime {
+                        fstat(&child_fd)
+                            .map(|st| u64::try_from(st.st_mtime).unwrap_or(0))
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let mut sub_out = DirAccountResult::default();
+                    sum_dir_fd_recursive(
+                        child_fd,
+                        0,
+                        MtimePolicy::None,
+                        None,
+                        hardlinks,
+                        scratch,
+                        &mut sub_out,
+                    );
+                    (sub_out.bytes, mtime)
+                } else {
+                    (0, 0)
+                }
+            } else if !need_mtime && ft == FileType::RegularFile {
+                let ino = entry.ino();
+                if ino != 0 && hardlinks.contains_primary(ino) {
+                    (0, 0)
+                } else {
+                    let Ok(fd) = dir.fd() else {
+                        break;
+                    };
+                    let Ok(st) = statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
+                        continue;
+                    };
+                    (stat_allocated_bytes(&st, false, hardlinks), 0)
+                }
+            } else {
+                let Ok(fd) = dir.fd() else {
+                    break;
+                };
+                let Ok(st) = statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
+                    continue;
+                };
+                let mode_ft = FileType::from_raw_mode(st.st_mode);
+                let mtime = u64::try_from(st.st_mtime).unwrap_or(0);
+                if mode_ft == FileType::Directory {
+                    if let Ok(child_fd) = openat(
+                        fd,
+                        name,
+                        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    ) {
+                        let mut sub_out = DirAccountResult::default();
+                        sum_dir_fd_recursive(
+                            child_fd,
+                            0,
+                            MtimePolicy::None,
+                            None,
+                            hardlinks,
+                            scratch,
+                            &mut sub_out,
+                        );
+                        (sub_out.bytes, mtime)
+                    } else {
+                        (0, mtime)
+                    }
+                } else {
+                    (stat_allocated_bytes(&st, false, hardlinks), mtime)
+                }
+            };
+
+            total_bytes = total_bytes.saturating_add(entry_bytes);
+            if let Some(h) = hash_u64 {
+                let slot = out_by_hash.entry(h).or_default();
+                slot.bytes = slot.bytes.saturating_add(entry_bytes);
+                slot.max_mtime = slot.max_mtime.max(entry_mtime);
+                slot.count = slot.count.saturating_add(1);
+            }
+        }
+
+        (total_bytes, false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = v1_hash_to_indices;
+        let mut total_bytes: u64 = 0;
+        match fs::read_dir(deps_root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let entry_path = entry.path();
+                    let Ok(emeta) = fs::symlink_metadata(&entry_path) else {
+                        continue;
+                    };
+                    let bytes = if emeta.file_type().is_dir() && !emeta.file_type().is_symlink() {
+                        account_tree(&entry_path, MtimePolicy::None, None, hardlinks, scratch).bytes
+                    } else {
+                        entry_allocated_bytes(&emeta, hardlinks)
+                    };
+                    total_bytes = total_bytes.saturating_add(bytes);
+                    if let Some(name) = entry.file_name().to_str()
+                        && let Some(hash_u64) =
+                            extract_16hex_from_dep_name(name).and_then(parse_16_lower_hex_u64)
+                    {
+                        let slot = out_by_hash.entry(hash_u64).or_default();
+                        slot.bytes = slot.bytes.saturating_add(bytes);
+                        slot.max_mtime = slot.max_mtime.max(meta_mtime_unix(&emeta));
+                        slot.count = slot.count.saturating_add(1);
+                    }
+                }
+                (total_bytes, false)
+            }
+            Err(_) => (0, true),
+        }
     }
 }
 
@@ -2347,15 +3846,6 @@ pub(crate) fn parse_fingerprint_target_stem(stem: &str) -> (UnitTargetKind, Comp
     } else {
         (UnitTargetKind::Other, CompactString::from(stem))
     }
-}
-
-fn read_companion_fingerprint_hash(path: &Path) -> Option<u64> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > MAX_COMPANION_HASH_BYTES {
-        return None;
-    }
-    let raw = fs::read(path).ok()?;
-    decode_le_u64_hex(&raw)
 }
 
 pub(crate) fn decode_le_u64_hex(raw: &[u8]) -> Option<u64> {
@@ -2385,41 +3875,119 @@ fn ascii_hex(byte: u8) -> Option<u8> {
     }
 }
 
-fn inspect_incremental_dir(
-    dir_path: &Path,
+#[cfg(unix)]
+fn inspect_incremental_dir_fd(
+    inc_root_path: &Path,
+    parent_fd: rustix::fd::BorrowedFd<'_>,
+    entry_name: &std::ffi::CStr,
     dir_name: CompactString,
     platform: &impl Platform,
-    seen_hardlinks: &mut HashSet<(u64, u64)>,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
 ) -> IncrementalDir {
-    let crate_name = extract_incremental_crate_name(&dir_name);
-    let mut sessions: Vec<IncrementalSession> = Vec::new();
-    let mut lock_status: HashMap<CompactString, bool> = HashMap::new();
-    let mut lock_mtimes: HashMap<CompactString, u64> = HashMap::new();
-    let mut allocated_bytes: u64 = 0;
-    let dir_mtime_unix: u64 = fs::symlink_metadata(dir_path)
-        .map(|m| meta_mtime_unix(&m))
-        .unwrap_or(0);
-    // Compute freshness strictly from `s-*.lock` files and `s-*` session contents so pruning
-    // an older session (which bumps `dir_path` mtime) never resets target age or top-M rank.
-    let mut latest_mtime_unix: u64 = 0;
+    use std::ffi::CStr;
 
-    // Fail closed when an incremental crate directory is unreadable: mark `any_locked = true`
-    // so `R3` never treats it as an empty unlocked `WorkingOnly` directory and schedules removal.
-    let (entries, dir_unreadable) = match fs::read_dir(dir_path) {
-        Ok(rd) => (rd.flatten().collect(), false),
-        Err(_) => (Vec::new(), true),
+    use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, openat, statat};
+
+    let crate_name = extract_incremental_crate_name(&dir_name);
+    let Ok(dir_fd) = open_child_dir_nofollow(parent_fd, entry_name) else {
+        // Fail closed when an incremental crate directory is unreadable: mark `any_locked = true`
+        // so `R3` never treats it as an empty unlocked `WorkingOnly` directory.
+        let dir_mtime_unix = statat(parent_fd, entry_name, AtFlags::SYMLINK_NOFOLLOW)
+            .map(|st| u64::try_from(st.st_mtime).unwrap_or(0))
+            .unwrap_or(0);
+        return IncrementalDir {
+            dir_name,
+            crate_name,
+            sessions: SmallVec::new(),
+            any_locked: true,
+            dir_mtime_unix,
+            latest_mtime_unix: dir_mtime_unix,
+            allocated_bytes: 0,
+        };
+    };
+    let Ok(mut dir) = Dir::new(dir_fd) else {
+        return IncrementalDir {
+            dir_name,
+            crate_name,
+            sessions: SmallVec::new(),
+            any_locked: true,
+            dir_mtime_unix: 0,
+            latest_mtime_unix: 0,
+            allocated_bytes: 0,
+        };
     };
 
-    for entry in &entries {
-        let entry_path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&entry_path) else {
+    let dir_mtime_unix = dir
+        .stat()
+        .map(|st| u64::try_from(st.st_mtime).unwrap_or(0))
+        .unwrap_or(0);
+    // Compute freshness strictly from `s-*.lock` files and `s-*` session contents so pruning
+    // an older session (which bumps the crate dir mtime) never resets target age or top-M rank.
+    let mut latest_mtime_unix: u64 = 0;
+    let mut allocated_bytes: u64 = 0;
+
+    let arena_mark = scratch.name_arena.len();
+    let mut locks: SmallVec<[(CompactString, bool, u64); 4]> = SmallVec::new();
+    let mut session_spans: SmallVec<[(usize, usize); 4]> = SmallVec::new();
+    let mut other_dir_spans: SmallVec<[(usize, usize); 2]> = SmallVec::new();
+    scratch.path_buf.clear();
+    scratch.path_buf.push(inc_root_path);
+    scratch.path_buf.push(dir_name.as_str());
+
+    while let Some(entry_res) = dir.read() {
+        let Ok(entry) = entry_res else {
             continue;
         };
-        let Some(name) = entry.file_name().to_str().map(CompactString::from) else {
+        let name = entry.file_name();
+        let bytes = name.to_bytes();
+        if bytes == b"." || bytes == b".." {
+            continue;
+        }
+        let name_str = std::str::from_utf8(bytes).ok();
+        let ft = entry.file_type();
+        if ft == FileType::Directory {
+            let start = scratch.name_arena.len();
+            scratch
+                .name_arena
+                .extend_from_slice(name.to_bytes_with_nul());
+            let span = (start, scratch.name_arena.len());
+            if name_str.is_some_and(|s| s.starts_with("s-")) {
+                session_spans.push(span);
+            } else {
+                other_dir_spans.push(span);
+            }
+            continue;
+        }
+
+        let Ok(fd) = dir.fd() else {
+            break;
+        };
+        let Ok(st) = statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
             continue;
         };
-        if meta.file_type().is_file() && name.starts_with("s-") && name.ends_with(".lock") {
-            let locked = match platform.try_lock_readonly(&entry_path) {
+        let mode_ft = FileType::from_raw_mode(st.st_mode);
+        if mode_ft == FileType::Directory {
+            let start = scratch.name_arena.len();
+            scratch
+                .name_arena
+                .extend_from_slice(name.to_bytes_with_nul());
+            let span = (start, scratch.name_arena.len());
+            if name_str.is_some_and(|s| s.starts_with("s-")) {
+                session_spans.push(span);
+            } else {
+                other_dir_spans.push(span);
+            }
+            continue;
+        }
+
+        if mode_ft == FileType::RegularFile
+            && let Some(s) = name_str
+            && s.starts_with("s-")
+            && s.ends_with(".lock")
+        {
+            scratch.path_buf.push(s);
+            let locked = match platform.try_lock_readonly(&scratch.path_buf) {
                 Ok(LockProbe::Acquired(file)) => {
                     let _ = file.unlock();
                     false
@@ -2427,66 +3995,114 @@ fn inspect_incremental_dir(
                 Ok(LockProbe::NotFound) => false,
                 Ok(LockProbe::Contested) | Err(_) => true,
             };
-            let mtime = meta_mtime_unix(&meta);
+            scratch.path_buf.pop();
+
+            let mtime = u64::try_from(st.st_mtime).unwrap_or(0);
             latest_mtime_unix = latest_mtime_unix.max(mtime);
             allocated_bytes =
-                allocated_bytes.saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
-            lock_status.insert(name.clone(), locked);
-            lock_mtimes.insert(name, mtime);
+                allocated_bytes.saturating_add(stat_allocated_bytes(&st, false, hardlinks));
+            locks.push((CompactString::from(s), locked, mtime));
+        } else {
+            allocated_bytes =
+                allocated_bytes.saturating_add(stat_allocated_bytes(&st, false, hardlinks));
         }
     }
 
-    let mut any_locked = dir_unreadable || lock_status.values().any(|&locked| locked);
+    let mut any_locked = locks.iter().any(|(_, locked, _)| *locked);
+    let mut sessions: SmallVec<[IncrementalSession; 1]> =
+        SmallVec::with_capacity(session_spans.len());
 
-    for entry in entries {
-        let entry_path = entry.path();
-        let Ok(meta) = fs::symlink_metadata(&entry_path) else {
+    for &(start, end) in &session_spans {
+        let Ok(fd) = dir.fd() else {
+            break;
+        };
+        let Ok(cstr) = CStr::from_bytes_with_nul(&scratch.name_arena[start..end]) else {
             continue;
         };
-        let Some(name) = entry.file_name().to_str().map(CompactString::from) else {
+        let Ok(name_str) = cstr.to_str() else {
             continue;
         };
-        if meta.file_type().is_file() && name.starts_with("s-") && name.ends_with(".lock") {
-            continue;
-        }
-        if !meta.file_type().is_dir() || meta.file_type().is_symlink() || !name.starts_with("s-") {
-            if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
-                allocated_bytes =
-                    allocated_bytes.saturating_add(sum_tree_bytes(&entry_path, seen_hardlinks));
-            } else {
-                allocated_bytes =
-                    allocated_bytes.saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
-            }
-            continue;
-        }
-
-        let (state, lock_file) = classify_incremental_session(&name, &lock_status);
-        let locked = lock_file
-            .as_ref()
-            .and_then(|lf| lock_status.get(lf).copied())
-            .unwrap_or(false);
+        let sess_name = CompactString::from(name_str);
+        let state = if name_str.ends_with("-working") {
+            SessionState::Working
+        } else {
+            SessionState::Finalized
+        };
+        let lock_match = name_str.rsplit_once('-').and_then(|(prefix, _)| {
+            locks.iter().find(|(lname, _, _)| {
+                lname.len() == prefix.len() + 5
+                    && lname.starts_with(prefix)
+                    && lname.ends_with(".lock")
+            })
+        });
+        let (lock_file, locked, lock_mtime) = match lock_match {
+            Some((lname, is_locked, lm)) => (Some(lname.clone()), *is_locked, Some(*lm)),
+            None => (None, false, None),
+        };
         if locked {
             any_locked = true;
         }
 
-        let (sess_bytes, mut sess_mtime) = sum_tree_bytes_and_mtime(&entry_path, 1, seen_hardlinks);
-        if let Some(lf) = &lock_file
-            && let Some(&lm) = lock_mtimes.get(lf)
-        {
-            sess_mtime = sess_mtime.max(lm);
+        let mut sess_out = DirAccountResult::default();
+        if let Ok(sess_fd) = openat(
+            fd,
+            cstr,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            sum_dir_fd_recursive(
+                sess_fd,
+                0,
+                MtimePolicy::UpToDepth(1),
+                None,
+                hardlinks,
+                scratch,
+                &mut sess_out,
+            );
         }
-        latest_mtime_unix = latest_mtime_unix.max(sess_mtime);
-        allocated_bytes = allocated_bytes.saturating_add(sess_bytes);
+        if let Some(lm) = lock_mtime {
+            sess_out.max_mtime = sess_out.max_mtime.max(lm);
+        }
+        latest_mtime_unix = latest_mtime_unix.max(sess_out.max_mtime);
+        allocated_bytes = allocated_bytes.saturating_add(sess_out.bytes);
 
         sessions.push(IncrementalSession {
-            dir_name: name,
+            dir_name: sess_name,
             lock_file,
             state,
             locked,
-            mtime_unix: sess_mtime,
-            allocated_bytes: sess_bytes,
+            mtime_unix: sess_out.max_mtime,
+            allocated_bytes: sess_out.bytes,
         });
     }
+
+    for &(start, end) in &other_dir_spans {
+        let Ok(fd) = dir.fd() else {
+            break;
+        };
+        if let Ok(cstr) = CStr::from_bytes_with_nul(&scratch.name_arena[start..end])
+            && let Ok(sub_fd) = openat(
+                fd,
+                cstr,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        {
+            let mut sub_out = DirAccountResult::default();
+            sum_dir_fd_recursive(
+                sub_fd,
+                0,
+                MtimePolicy::None,
+                None,
+                hardlinks,
+                scratch,
+                &mut sub_out,
+            );
+            allocated_bytes = allocated_bytes.saturating_add(sub_out.bytes);
+        }
+    }
+
+    scratch.name_arena.truncate(arena_mark);
 
     if latest_mtime_unix == 0 {
         latest_mtime_unix = dir_mtime_unix;
@@ -2503,20 +4119,123 @@ fn inspect_incremental_dir(
     }
 }
 
-fn classify_incremental_session(
-    session_dir_name: &str,
-    known_locks: &HashMap<CompactString, bool>,
-) -> (SessionState, Option<CompactString>) {
-    let state = if session_dir_name.ends_with("-working") {
-        SessionState::Working
-    } else {
-        SessionState::Finalized
+#[cfg(not(unix))]
+fn inspect_incremental_dir_path(
+    dir_path: &Path,
+    dir_name: CompactString,
+    platform: &impl Platform,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+) -> IncrementalDir {
+    let crate_name = extract_incremental_crate_name(&dir_name);
+    let mut sessions: SmallVec<[IncrementalSession; 1]> = SmallVec::new();
+    let mut locks: SmallVec<[(CompactString, bool, u64); 4]> = SmallVec::new();
+    let mut allocated_bytes: u64 = 0;
+    let dir_mtime_unix: u64 = fs::symlink_metadata(dir_path)
+        .map(|m| meta_mtime_unix(&m))
+        .unwrap_or(0);
+    let mut latest_mtime_unix: u64 = 0;
+
+    let (entries, dir_unreadable) = match fs::read_dir(dir_path) {
+        Ok(rd) => (rd.flatten().collect(), false),
+        Err(_) => (Vec::new(), true),
     };
-    let lock_candidate = session_dir_name
-        .rsplit_once('-')
-        .map(|(prefix, _)| CompactString::from(format!("{prefix}.lock")))
-        .filter(|candidate| known_locks.contains_key(candidate));
-    (state, lock_candidate)
+
+    let mut session_entries: Vec<(CompactString, PathBuf)> = Vec::new();
+    for entry in entries {
+        let entry_path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&entry_path) else {
+            continue;
+        };
+        let os_name = entry.file_name();
+        let Some(name) = os_name.to_str() else {
+            continue;
+        };
+        if meta.file_type().is_file() && name.starts_with("s-") && name.ends_with(".lock") {
+            let locked = match platform.try_lock_readonly(&entry_path) {
+                Ok(LockProbe::Acquired(file)) => {
+                    let _ = file.unlock();
+                    false
+                }
+                Ok(LockProbe::NotFound) => false,
+                Ok(LockProbe::Contested) | Err(_) => true,
+            };
+            let mtime = meta_mtime_unix(&meta);
+            latest_mtime_unix = latest_mtime_unix.max(mtime);
+            allocated_bytes =
+                allocated_bytes.saturating_add(entry_allocated_bytes(&meta, hardlinks));
+            locks.push((CompactString::from(name), locked, mtime));
+        } else if meta.file_type().is_dir()
+            && !meta.file_type().is_symlink()
+            && name.starts_with("s-")
+        {
+            session_entries.push((CompactString::from(name), entry_path));
+        } else if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+            allocated_bytes = allocated_bytes.saturating_add(
+                account_tree(&entry_path, MtimePolicy::None, None, hardlinks, scratch).bytes,
+            );
+        } else {
+            allocated_bytes =
+                allocated_bytes.saturating_add(entry_allocated_bytes(&meta, hardlinks));
+        }
+    }
+
+    let mut any_locked = dir_unreadable || locks.iter().any(|(_, locked, _)| *locked);
+    for (name, entry_path) in session_entries {
+        let state = if name.ends_with("-working") {
+            SessionState::Working
+        } else {
+            SessionState::Finalized
+        };
+        let lock_match = name.rsplit_once('-').and_then(|(prefix, _)| {
+            locks.iter().find(|(lname, _, _)| {
+                lname.len() == prefix.len() + 5
+                    && lname.starts_with(prefix)
+                    && lname.ends_with(".lock")
+            })
+        });
+        let (lock_file, locked, lock_mtime) = match lock_match {
+            Some((lname, is_locked, lm)) => (Some(lname.clone()), *is_locked, Some(*lm)),
+            None => (None, false, None),
+        };
+        if locked {
+            any_locked = true;
+        }
+        let mut res = account_tree(
+            &entry_path,
+            MtimePolicy::UpToDepth(1),
+            None,
+            hardlinks,
+            scratch,
+        );
+        if let Some(lm) = lock_mtime {
+            res.max_mtime = res.max_mtime.max(lm);
+        }
+        latest_mtime_unix = latest_mtime_unix.max(res.max_mtime);
+        allocated_bytes = allocated_bytes.saturating_add(res.bytes);
+        sessions.push(IncrementalSession {
+            dir_name: name,
+            lock_file,
+            state,
+            locked,
+            mtime_unix: res.max_mtime,
+            allocated_bytes: res.bytes,
+        });
+    }
+
+    if latest_mtime_unix == 0 {
+        latest_mtime_unix = dir_mtime_unix;
+    }
+
+    IncrementalDir {
+        dir_name,
+        crate_name,
+        sessions,
+        any_locked,
+        dir_mtime_unix,
+        latest_mtime_unix,
+        allocated_bytes,
+    }
 }
 
 pub(crate) fn extract_incremental_crate_name(dir_name: &str) -> CompactString {
@@ -2541,31 +4260,6 @@ pub(crate) fn split_pkg_and_16hex(name: &str) -> Option<(CompactString, CompactS
     }
 }
 
-pub(crate) fn extract_16hex_from_dep_name(name: &str) -> Option<&str> {
-    let bytes = name.as_bytes();
-    for idx in (0..bytes.len()).rev() {
-        if bytes[idx] != b'-' {
-            continue;
-        }
-        let start = idx + 1;
-        let end = start + 16;
-        if end > bytes.len() {
-            continue;
-        }
-        let next_ok = end == bytes.len() || bytes[end] == b'.';
-        if next_ok && is_16_lower_hex(&name[start..end]) {
-            return Some(&name[start..end]);
-        }
-    }
-    None
-}
-
-fn is_16_lower_hex(s: &str) -> bool {
-    s.len() == 16
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
 fn unit_metadata_mtime(meta: &UnitMetadata) -> u64 {
     match meta {
         UnitMetadata::Complete { mtime_unix, .. } | UnitMetadata::Incomplete { mtime_unix } => {
@@ -2586,10 +4280,160 @@ struct RepoGitInfo {
     branch_merged_into_default: Option<bool>,
 }
 
+fn preinspect_git_for_candidates<P: Platform + Sync>(
+    candidates: &[DiscoveredCandidate],
+    platform: &P,
+) -> PreinspectedGit {
+    if candidates.len() <= 1 {
+        return PreinspectedGit {
+            by_target: HashMap::new(),
+            git_repo_cache: HashMap::new(),
+            default_ref_cache: HashMap::new(),
+        };
+    }
+
+    let mut cand_anchors: Vec<(&Path, Option<PathBuf>)> = Vec::with_capacity(candidates.len());
+    let mut seen_anchors: HashSet<PathBuf> = HashSet::new();
+    let mut unique_anchors: Vec<PathBuf> = Vec::new();
+    for cand in candidates {
+        let anchor = find_git_ancestor(&cand.path);
+        if let Some(ref a) = anchor
+            && seen_anchors.insert(a.clone())
+        {
+            unique_anchors.push(a.clone());
+        }
+        cand_anchors.push((cand.path.as_path(), anchor));
+    }
+
+    let mut by_target: HashMap<PathBuf, GitDiscovery> = HashMap::with_capacity(candidates.len());
+    if unique_anchors.is_empty() {
+        for (path, _) in cand_anchors {
+            by_target.insert(path.to_path_buf(), GitDiscovery::NotInGitRepo);
+        }
+        return PreinspectedGit {
+            by_target,
+            git_repo_cache: HashMap::new(),
+            default_ref_cache: HashMap::new(),
+        };
+    }
+
+    let default_ref_cache: Mutex<HashMap<PathBuf, Option<String>>> = Mutex::new(HashMap::new());
+    let mut git_repo_cache: HashMap<PathBuf, Result<RepoGitInfo, CompactString>> =
+        HashMap::with_capacity(unique_anchors.len());
+
+    if unique_anchors.len() == 1 {
+        let anchor = unique_anchors.pop().unwrap();
+        let res = inspect_repo_git_shared(&anchor, platform, &default_ref_cache);
+        git_repo_cache.insert(anchor, res);
+    } else {
+        let worker_count = unique_anchors.len().min(bounded_git_worker_count());
+        let next_idx = AtomicUsize::new(0);
+        let run_worker = || {
+            let mut local = Vec::new();
+            loop {
+                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                let Some(anchor) = unique_anchors.get(idx) else {
+                    break;
+                };
+                let res = inspect_repo_git_shared(anchor, platform, &default_ref_cache);
+                local.push((idx, res));
+            }
+            local
+        };
+        let anchor_results: Vec<Vec<(usize, Result<RepoGitInfo, CompactString>)>> =
+            std::thread::scope(|scope| {
+                let helper_count = worker_count.saturating_sub(1);
+                let mut handles = Vec::with_capacity(helper_count);
+                for _ in 0..helper_count {
+                    handles.push(scope.spawn(run_worker));
+                }
+                let mut results = Vec::with_capacity(worker_count);
+                results.push(run_worker());
+                for h in handles {
+                    results.push(h.join().expect("git repo preinspection thread panicked"));
+                }
+                results
+            });
+        for batch in anchor_results {
+            for (idx, res) in batch {
+                git_repo_cache.insert(unique_anchors[idx].clone(), res);
+            }
+        }
+    }
+
+    let mut ls_tasks: Vec<(&Path, &RepoGitInfo)> = Vec::new();
+    for (path, anchor_opt) in &cand_anchors {
+        let Some(anchor) = anchor_opt else {
+            by_target.insert(path.to_path_buf(), GitDiscovery::NotInGitRepo);
+            continue;
+        };
+        match git_repo_cache.get(anchor) {
+            Some(Ok(info)) => ls_tasks.push((*path, info)),
+            Some(Err(reason)) => {
+                by_target.insert(path.to_path_buf(), GitDiscovery::Failed(reason.clone()));
+            }
+            None => {}
+        }
+    }
+
+    if ls_tasks.len() <= 1 {
+        for (path, info) in ls_tasks {
+            let disc = finalize_git_discovery_for_target(path, info.clone(), platform, None);
+            by_target.insert(path.to_path_buf(), disc);
+        }
+    } else {
+        let worker_count = ls_tasks.len().min(bounded_git_worker_count());
+        let next_idx = AtomicUsize::new(0);
+        let run_worker = || {
+            let mut local = Vec::new();
+            loop {
+                let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                let Some(&(path, info)) = ls_tasks.get(idx) else {
+                    break;
+                };
+                let disc = finalize_git_discovery_for_target(path, info.clone(), platform, None);
+                local.push((path.to_path_buf(), disc));
+            }
+            local
+        };
+        let ls_results: Vec<Vec<(PathBuf, GitDiscovery)>> = std::thread::scope(|scope| {
+            let helper_count = worker_count.saturating_sub(1);
+            let mut handles = Vec::with_capacity(helper_count);
+            for _ in 0..helper_count {
+                handles.push(scope.spawn(run_worker));
+            }
+            let mut results = Vec::with_capacity(worker_count);
+            results.push(run_worker());
+            for h in handles {
+                results.push(
+                    h.join()
+                        .expect("git ls-files preinspection thread panicked"),
+                );
+            }
+            results
+        });
+        for batch in ls_results {
+            for (path, disc) in batch {
+                by_target.insert(path, disc);
+            }
+        }
+    }
+
+    PreinspectedGit {
+        by_target,
+        git_repo_cache,
+        default_ref_cache: default_ref_cache
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    }
+}
+
 fn inspect_git_for_target(
     target_root: &Path,
     platform: &impl Platform,
     cache: &mut HashMap<PathBuf, Result<RepoGitInfo, CompactString>>,
+    default_ref_cache: &mut HashMap<PathBuf, Option<String>>,
+    parent_clean_git: Option<(&Path, &Path)>,
 ) -> GitDiscovery {
     let Some(repo_anchor) = find_git_ancestor(target_root) else {
         return GitDiscovery::NotInGitRepo;
@@ -2598,7 +4442,7 @@ fn inspect_git_for_target(
     let repo_info = match cache.get(&repo_anchor) {
         Some(cached) => cached.clone(),
         None => {
-            let computed = inspect_repo_git(&repo_anchor, platform);
+            let computed = inspect_repo_git(&repo_anchor, platform, default_ref_cache);
             cache.insert(repo_anchor.clone(), computed.clone());
             computed
         }
@@ -2609,7 +4453,16 @@ fn inspect_git_for_target(
         Err(reason) => return GitDiscovery::Failed(reason),
     };
 
-    let norm_target = normalize_macos_system_symlinks(target_root);
+    finalize_git_discovery_for_target(target_root, info, platform, parent_clean_git)
+}
+
+fn finalize_git_discovery_for_target(
+    target_root: &Path,
+    info: RepoGitInfo,
+    platform: &impl Platform,
+    parent_clean_git: Option<(&Path, &Path)>,
+) -> GitDiscovery {
+    let norm_target = normalize_macos_system_symlinks_cow(target_root);
     let has_tracked_files_in_target = if !info.worktree_dir_missing {
         let Ok(rel_target) = norm_target.strip_prefix(&info.worktree_root) else {
             return GitDiscovery::Failed(CompactString::new(
@@ -2626,16 +4479,25 @@ fn inspect_git_for_target(
                 "non-utf8 target path inside git worktree",
             ));
         };
-        match platform.run_git(&info.worktree_root, &["ls-files", "-z", "--", rel_str]) {
-            Ok(out) if out.status_code == Some(0) => !out.stdout.is_empty(),
-            Ok(out) => {
-                return GitDiscovery::Failed(CompactString::from(format!(
-                    "git ls-files exited {:?}",
-                    out.status_code
-                )));
-            }
-            Err(error) => {
-                return GitDiscovery::Failed(CompactString::from(error.to_string()));
+        // If our direct parent target in the same worktree already proved zero tracked files
+        // recursively via `git ls-files`, any child subtree inside it also has zero tracked files.
+        let subsumed_by_clean_parent = parent_clean_git.is_some_and(|(wt_root, parent_norm)| {
+            wt_root == info.worktree_root.as_path() && norm_target.starts_with(parent_norm)
+        });
+        if subsumed_by_clean_parent {
+            false
+        } else {
+            match platform.run_git(&info.worktree_root, &["ls-files", "-z", "--", rel_str]) {
+                Ok(out) if out.status_code == Some(0) => !out.stdout.is_empty(),
+                Ok(out) => {
+                    return GitDiscovery::Failed(CompactString::from(format!(
+                        "git ls-files exited {:?}",
+                        out.status_code
+                    )));
+                }
+                Err(error) => {
+                    return GitDiscovery::Failed(CompactString::from(error.to_string()));
+                }
             }
         }
     } else {
@@ -2679,7 +4541,51 @@ fn infer_non_git_project_dir(target_root: &Path) -> Option<PathBuf> {
 fn inspect_repo_git(
     repo_dir: &Path,
     platform: &impl Platform,
+    default_ref_cache: &mut HashMap<PathBuf, Option<String>>,
 ) -> Result<RepoGitInfo, CompactString> {
+    inspect_repo_git_core(repo_dir, platform, |wt_root, common_dir| {
+        if let Some(cached) = default_ref_cache.get(common_dir) {
+            return cached.clone();
+        }
+        let resolved = resolve_local_default_ref(wt_root, platform);
+        default_ref_cache.insert(common_dir.to_path_buf(), resolved.clone());
+        resolved
+    })
+}
+
+fn inspect_repo_git_shared(
+    repo_dir: &Path,
+    platform: &impl Platform,
+    default_ref_cache: &Mutex<HashMap<PathBuf, Option<String>>>,
+) -> Result<RepoGitInfo, CompactString> {
+    inspect_repo_git_core(repo_dir, platform, |wt_root, common_dir| {
+        {
+            let guard = default_ref_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = guard.get(common_dir) {
+                return cached.clone();
+            }
+        }
+        let resolved = resolve_local_default_ref(wt_root, platform);
+        let mut guard = default_ref_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .entry(common_dir.to_path_buf())
+            .or_insert(resolved)
+            .clone()
+    })
+}
+
+fn inspect_repo_git_core<F>(
+    repo_dir: &Path,
+    platform: &impl Platform,
+    resolve_default_ref: F,
+) -> Result<RepoGitInfo, CompactString>
+where
+    F: FnOnce(&Path, &Path) -> Option<String>,
+{
     let rev = platform
         .run_git(
             repo_dir,
@@ -2740,29 +4646,39 @@ fn inspect_repo_git(
         });
     }
 
-    let status = platform
-        .run_git(
-            &worktree_root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
-        )
-        .map_err(|e| CompactString::from(e.to_string()))?;
-    if status.status_code != Some(0) {
-        return Err(CompactString::from(format!(
-            "git status exited {:?}",
-            status.status_code
-        )));
-    }
-    let is_dirty = !status.stdout.is_empty();
-
-    let branch_merged_into_default = if worktree_kind == WorktreeKind::LinkedWorktree
-        && !is_dirty
-        && !worktree_locked
-        && !git_op_in_progress
-    {
-        check_branch_merged_locally(&worktree_root, platform)
-    } else {
-        None
-    };
+    // `is_dirty` and `branch_merged_into_default` are only consulted for unlocked, non-op
+    // `LinkedWorktree`s; skipping `git status` on `MainCheckout` / locked / active-op repos
+    // avoids expensive full working-tree stat walks on large monorepos.
+    let (is_dirty, branch_merged_into_default) =
+        if worktree_kind == WorktreeKind::LinkedWorktree && !worktree_locked && !git_op_in_progress
+        {
+            let status = platform
+                .run_git(
+                    &worktree_root,
+                    &["status", "--porcelain=v1", "-z", "--untracked-files=normal"],
+                )
+                .map_err(|e| CompactString::from(e.to_string()))?;
+            if status.status_code != Some(0) {
+                return Err(CompactString::from(format!(
+                    "git status exited {:?}",
+                    status.status_code
+                )));
+            }
+            let dirty = !status.stdout.is_empty();
+            let merged = if !dirty {
+                check_branch_merged_locally(
+                    &worktree_root,
+                    &repo_common_dir,
+                    platform,
+                    resolve_default_ref,
+                )
+            } else {
+                None
+            };
+            (dirty, merged)
+        } else {
+            (false, None)
+        };
 
     Ok(RepoGitInfo {
         repo_common_dir,
@@ -2798,11 +4714,28 @@ fn has_git_op_markers(git_dir: &Path) -> bool {
         "rebase-merge",
         "rebase-apply",
     ];
-    MARKERS.iter().any(|marker| git_dir.join(marker).exists())
+    let mut candidate = git_dir.to_path_buf();
+    for marker in MARKERS {
+        candidate.push(marker);
+        let exists = candidate.exists();
+        candidate.pop();
+        if exists {
+            return true;
+        }
+    }
+    false
 }
 
-fn check_branch_merged_locally(worktree_root: &Path, platform: &impl Platform) -> Option<bool> {
-    let default_ref = resolve_local_default_ref(worktree_root, platform)?;
+fn check_branch_merged_locally<F>(
+    worktree_root: &Path,
+    repo_common_dir: &Path,
+    platform: &impl Platform,
+    resolve_default_ref: F,
+) -> Option<bool>
+where
+    F: FnOnce(&Path, &Path) -> Option<String>,
+{
+    let default_ref = resolve_default_ref(worktree_root, repo_common_dir)?;
     let out = platform
         .run_git(
             worktree_root,
@@ -2840,56 +4773,42 @@ fn resolve_local_default_ref(worktree_root: &Path, platform: &impl Platform) -> 
     None
 }
 
-/// Fast fd-anchored `st_blocks * 512` tree sum with hardlink deduplication.
-fn sum_tree_bytes(root: &Path, seen_hardlinks: &mut HashSet<(u64, u64)>) -> u64 {
-    merge_accounting(account_tree(root, MtimePolicy::None, None), seen_hardlinks).0
-}
-
-fn sum_tree_bytes_excluding_child(
-    root: &Path,
-    exclude_child: &str,
-    seen_hardlinks: &mut HashSet<(u64, u64)>,
-) -> u64 {
-    merge_accounting(
-        account_tree(root, MtimePolicy::None, Some(exclude_child.as_bytes())),
-        seen_hardlinks,
-    )
-    .0
-}
-
-fn sum_tree_bytes_and_mtime(
-    root: &Path,
-    mtime_max_depth: usize,
-    seen_hardlinks: &mut HashSet<(u64, u64)>,
-) -> (u64, u64) {
-    merge_accounting(
-        account_tree(root, MtimePolicy::UpToDepth(mtime_max_depth), None),
-        seen_hardlinks,
-    )
-}
-
-fn merge_accounting(acct: TreeAccounting, seen_hardlinks: &mut HashSet<(u64, u64)>) -> (u64, u64) {
-    let mut total = acct.nlink1_bytes;
-    for (dev, ino, bytes) in acct.multi_link {
-        if seen_hardlinks.insert((dev, ino)) {
-            total = total.saturating_add(bytes);
-        }
-    }
-    (total, acct.max_mtime)
-}
-
+/// Fast fd-anchored `st_blocks * 512` tree sum with single-threaded exact hardlink dedup.
 fn account_tree(
     root: &Path,
     mtime_policy: MtimePolicy,
     exclude_top_child: Option<&[u8]>,
-) -> TreeAccounting {
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+) -> DirAccountResult {
     #[cfg(unix)]
     {
-        account_tree_unix(root, mtime_policy, exclude_top_child)
+        use rustix::fs::{Mode, OFlags, open};
+
+        let mut out = DirAccountResult::default();
+        let Ok(fd) = open(
+            root,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return out;
+        };
+
+        sum_dir_fd_recursive(
+            fd,
+            0,
+            mtime_policy,
+            exclude_top_child,
+            hardlinks,
+            scratch,
+            &mut out,
+        );
+        out
     }
     #[cfg(not(unix))]
     {
-        let mut out = TreeAccounting::default();
+        let _ = scratch;
+        let mut out = DirAccountResult::default();
         let mut it = WalkDir::new(root).follow_links(false).into_iter();
         while let Some(next) = it.next() {
             let Ok(entry) = next else { continue };
@@ -2900,14 +4819,17 @@ fn account_tree(
                 it.skip_current_dir();
                 continue;
             }
+            if matches!(mtime_policy, MtimePolicy::V2PkgDir)
+                && entry.depth() == 1
+                && entry.file_type().is_dir()
+                && !entry.file_type().is_symlink()
+                && entry.file_name().to_str().is_some_and(is_16_lower_hex)
+            {
+                out.v2_unit_count += 1;
+            }
             if let Ok(meta) = entry.metadata() {
-                let bytes = meta_blocks(&meta).saturating_mul(512);
-                if !meta.is_dir() && meta_nlink(&meta) > 1 {
-                    out.multi_link
-                        .push((meta_dev(&meta), meta_ino(&meta), bytes));
-                } else {
-                    out.nlink1_bytes = out.nlink1_bytes.saturating_add(bytes);
-                }
+                let bytes = entry_allocated_bytes(&meta, hardlinks);
+                out.bytes = out.bytes.saturating_add(bytes);
                 let track_mtime = match mtime_policy {
                     MtimePolicy::None => false,
                     MtimePolicy::UpToDepth(max_d) => entry.depth() <= max_d,
@@ -2927,34 +4849,17 @@ fn account_tree(
 }
 
 #[cfg(unix)]
-fn account_tree_unix(
-    root: &Path,
-    mtime_policy: MtimePolicy,
-    exclude_top_child: Option<&[u8]>,
-) -> TreeAccounting {
-    use rustix::fs::{Mode, OFlags, open};
-
-    let mut out = TreeAccounting::default();
-    let Ok(fd) = open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) else {
-        return out;
-    };
-
-    sum_dir_fd_recursive(fd, 0, mtime_policy, exclude_top_child, &mut out);
-    out
-}
-
-#[cfg(unix)]
 fn sum_dir_fd_recursive(
     dir_fd: std::os::fd::OwnedFd,
     depth: usize,
     mtime_policy: MtimePolicy,
     exclude_top_child: Option<&[u8]>,
-    out: &mut TreeAccounting,
+    hardlinks: &mut HardlinkSet,
+    scratch: &mut DirScratch,
+    out: &mut DirAccountResult,
 ) {
+    use std::ffi::CStr;
+
     use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, openat, statat};
 
     const MAX_ACCOUNT_DEPTH: usize = 64;
@@ -2972,6 +4877,9 @@ fn sum_dir_fd_recursive(
         MtimePolicy::V2UnitFingerprint { unit_depth } => depth == unit_depth,
     };
     if stat_self_dir && let Ok(st) = dir.stat() {
+        out.bytes = out
+            .bytes
+            .saturating_add(stat_allocated_bytes(&st, true, hardlinks));
         out.max_mtime = out.max_mtime.max(u64::try_from(st.st_mtime).unwrap_or(0));
     }
 
@@ -2980,8 +4888,11 @@ fn sum_dir_fd_recursive(
         MtimePolicy::IncrementalCrateDir => depth == 0,
         MtimePolicy::UpToDepth(max_d) => depth < max_d,
     };
+    let count_v2_units = matches!(mtime_policy, MtimePolicy::V2PkgDir) && depth == 0;
 
-    let mut child_dirs: Vec<std::ffi::CString> = Vec::new();
+    let arena_mark = scratch.name_arena.len();
+    let spans_mark = scratch.name_spans.len();
+
     while let Some(entry_res) = dir.read() {
         let Ok(entry) = entry_res else {
             continue;
@@ -3000,8 +4911,25 @@ fn sum_dir_fd_recursive(
             continue;
         }
         if ft == FileType::Directory {
-            child_dirs.push(name.to_owned());
+            if count_v2_units && std::str::from_utf8(bytes).is_ok_and(is_16_lower_hex) {
+                out.v2_unit_count += 1;
+            }
+            let start = scratch.name_arena.len();
+            scratch
+                .name_arena
+                .extend_from_slice(name.to_bytes_with_nul());
+            scratch.name_spans.push((start, scratch.name_arena.len()));
             continue;
+        }
+
+        // Exact hardlink `statat` skip: when mtime is not needed for this regular file and its
+        // primary-device `d_ino` was already accounted by an earlier hardlink, its incremental byte
+        // contribution is guaranteed 0.
+        if !track_child_file_mtime && ft == FileType::RegularFile {
+            let ino = entry.ino();
+            if ino != 0 && hardlinks.contains_primary(ino) {
+                continue;
+            }
         }
 
         let Ok(fd) = dir.fd() else {
@@ -3010,20 +4938,39 @@ fn sum_dir_fd_recursive(
         let Ok(st) = statat(fd, name, AtFlags::SYMLINK_NOFOLLOW) else {
             continue;
         };
-        if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
-            child_dirs.push(name.to_owned());
+        let mode_ft = FileType::from_raw_mode(st.st_mode);
+        if mode_ft == FileType::Symlink {
             continue;
         }
-        record_stat_blocks(&st, out);
+        if mode_ft == FileType::Directory {
+            if count_v2_units && std::str::from_utf8(bytes).is_ok_and(is_16_lower_hex) {
+                out.v2_unit_count += 1;
+            }
+            let start = scratch.name_arena.len();
+            scratch
+                .name_arena
+                .extend_from_slice(name.to_bytes_with_nul());
+            scratch.name_spans.push((start, scratch.name_arena.len()));
+            continue;
+        }
+        out.bytes = out
+            .bytes
+            .saturating_add(stat_allocated_bytes(&st, false, hardlinks));
         if track_child_file_mtime {
             out.max_mtime = out.max_mtime.max(u64::try_from(st.st_mtime).unwrap_or(0));
         }
     }
 
-    for child_name in child_dirs {
+    let spans_end = scratch.name_spans.len();
+    for span_idx in spans_mark..spans_end {
         let Ok(fd) = dir.fd() else {
             break;
         };
+        let (start, end) = scratch.name_spans[span_idx];
+        let Ok(child_cstr) = CStr::from_bytes_with_nul(&scratch.name_arena[start..end]) else {
+            continue;
+        };
+        let child_bytes = child_cstr.to_bytes();
         let child_policy = match mtime_policy {
             MtimePolicy::None => MtimePolicy::None,
             MtimePolicy::IncrementalCrateDir => MtimePolicy::UpToDepth(2),
@@ -3035,16 +4982,14 @@ fn sum_dir_fd_recursive(
                 }
             }
             MtimePolicy::V2PkgDir => {
-                if depth == 0
-                    && std::str::from_utf8(child_name.to_bytes()).is_ok_and(is_16_lower_hex)
-                {
+                if depth == 0 && std::str::from_utf8(child_bytes).is_ok_and(is_16_lower_hex) {
                     MtimePolicy::V2UnitFingerprint { unit_depth: 1 }
                 } else {
                     MtimePolicy::None
                 }
             }
             MtimePolicy::V2UnitFingerprint { unit_depth } => {
-                if depth == unit_depth && child_name.to_bytes() == b"fingerprint" {
+                if depth == unit_depth && child_bytes == b"fingerprint" {
                     MtimePolicy::UpToDepth(depth + 2)
                 } else {
                     MtimePolicy::None
@@ -3053,29 +4998,39 @@ fn sum_dir_fd_recursive(
         };
         if let Ok(child_fd) = openat(
             fd,
-            child_name.as_c_str(),
+            child_cstr,
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         ) {
-            sum_dir_fd_recursive(child_fd, depth + 1, child_policy, None, out);
+            sum_dir_fd_recursive(
+                child_fd,
+                depth + 1,
+                child_policy,
+                None,
+                hardlinks,
+                scratch,
+                out,
+            );
         }
     }
+
+    scratch.name_arena.truncate(arena_mark);
+    scratch.name_spans.truncate(spans_mark);
 }
 
 #[cfg(unix)]
-fn record_stat_blocks(st: &rustix::fs::Stat, out: &mut TreeAccounting) {
+#[inline]
+fn stat_allocated_bytes(st: &rustix::fs::Stat, is_dir: bool, hardlinks: &mut HardlinkSet) -> u64 {
     let blocks = u64::try_from(st.st_blocks).unwrap_or(0);
     let bytes = blocks.saturating_mul(512);
-    #[allow(clippy::useless_conversion)]
-    let nlink = u64::from(st.st_nlink);
-    if nlink > 1 {
+    if !is_dir && st.st_nlink > 1 {
         #[allow(clippy::unnecessary_cast)]
         let dev = st.st_dev as u64;
         #[allow(clippy::unnecessary_cast)]
         let ino = st.st_ino as u64;
-        out.multi_link.push((dev, ino, bytes));
+        hardlinks.insert_and_count(dev, ino, bytes)
     } else {
-        out.nlink1_bytes = out.nlink1_bytes.saturating_add(bytes);
+        bytes
     }
 }
 
@@ -3105,15 +5060,13 @@ fn file_identity(path: &Path, meta: &fs::Metadata) -> (u64, u64) {
     }
 }
 
-fn entry_allocated_bytes(meta: &fs::Metadata, seen_hardlinks: &mut HashSet<(u64, u64)>) -> u64 {
+fn entry_allocated_bytes(meta: &fs::Metadata, hardlinks: &mut HardlinkSet) -> u64 {
     let bytes = meta_blocks(meta).saturating_mul(512);
-    if !meta.is_dir()
-        && meta_nlink(meta) > 1
-        && !seen_hardlinks.insert((meta_dev(meta), meta_ino(meta)))
-    {
-        return 0;
+    if !meta.is_dir() && meta_nlink(meta) > 1 {
+        hardlinks.insert_and_count(meta_dev(meta), meta_ino(meta), bytes)
+    } else {
+        bytes
     }
-    bytes
 }
 
 #[cfg(unix)]
@@ -3182,14 +5135,14 @@ mod tests {
     use compact_str::CompactString;
 
     use super::{
-        ScanDetail, ScanRequest, ScanRoot, decode_le_u64_hex, extract_16hex_from_dep_name,
-        extract_incremental_crate_name, parse_fingerprint_target_stem, scan,
+        ScanDetail, ScanRequest, ScanRoot, decode_le_u64_hex, extract_incremental_crate_name,
+        parse_fingerprint_target_stem, scan,
     };
     use crate::config::Config;
     use crate::error::AppError;
     use crate::model::{
         DiskStats, GIB, GitDiscovery, MountEntry, ProcessSnapshot, TargetLayout, TargetOrigin,
-        UnitMetadata, UnitTargetKind,
+        UnitMetadata, UnitTargetKind, extract_16hex_from_dep_name,
     };
     use crate::platform::{CommandOutput, LockProbe, Platform, crosses_mount_boundary};
 
@@ -3229,11 +5182,7 @@ mod tests {
             })
         }
         fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
-            Ok(ProcessSnapshot {
-                captured_at_unix: self.now,
-                self_pid: 1,
-                processes: vec![],
-            })
+            Ok(ProcessSnapshot::empty(self.now, 1))
         }
         fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
             Ok(self.mounts.clone())
@@ -3451,10 +5400,12 @@ mod tests {
         assert_eq!(t_v1.layout, TargetLayout::LegacyV1);
         assert_eq!(t_v1.profiles[0].v1_units.len(), 1);
         assert_eq!(
-            t_v1.profiles[0].v1_units[0].v1_build_dir.as_deref(),
+            t_v1.profiles[0].v1_units[0]
+                .v1_build_dir()
+                .map(CompactString::as_str),
             Some("demo-0123456789abcdef")
         );
-        assert_eq!(t_v1.profiles[0].v1_units[0].v1_dep_entries.len(), 2);
+        assert_eq!(t_v1.profiles[0].v1_units[0].v1_dep_entry_count(), 2);
 
         let t_mixed = by_suffix("proj-mixed/target");
         assert_eq!(t_mixed.layout, TargetLayout::MixedV1V2);
@@ -3628,11 +5579,7 @@ mod tests {
                 })
             }
             fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
-                Ok(ProcessSnapshot {
-                    captured_at_unix: self.now,
-                    self_pid: 1,
-                    processes: vec![],
-                })
+                Ok(ProcessSnapshot::empty(self.now, 1))
             }
             fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
                 Ok(vec![MountEntry {
@@ -4108,5 +6055,469 @@ mod tests {
         // Actual in-progress rebase directory MUST trigger git_op_in_progress
         fs::create_dir(git_dir.join("rebase-merge")).unwrap();
         assert!(super::has_git_op_markers(git_dir));
+    }
+
+    #[test]
+    fn pruned_dir_name_tables_are_strictly_sorted_for_binary_search() {
+        for table in [super::PRUNED_DIR_NAMES, super::REPO_INNER_PRUNED_DIR_NAMES] {
+            assert!(!table.is_empty());
+            for pair in table.windows(2) {
+                assert!(
+                    pair[0] < pair[1],
+                    "pruned dir table out of order or duplicate: {:?} >= {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_fingerprint_json_into_validates_and_rolls_back_dep_pool_on_error() {
+        let mut pool = vec![0xdead_beef_u64];
+
+        let valid = br#"{"rustc":12345,"features":"[]","declared_features":"[]","target":1,"profile":2,"path":3,"deps":[[1,"a",false,9001],[2,"b",true,9002]],"local":[],"rustflags":[],"rustdocflags":[],"config":0,"compile_kind":0}"#;
+        let rustc = super::parse_fingerprint_json_into(valid, &mut pool).unwrap();
+        assert_eq!(rustc, 12345);
+        assert_eq!(pool, vec![0xdead_beef_u64, 9001, 9002]);
+
+        // Every invalid/malformed case MUST fail closed (`None`) AND leave `pool` untouched!
+        let saved_len = pool.len();
+        let invalid_cases: &[&[u8]] = &[
+            b"",
+            b"{corrupt",
+            // Missing `rustc`
+            br#"{"deps":[[1,"a",false,9999]]}"#,
+            // Duplicate `rustc`
+            br#"{"rustc":1,"deps":[[1,"a",false,9999]],"rustc":2}"#,
+            // Duplicate `deps`
+            br#"{"rustc":1,"deps":[[1,"a",false,9999]],"deps":[]}"#,
+            // Wrong dep tuple length (missing 4th element)
+            br#"{"rustc":1,"deps":[[1,"a",9999]]}"#,
+            // Wrong dep tuple length (extra 5th element)
+            br#"{"rustc":1,"deps":[[1,"a",false,9999,123]]}"#,
+            // Non-u64 dep fingerprint hash
+            br#"{"rustc":1,"deps":[[1,"a",false,"not_a_num"]]}"#,
+            // Partial valid dep followed by corrupt dep -> must roll back first dep too!
+            br#"{"rustc":1,"deps":[[1,"a",false,7777],[2,"b",false,"bad"]]}"#,
+            // Trailing garbage after valid object
+            br#"{"rustc":1,"deps":[[1,"a",false,8888]]} trailing"#,
+        ];
+
+        for case in invalid_cases {
+            assert!(
+                super::parse_fingerprint_json_into(case, &mut pool).is_none(),
+                "expected None for {:?}",
+                String::from_utf8_lossy(case)
+            );
+            assert_eq!(
+                pool.len(),
+                saved_len,
+                "dep pool leaked partial entries for {:?}",
+                String::from_utf8_lossy(case)
+            );
+        }
+    }
+
+    #[test]
+    fn is_valid_rustc_info_enforces_fingerprint_and_outputs_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".rustc_info.json");
+
+        fs::write(
+            &path,
+            br#"{"rustc_fingerprint":123,"outputs":{"42":{"success":true}},"successes":{}}"#,
+        )
+        .unwrap();
+        assert!(super::is_valid_rustc_info(&path));
+
+        let invalid = [
+            br#"{"rustc_fingerprint":null,"outputs":{}}"#.as_slice(),
+            br#"{"outputs":{}}"#.as_slice(),
+            br#"{"rustc_fingerprint":123,"outputs":[]}"#.as_slice(),
+            br#"{"rustc_fingerprint":123,"outputs":123}"#.as_slice(),
+            br#"{"rustc_fingerprint":123,"outputs":null}"#.as_slice(),
+            br#"{"rustc_fingerprint":123}"#.as_slice(),
+            br#"{not json"#.as_slice(),
+        ];
+        for body in invalid {
+            fs::write(&path, body).unwrap();
+            assert!(
+                !super::is_valid_rustc_info(&path),
+                "expected invalid rustc_info for {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_and_format_16_lower_hex_u64_edge_cases() {
+        for (val, text) in [
+            (0u64, "0000000000000000"),
+            (0xau64, "000000000000000a"),
+            (0x0123_4567_89ab_cdef_u64, "0123456789abcdef"),
+            (u64::MAX, "ffffffffffffffff"),
+        ] {
+            assert_eq!(super::parse_16_lower_hex_u64(text), Some(val));
+            assert_eq!(super::format_16_lower_hex(val).as_str(), text);
+        }
+        for bad in [
+            "",
+            "0123456789abcde",
+            "0123456789abcdef0",
+            "0123456789ABCDEF",
+            "0123456789abcdeg",
+            "0123456789abcde/",
+        ] {
+            assert!(
+                super::parse_16_lower_hex_u64(bad).is_none(),
+                "expected None for {bad:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_fd_bounded_handles_empty_exact_growth_and_oversize() {
+        use rustix::fs::{Mode, OFlags, open};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut buf = Vec::new();
+
+        // 1. Empty file
+        let empty_p = tmp.path().join("empty");
+        fs::write(&empty_p, b"").unwrap();
+        let fd = open(&empty_p, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        assert_eq!(super::read_fd_bounded(&fd, 0, 1024, &mut buf), Some(0));
+
+        // 2. Exact expected size (1-syscall fast path)
+        let exact_p = tmp.path().join("exact");
+        let payload = b"hello targetwarden fast path!";
+        fs::write(&exact_p, payload).unwrap();
+        let fd = open(&exact_p, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        let n = super::read_fd_bounded(&fd, payload.len() as u64, 1024, &mut buf).unwrap();
+        assert_eq!(&buf[..n], payload);
+
+        // 3. File larger than `expected_size` hint (simulates concurrent file growth)
+        let grew_p = tmp.path().join("grew");
+        let big = vec![b'x'; 5000];
+        fs::write(&grew_p, &big).unwrap();
+        let fd = open(&grew_p, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        let n = super::read_fd_bounded(&fd, 100, 8192, &mut buf).unwrap();
+        assert_eq!(n, 5000);
+        assert_eq!(&buf[..n], big.as_slice());
+
+        // 4. Exceeds `max_bytes` (both when hint > max and when actual > max)
+        let fd = open(&grew_p, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        assert_eq!(super::read_fd_bounded(&fd, 5000, 4096, &mut buf), None);
+        let fd = open(&grew_p, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        assert_eq!(super::read_fd_bounded(&fd, 100, 4096, &mut buf), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_hardlink_set_ino_skip_matches_full_stat_accounting_exactly() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("tree");
+        let sub_a = root.join("a");
+        let sub_b = root.join("b");
+        fs::create_dir_all(&sub_a).unwrap();
+        fs::create_dir_all(&sub_b).unwrap();
+
+        // Create unique files and multi-linked files across sibling subdirs
+        let shared1 = sub_a.join("shared1.rlib");
+        let shared2 = sub_a.join("shared2.rlib");
+        fs::write(&shared1, vec![0x11u8; 16 * 1024]).unwrap();
+        fs::write(&shared2, vec![0x22u8; 24 * 1024]).unwrap();
+        fs::write(sub_a.join("unique_a.o"), vec![0x33u8; 8 * 1024]).unwrap();
+        fs::write(sub_b.join("unique_b.o"), vec![0x44u8; 12 * 1024]).unwrap();
+        fs::hard_link(&shared1, sub_b.join("shared1_link1.rlib")).unwrap();
+        fs::hard_link(&shared1, sub_b.join("shared1_link2.rlib")).unwrap();
+        fs::hard_link(&shared2, sub_b.join("shared2_link1.rlib")).unwrap();
+
+        let dev = fs::symlink_metadata(&root).unwrap().dev();
+        let mut hl_no_skip = super::HardlinkSet::new();
+        hl_no_skip.reset(dev, false);
+        let mut hl_with_skip = super::HardlinkSet::new();
+        hl_with_skip.reset(dev, true);
+
+        let mut scratch = super::DirScratch::default();
+        let res_no_skip = super::account_tree(
+            &root,
+            super::MtimePolicy::None,
+            None,
+            &mut hl_no_skip,
+            &mut scratch,
+        );
+        let res_with_skip = super::account_tree(
+            &root,
+            super::MtimePolicy::None,
+            None,
+            &mut hl_with_skip,
+            &mut scratch,
+        );
+        assert!(res_no_skip.bytes > 0);
+        assert_eq!(res_with_skip.bytes, res_no_skip.bytes);
+
+        // Verify `contains_primary` confirms the multi-linked inode was indexed,
+        // and `reset()` clears all state for the next target.
+        let shared1_ino = fs::symlink_metadata(&shared1).unwrap().ino();
+        assert!(hl_with_skip.contains_primary(shared1_ino));
+        hl_with_skip.reset(dev, true);
+        assert!(!hl_with_skip.contains_primary(shared1_ino));
+    }
+
+    #[test]
+    fn compact_profile_dep_fp_pool_preserves_reachable_v2_and_v1_spans_and_drops_unmatched() {
+        use crate::model::{
+            BuildUnit, BuildUnitId, ProfileDir, TargetLayout, UnitMetadata, UnitTargetAnchor,
+            UnitTargetKind,
+        };
+
+        let anchor = |fp_hash: u64| {
+            smallvec::smallvec![UnitTargetAnchor {
+                target_kind: UnitTargetKind::Lib,
+                target_name: CompactString::new("lib"),
+                fingerprint_hash: Some(fp_hash),
+            }]
+        };
+        fn unit_deps<'a>(unit: &BuildUnit, pool: &'a [u64]) -> &'a [u64] {
+            match &unit.metadata {
+                UnitMetadata::Complete {
+                    dep_fp_start,
+                    dep_fp_len,
+                    ..
+                } => &pool[*dep_fp_start as usize..(*dep_fp_start + *dep_fp_len) as usize],
+                UnitMetadata::Incomplete { .. } => &[],
+            }
+        }
+
+        let mut profile = ProfileDir {
+            name: CompactString::new("debug"),
+            rel_path: PathBuf::from("debug"),
+            layout: TargetLayout::MixedV1V2,
+            lock_files: smallvec::SmallVec::new(),
+            locked_now: false,
+            fingerprint_corrupt: false,
+            v2_unit_count: 2,
+            v1_unit_count: 2,
+            incremental_dir_count: 0,
+            profile_mtime_unix: 0,
+            inc_root_mtime_unix: 0,
+            allocated_bytes: 0,
+            last_activity_unix: 0,
+            // V2 anchors: 100, 200. V1 anchors: 300, 400. Unmatched: 777, 888, 999.
+            // Interleaved spans: V2[0] (0..4), V1[0] (4..7), V2[1] (7..8), V1[1] (8..9)
+            dep_fp_pool: vec![999, 200, 888, 300, 100, 400, 999, 777, 300],
+            v2_units: vec![
+                BuildUnit {
+                    id: BuildUnitId::V2 {
+                        pkg: CompactString::new("a"),
+                        unit_hash: CompactString::new("0000000000000001"),
+                    },
+                    v1: None,
+                    metadata: UnitMetadata::Complete {
+                        rustc_hash: 1,
+                        dep_fp_start: 0,
+                        dep_fp_len: 4, // [999, 200, 888, 300] -> keeps [200] (300 is V1-only)
+                        targets: anchor(100),
+                        mtime_unix: 10,
+                    },
+                    allocated_bytes: 10,
+                },
+                BuildUnit {
+                    id: BuildUnitId::V2 {
+                        pkg: CompactString::new("b"),
+                        unit_hash: CompactString::new("0000000000000002"),
+                    },
+                    v1: None,
+                    metadata: UnitMetadata::Complete {
+                        rustc_hash: 1,
+                        dep_fp_start: 7,
+                        dep_fp_len: 1, // [777] -> keeps []
+                        targets: anchor(200),
+                        mtime_unix: 10,
+                    },
+                    allocated_bytes: 10,
+                },
+            ],
+            v1_units: vec![
+                BuildUnit {
+                    id: BuildUnitId::V1 {
+                        fingerprint_dir: Some(CompactString::new("c-0000000000000003")),
+                        unit_hash: CompactString::new("0000000000000003"),
+                    },
+                    v1: None,
+                    metadata: UnitMetadata::Complete {
+                        rustc_hash: 1,
+                        dep_fp_start: 4,
+                        dep_fp_len: 3, // [100, 400, 999] -> keeps [400] (100 is V2-only)
+                        targets: anchor(300),
+                        mtime_unix: 10,
+                    },
+                    allocated_bytes: 10,
+                },
+                BuildUnit {
+                    id: BuildUnitId::V1 {
+                        fingerprint_dir: Some(CompactString::new("d-0000000000000004")),
+                        unit_hash: CompactString::new("0000000000000004"),
+                    },
+                    v1: None,
+                    metadata: UnitMetadata::Complete {
+                        rustc_hash: 1,
+                        dep_fp_start: 8,
+                        dep_fp_len: 1, // [300] -> keeps [300]
+                        targets: anchor(400),
+                        mtime_unix: 10,
+                    },
+                    allocated_bytes: 10,
+                },
+            ],
+            incremental_dirs: Vec::new(),
+        };
+
+        super::compact_profile_dep_fp_pool(&mut profile);
+
+        assert_eq!(profile.dep_fp_pool, vec![200, 400, 300]);
+        assert_eq!(
+            unit_deps(&profile.v2_units[0], &profile.dep_fp_pool),
+            &[200]
+        );
+        assert_eq!(
+            unit_deps(&profile.v2_units[1], &profile.dep_fp_pool),
+            &[] as &[u64]
+        );
+        assert_eq!(
+            unit_deps(&profile.v1_units[0], &profile.dep_fp_pool),
+            &[400]
+        );
+        assert_eq!(
+            unit_deps(&profile.v1_units[1], &profile.dep_fp_pool),
+            &[300]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_and_full_agree_on_symlinks_and_missing_mounts_disables_ino_skip() {
+        use std::os::unix::fs::symlink;
+
+        struct NoMountsPlatform {
+            now: u64,
+        }
+        impl Platform for NoMountsPlatform {
+            fn euid(&self) -> Result<u32, AppError> {
+                Ok(501)
+            }
+            fn now_unix(&self) -> u64 {
+                self.now
+            }
+            fn disk_stats(&self, volume: &Path) -> Result<DiskStats, AppError> {
+                Ok(DiskStats {
+                    mount: volume.to_path_buf(),
+                    total_bytes: 460 * GIB,
+                    free_bytes: 100 * GIB,
+                    local_snapshots: Some(vec![]),
+                })
+            }
+            fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
+                Ok(ProcessSnapshot::empty(self.now, 1))
+            }
+            fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
+                Err(AppError::CommandFailed {
+                    program: "mount",
+                    message: "simulated unavailable mount table".to_owned(),
+                })
+            }
+            fn run_git(&self, _cwd: &Path, _args: &[&str]) -> Result<CommandOutput, AppError> {
+                Err(AppError::CommandFailed {
+                    program: "git",
+                    message: "disabled".to_owned(),
+                })
+            }
+            fn try_lock_readonly(&self, _path: &Path) -> Result<LockProbe, AppError> {
+                Ok(LockProbe::NotFound)
+            }
+            fn run_launchctl(&self, _args: &[&str]) -> Result<CommandOutput, AppError> {
+                Err(AppError::CommandFailed {
+                    program: "launchctl",
+                    message: "disabled".to_owned(),
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let outside = base.join("outside.bin");
+        fs::write(&outside, vec![0xaa; 32 * 1024]).unwrap();
+
+        let target = base.join("proj/target");
+        write_cargo_tag(&target);
+        let debug = target.join("debug");
+        let fp = debug.join(".fingerprint/demo-0123456789abcdef");
+        let build = debug.join("build/demo/0123456789abcdef/fingerprint");
+        let inc = debug.join("incremental/demo-abc12345/s-1-final");
+        let deps = debug.join("deps");
+        fs::create_dir_all(&fp).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::create_dir_all(&inc).unwrap();
+        fs::create_dir_all(&deps).unwrap();
+        fs::write(fp.join("lib-demo.json"), r#"{"rustc":1,"deps":[]}"#).unwrap();
+        fs::write(build.join("lib-demo.json"), r#"{"rustc":1,"deps":[]}"#).unwrap();
+        let dep1 = deps.join("libdemo-0123456789abcdef.rlib");
+        fs::write(&dep1, vec![0x11; 16 * 1024]).unwrap();
+        fs::hard_link(&dep1, deps.join("libdemo_alias-0123456789abcdef.rlib")).unwrap();
+
+        // Symlinks inside `.fingerprint/`, `build/`, and `incremental/` must be skipped
+        // identically by BOTH `Inventory` and `Full` modes.
+        symlink(&outside, debug.join(".fingerprint/link_outside")).unwrap();
+        symlink(&outside, debug.join("build/link_outside")).unwrap();
+        symlink(&outside, debug.join("incremental/link_outside")).unwrap();
+
+        let cfg = Config::default();
+        let platform = TestPlatform::new(1_800_000_000);
+        let inv_snap = scan(
+            &platform,
+            &cfg,
+            &ScanRequest::with_default_volume(
+                vec![],
+                vec![target.clone()],
+                false,
+                ScanDetail::Inventory,
+            ),
+        )
+        .unwrap();
+        let full_snap = scan(
+            &platform,
+            &cfg,
+            &ScanRequest::with_default_volume(
+                vec![],
+                vec![target.clone()],
+                false,
+                ScanDetail::Full,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            inv_snap.targets[0].allocated_bytes, full_snap.targets[0].allocated_bytes,
+            "Inventory and Full must report identical allocated_bytes with symlinks and hardlinks"
+        );
+
+        // When mount table is unavailable (`mounts = None`), hardlink accounting still works
+        // cleanly without enabling `d_ino` skipping and fails closed (`mount_table_available = false`).
+        let no_mounts = NoMountsPlatform { now: 1_800_000_000 };
+        let no_mounts_snap = scan(
+            &no_mounts,
+            &cfg,
+            &ScanRequest::with_default_volume(vec![], vec![target], false, ScanDetail::Full),
+        )
+        .unwrap();
+        assert!(!no_mounts_snap.mount_table_available);
+        assert_eq!(
+            no_mounts_snap.targets[0].allocated_bytes,
+            full_snap.targets[0].allocated_bytes
+        );
     }
 }

@@ -4,16 +4,16 @@
 //!
 //! Allowed dependencies: `model`, `config`.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use smallvec::SmallVec;
 
 use crate::config::Config;
 use crate::model::{
-    BuildUnit, BuildUnitId, CargoTarget, DiskPressure, IncrementalDir, IncrementalRemoval,
-    ProfileDir, ReclaimAction, SessionState, SweepOps, SweepUnitReason, TargetLayout, UnitMetadata,
-    UnitTargetKind, V1UnitRemoval, V2UnitRemoval,
+    BuildUnit, BuildUnitId, CargoTarget, DiskPressure, FastU64BuildHasher, IncrementalDir,
+    IncrementalRemoval, ProfileDir, ReclaimAction, SessionState, SweepOps, SweepUnitReason,
+    TargetLayout, UnitMetadata, UnitTargetKind, V1UnitRemoval, V2UnitRemoval,
 };
 
 /// Plan all `R2` (`SweepBuildUnits` + `RemoveDoc`) and `R3` (`PruneIncremental`) actions
@@ -84,6 +84,7 @@ pub(crate) fn plan_profile_build_sweep(
 
     let v2_removals = sweep_v2_layer(
         &profile.v2_units,
+        &profile.dep_fp_pool,
         drop_v2_anchors,
         &profile_path,
         pinned_unit_paths,
@@ -92,7 +93,7 @@ pub(crate) fn plan_profile_build_sweep(
         config,
     );
     let v1_removals = sweep_v1_layer(
-        &profile.v1_units,
+        profile,
         drop_v1_anchors,
         &profile_path,
         pinned_unit_paths,
@@ -150,8 +151,10 @@ fn max_complete_mtime(units: &[BuildUnit]) -> Option<u64> {
         .max()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sweep_v2_layer(
     units: &[BuildUnit],
+    dep_fp_pool: &[u64],
     drop_anchors: bool,
     profile_path: &Path,
     pinned_unit_paths: &[PathBuf],
@@ -161,6 +164,7 @@ fn sweep_v2_layer(
 ) -> Vec<V2UnitRemoval> {
     let selected = select_swept_units(
         units,
+        dep_fp_pool,
         drop_anchors,
         profile_path,
         pinned_unit_paths,
@@ -188,8 +192,9 @@ fn sweep_v2_layer(
     removals
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sweep_v1_layer(
-    units: &[BuildUnit],
+    profile: &ProfileDir,
     drop_anchors: bool,
     profile_path: &Path,
     pinned_unit_paths: &[PathBuf],
@@ -197,8 +202,10 @@ fn sweep_v1_layer(
     pressure: DiskPressure,
     config: &Config,
 ) -> Vec<V1UnitRemoval> {
+    let units = &profile.v1_units;
     let selected = select_swept_units(
         units,
+        &profile.dep_fp_pool,
         drop_anchors,
         profile_path,
         pinned_unit_paths,
@@ -210,33 +217,35 @@ fn sweep_v1_layer(
         .into_iter()
         .filter_map(|(idx, reason)| match &units[idx].id {
             BuildUnitId::V1 {
-                fingerprint_dir, ..
-            } => {
-                let mut dep_entries = units[idx].v1_dep_entries.clone();
-                dep_entries.sort();
-                Some(V1UnitRemoval {
-                    fingerprint_dir: fingerprint_dir.clone(),
-                    build_dir: units[idx].v1_build_dir.clone(),
-                    dep_entries,
-                    allocated_bytes: units[idx].allocated_bytes,
-                    reason,
-                })
-            }
+                fingerprint_dir,
+                unit_hash,
+            } => Some(V1UnitRemoval {
+                fingerprint_dir: fingerprint_dir.clone(),
+                unit_hash: unit_hash.clone(),
+                build_dir: units[idx].v1_build_dir().cloned(),
+                dep_entries: Vec::new(),
+                sweep_deps_by_hash: units[idx].v1_dep_entry_count() > 0,
+                allocated_bytes: units[idx].allocated_bytes,
+                reason,
+            }),
             BuildUnitId::V2 { .. } => None,
         })
         .collect();
     removals.sort_by(|a, b| {
         a.fingerprint_dir
             .cmp(&b.fingerprint_dir)
+            .then_with(|| a.unit_hash.cmp(&b.unit_hash))
             .then_with(|| a.build_dir.cmp(&b.build_dir))
             .then_with(|| a.dep_entries.cmp(&b.dep_entries))
     });
     removals
 }
 
-/// Core R2 BFS reachability engine over one homogeneous build-unit layer (V2 or V1).
+/// Core R2 reachability engine over one homogeneous build-unit layer (V2 or V1).
+#[allow(clippy::too_many_arguments)]
 fn select_swept_units(
     units: &[BuildUnit],
+    dep_fp_pool: &[u64],
     drop_anchors: bool,
     profile_path: &Path,
     pinned_unit_paths: &[PathBuf],
@@ -250,11 +259,11 @@ fn select_swept_units(
 
     let dup_cooldown = config.sweep.dup_cooldown_secs(pressure);
     let mut keep = vec![false; units.len()];
-    let mut queue: VecDeque<usize> = VecDeque::new();
+    let mut stack: Vec<usize> = Vec::with_capacity(units.len().min(64));
 
     // 1. Derive active `rustc_hash` set strictly from Complete units within `max_mtime - 24h`.
     let max_mtime = max_complete_mtime(units);
-    let mut active_rustc_hashes: HashSet<u64> = HashSet::new();
+    let mut active_rustc_hashes: SmallVec<[u64; 4]> = SmallVec::new();
     if let Some(max_t) = max_mtime {
         let cutoff = max_t.saturating_sub(config.sweep.active_rustc_window_secs);
         for unit in units {
@@ -264,14 +273,16 @@ fn select_swept_units(
                 ..
             } = &unit.metadata
                 && *mtime_unix >= cutoff
+                && !active_rustc_hashes.contains(rustc_hash)
             {
-                active_rustc_hashes.insert(*rustc_hash);
+                active_rustc_hashes.push(*rustc_hash);
             }
         }
     }
 
     // 2. Index every companion fingerprint hash -> unit indices (handles multi-JSON & collisions).
-    let mut by_fp_hash: HashMap<u64, SmallVec<[usize; 2]>> = HashMap::new();
+    let mut by_fp_hash: HashMap<u64, SmallVec<[usize; 2]>, FastU64BuildHasher> =
+        HashMap::with_capacity_and_hasher(units.len(), FastU64BuildHasher);
     for (idx, unit) in units.iter().enumerate() {
         if let UnitMetadata::Complete { targets, .. } = &unit.metadata {
             for anchor in targets {
@@ -282,30 +293,35 @@ fn select_swept_units(
         }
     }
 
-    let mark_keep = |idx: usize, keep: &mut [bool], queue: &mut VecDeque<usize>| {
+    let mark_keep = |idx: usize, keep: &mut [bool], stack: &mut Vec<usize>| {
         if !keep[idx] {
             keep[idx] = true;
-            queue.push_back(idx);
+            stack.push(idx);
         }
     };
 
     // 3. Seed: auto-pinned proc-macro `.dylib` paths and units inside `dup_cooldown`.
+    let pinned_rel: SmallVec<[&Path; 4]> = pinned_unit_paths
+        .iter()
+        .filter_map(|p| p.strip_prefix(profile_path).ok())
+        .collect();
     for (idx, unit) in units.iter().enumerate() {
         let age = now_unix.saturating_sub(unit.metadata.mtime_unix());
-        if age < dup_cooldown || unit_matches_pinned_path(unit, profile_path, pinned_unit_paths) {
-            mark_keep(idx, &mut keep, &mut queue);
+        if age < dup_cooldown || unit_matches_pinned_rel(unit, &pinned_rel) {
+            mark_keep(idx, &mut keep, &mut stack);
         }
     }
 
     // 4. Seed: top-K active units per `(pkg_group, target_kind, target_name)` across all JSON anchors,
     //    skipping anchors that are stale relative to the profile's latest build (`max_t`).
-    //    Live dependencies of any age remain 100% protected via BFS in step 5.
+    //    Live dependencies of any age remain 100% protected via reachability traversal in step 5.
     if !drop_anchors
         && !active_rustc_hashes.is_empty()
         && let Some(max_t) = max_mtime
     {
         type GroupKey<'a> = (&'a str, UnitTargetKind, &'a str);
-        let mut groups: HashMap<GroupKey<'_>, Vec<(u64, usize)>> = HashMap::new();
+        let mut groups: HashMap<GroupKey<'_>, SmallVec<[(u64, usize); 2]>> =
+            HashMap::with_capacity(units.len());
 
         for (idx, unit) in units.iter().enumerate() {
             if let UnitMetadata::Complete {
@@ -323,7 +339,7 @@ fn select_swept_units(
                     }
                     groups
                         .entry((
-                            unit.pkg_group.as_str(),
+                            unit.pkg_group(),
                             anchor.target_kind,
                             anchor.target_name.as_str(),
                         ))
@@ -335,30 +351,42 @@ fn select_swept_units(
 
         let default_k = config.sweep.anchor_slots_k(pressure);
         for ((_, kind, _), mut members) in groups {
-            members.sort_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| unit_sort_key(&units[a.1].id).cmp(&unit_sort_key(&units[b.1].id)))
-            });
+            if members.len() > 1 {
+                members.sort_by(|a, b| {
+                    b.0.cmp(&a.0).then_with(|| {
+                        unit_sort_key(&units[a.1].id).cmp(&unit_sort_key(&units[b.1].id))
+                    })
+                });
+            }
             let k = if kind == UnitTargetKind::Test {
                 1
             } else {
                 default_k
             };
             for &(_, idx) in members.iter().take(k) {
-                mark_keep(idx, &mut keep, &mut queue);
+                mark_keep(idx, &mut keep, &mut stack);
             }
         }
     }
 
-    // 5. BFS reachability over `dep_fp_hashes` protects live dependencies regardless of `mtime`.
-    while let Some(idx) = queue.pop_front() {
-        if let UnitMetadata::Complete { dep_fp_hashes, .. } = &units[idx].metadata {
-            for &dep_hash in dep_fp_hashes {
-                if let Some(dep_indices) = by_fp_hash.get(&dep_hash) {
-                    for &dep_idx in dep_indices {
-                        if !keep[dep_idx] {
-                            keep[dep_idx] = true;
-                            queue.push_back(dep_idx);
+    // 5. Graph reachability over `dep_fp_pool` protects live dependencies regardless of `mtime`.
+    while let Some(idx) = stack.pop() {
+        if let UnitMetadata::Complete {
+            dep_fp_start,
+            dep_fp_len,
+            ..
+        } = &units[idx].metadata
+        {
+            let start = *dep_fp_start as usize;
+            let end = start.saturating_add(*dep_fp_len as usize);
+            if let Some(dep_fp_hashes) = dep_fp_pool.get(start..end) {
+                for &dep_hash in dep_fp_hashes {
+                    if let Some(dep_indices) = by_fp_hash.get(&dep_hash) {
+                        for &dep_idx in dep_indices {
+                            if !keep[dep_idx] {
+                                keep[dep_idx] = true;
+                                stack.push(dep_idx);
+                            }
                         }
                     }
                 }
@@ -397,43 +425,39 @@ fn unit_sort_key(id: &BuildUnitId) -> (&str, &str) {
     }
 }
 
-fn unit_matches_pinned_path(
-    unit: &BuildUnit,
-    profile_path: &Path,
-    pinned_unit_paths: &[PathBuf],
-) -> bool {
-    if pinned_unit_paths.is_empty() {
+fn unit_matches_pinned_rel(unit: &BuildUnit, pinned_rel: &[&Path]) -> bool {
+    if pinned_rel.is_empty() {
         return false;
     }
     match &unit.id {
-        BuildUnitId::V2 { pkg, unit_hash } => {
-            let unit_dir = profile_path
-                .join("build")
-                .join(pkg.as_str())
-                .join(unit_hash.as_str());
-            pinned_unit_paths.iter().any(|p| p.starts_with(&unit_dir))
-        }
+        BuildUnitId::V2 { pkg, unit_hash } => pinned_rel.iter().any(|rel| {
+            let mut comps = rel.components();
+            comps.next().and_then(|c| c.as_os_str().to_str()) == Some("build")
+                && comps.next().and_then(|c| c.as_os_str().to_str()) == Some(pkg.as_str())
+                && comps.next().and_then(|c| c.as_os_str().to_str()) == Some(unit_hash.as_str())
+        }),
         BuildUnitId::V1 {
             fingerprint_dir,
             unit_hash,
-        } => {
-            let fp_dir = fingerprint_dir
-                .as_deref()
-                .map(|fp| profile_path.join(".fingerprint").join(fp));
-            let build_dir = unit
-                .v1_build_dir
-                .as_deref()
-                .map(|b| profile_path.join("build").join(b));
-            let deps_dir = profile_path.join("deps");
-            pinned_unit_paths.iter().any(|p| {
-                fp_dir.as_ref().is_some_and(|fp| p.starts_with(fp))
-                    || build_dir.as_ref().is_some_and(|bd| p.starts_with(bd))
-                    || (p.starts_with(&deps_dir)
-                        && p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|name| name.contains(unit_hash.as_str())))
-            })
-        }
+        } => pinned_rel.iter().any(|rel| {
+            let mut comps = rel.components();
+            let Some(first) = comps.next().and_then(|c| c.as_os_str().to_str()) else {
+                return false;
+            };
+            match first {
+                ".fingerprint" => fingerprint_dir.as_deref().is_some_and(|fp| {
+                    comps.next().and_then(|c| c.as_os_str().to_str()) == Some(fp)
+                }),
+                "build" => unit.v1_build_dir().is_some_and(|bd| {
+                    comps.next().and_then(|c| c.as_os_str().to_str()) == Some(bd.as_str())
+                }),
+                "deps" => rel
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.contains(unit_hash.as_str())),
+                _ => false,
+            }
+        }),
     }
 }
 
@@ -502,15 +526,19 @@ pub(crate) fn plan_profile_incremental_prune(
         .max()
         .unwrap_or(0);
 
-    let mut groups: BTreeMap<&str, Vec<&IncrementalDir>> = BTreeMap::new();
+    let mut groups: BTreeMap<&str, SmallVec<[&IncrementalDir; 4]>> = BTreeMap::new();
     for dir in &profile.incremental_dirs {
         groups.entry(dir.crate_name.as_str()).or_default().push(dir);
     }
 
     let mut removals: Vec<IncrementalRemoval> = Vec::new();
+    let mut finalized: SmallVec<[&IncrementalDir; 4]> = SmallVec::new();
+    let mut working_only: SmallVec<[&IncrementalDir; 4]> = SmallVec::new();
+    let mut sorted_sessions: SmallVec<[&crate::model::IncrementalSession; 4]> = SmallVec::new();
+
     for (_, dirs) in groups {
-        let mut finalized: Vec<&IncrementalDir> = Vec::new();
-        let mut working_only: Vec<&IncrementalDir> = Vec::new();
+        finalized.clear();
+        working_only.clear();
 
         for dir in dirs {
             if dir.has_finalized() {
@@ -523,7 +551,7 @@ pub(crate) fn plan_profile_incremental_prune(
         // Level 1a: unlocked `WorkingOnly` dirs older than `inc_cooldown` are removed without
         // consuming finalized `M` slots.
         working_only.sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
-        for dir in working_only {
+        for &dir in &working_only {
             let age = now_unix.saturating_sub(dir.latest_mtime_unix);
             if !dir.any_locked && age >= inc_cooldown {
                 removals.push(IncrementalRemoval::WholeCrateDir {
@@ -543,7 +571,7 @@ pub(crate) fn plan_profile_incremental_prune(
                 .then_with(|| a.dir_name.cmp(&b.dir_name))
         });
 
-        for (rank, dir) in finalized.into_iter().enumerate() {
+        for (rank, &dir) in finalized.iter().enumerate() {
             let age = now_unix.saturating_sub(dir.latest_mtime_unix);
             let stale_crate =
                 max_inc_mtime.saturating_sub(dir.latest_mtime_unix) > stale_crate_window;
@@ -569,9 +597,10 @@ pub(crate) fn plan_profile_incremental_prune(
                 })
                 .map(|s| s.dir_name.as_str());
 
-            let mut sorted_sessions: Vec<_> = dir.sessions.iter().collect();
+            sorted_sessions.clear();
+            sorted_sessions.extend(dir.sessions.iter());
             sorted_sessions.sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
-            for session in sorted_sessions {
+            for &session in &sorted_sessions {
                 if newest_finalized == Some(session.dir_name.as_str()) {
                     continue;
                 }
@@ -632,7 +661,7 @@ mod tests {
         BuildUnit, BuildUnitId, CargoTarget, DiskPressure, DocDirInfo, GitDiscovery,
         IncrementalDir, IncrementalRemoval, IncrementalSession, ProfileDir, ReclaimAction,
         SessionState, SweepOps, SweepUnitReason, TargetLayout, TargetOrigin, UnitMetadata,
-        UnitTargetAnchor, UnitTargetKind, WorktreeKind,
+        UnitTargetAnchor, UnitTargetKind, V1UnitExtras, WorktreeKind,
     };
 
     const NOW: u64 = 1_800_000_000;
@@ -665,7 +694,8 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn v2_unit(
+    fn push_v2_unit(
+        profile: &mut ProfileDir,
         pkg: &str,
         hash: &str,
         kind: UnitTargetKind,
@@ -675,29 +705,31 @@ mod tests {
         deps: &[u64],
         mtime: u64,
         bytes: u64,
-    ) -> BuildUnit {
+    ) {
         let mut targets = SmallVec::new();
         targets.push(UnitTargetAnchor {
             target_kind: kind,
             target_name: CompactString::from(target_name),
             fingerprint_hash: fp_hash,
         });
-        BuildUnit {
+        let dep_fp_start = u32::try_from(profile.dep_fp_pool.len()).unwrap();
+        profile.dep_fp_pool.extend_from_slice(deps);
+        let dep_fp_len = u32::try_from(deps.len()).unwrap();
+        profile.v2_units.push(BuildUnit {
             id: BuildUnitId::V2 {
                 pkg: CompactString::from(pkg),
                 unit_hash: CompactString::from(hash),
             },
-            pkg_group: CompactString::from(pkg),
             metadata: UnitMetadata::Complete {
                 targets,
                 rustc_hash: rustc,
-                dep_fp_hashes: deps.iter().copied().collect(),
+                dep_fp_start,
+                dep_fp_len,
                 mtime_unix: mtime,
             },
-            v1_build_dir: None,
-            v1_dep_entries: vec![],
+            v1: None,
             allocated_bytes: bytes,
-        }
+        });
     }
 
     fn base_profile(layout: TargetLayout) -> ProfileDir {
@@ -713,6 +745,7 @@ mod tests {
             incremental_dir_count: 0,
             v2_units: vec![],
             v1_units: vec![],
+            dep_fp_pool: vec![],
             incremental_dirs: vec![],
             profile_mtime_unix: NOW - 3 * HOUR,
             inc_root_mtime_unix: NOW - 3 * HOUR,
@@ -729,106 +762,106 @@ mod tests {
 
         let mut profile = base_profile(TargetLayout::BuildDirV2);
         // Active bin built 3h ago depends on 5-day-old dep_lib (fp=100) which depends on 10-day-old build-script (fp=200)
-        profile.v2_units = vec![
-            v2_unit(
-                "app",
-                "0000000000000001",
-                UnitTargetKind::Bin,
-                "app",
-                Some(10),
-                active_rustc,
-                &[100],
-                NOW - 3 * HOUR,
-                500,
-            ),
-            // 5-day-old live dependency (reachable via BFS) -> MUST SURVIVE!
-            v2_unit(
-                "dep_lib",
-                "0000000000000002",
-                UnitTargetKind::Lib,
-                "dep_lib",
-                Some(100),
-                active_rustc,
-                &[200],
-                NOW - 5 * DAY,
-                1000,
-            ),
-            // 10-day-old transitive build script -> MUST SURVIVE!
-            v2_unit(
-                "dep_lib",
-                "0000000000000003",
-                UnitTargetKind::RunBuildScript,
-                "build",
-                Some(200),
-                active_rustc,
-                &[],
-                NOW - 10 * DAY,
-                400,
-            ),
-            // Unreachable old duplicate of dep_lib (K=2 in Calm, so make 3 copies of dep_lib; wait: dep_lib #2 is active, add #4 newer & #5 older)
-            v2_unit(
-                "dep_lib",
-                "0000000000000004",
-                UnitTargetKind::Lib,
-                "dep_lib",
-                Some(101),
-                active_rustc,
-                &[],
-                NOW - 4 * DAY,
-                1000,
-            ),
-            v2_unit(
-                "dep_lib",
-                "0000000000000005",
-                UnitTargetKind::Lib,
-                "dep_lib",
-                Some(102),
-                active_rustc,
-                &[],
-                NOW - 6 * DAY,
-                1000,
-            ),
-            // Stale rustc_hash unit -> MUST BE SWEPT with StaleRustcHash
-            v2_unit(
-                "old_crate",
-                "0000000000000006",
-                UnitTargetKind::Lib,
-                "old_crate",
-                Some(300),
-                old_rustc,
-                &[],
-                NOW - 4 * DAY,
-                2000,
-            ),
-            // Incomplete aborted unit older than 2h -> MUST BE SWEPT with IncompleteAbortedUnit
-            BuildUnit {
-                id: BuildUnitId::V2 {
-                    pkg: CompactString::new("aborted"),
-                    unit_hash: CompactString::new("0000000000000007"),
-                },
-                pkg_group: CompactString::new("aborted"),
-                metadata: UnitMetadata::Incomplete {
-                    mtime_unix: NOW - 3 * HOUR,
-                },
-                v1_build_dir: None,
-                v1_dep_entries: vec![],
-                allocated_bytes: 300,
+        push_v2_unit(
+            &mut profile,
+            "app",
+            "0000000000000001",
+            UnitTargetKind::Bin,
+            "app",
+            Some(10),
+            active_rustc,
+            &[100],
+            NOW - 3 * HOUR,
+            500,
+        );
+        // 5-day-old live dependency (reachable via BFS) -> MUST SURVIVE!
+        push_v2_unit(
+            &mut profile,
+            "dep_lib",
+            "0000000000000002",
+            UnitTargetKind::Lib,
+            "dep_lib",
+            Some(100),
+            active_rustc,
+            &[200],
+            NOW - 5 * DAY,
+            1000,
+        );
+        // 10-day-old transitive build script -> MUST SURVIVE!
+        push_v2_unit(
+            &mut profile,
+            "dep_lib",
+            "0000000000000003",
+            UnitTargetKind::RunBuildScript,
+            "build",
+            Some(200),
+            active_rustc,
+            &[],
+            NOW - 10 * DAY,
+            400,
+        );
+        // Unreachable old duplicate of dep_lib (K=2 in Calm, so make 3 copies of dep_lib; wait: dep_lib #2 is active, add #4 newer & #5 older)
+        push_v2_unit(
+            &mut profile,
+            "dep_lib",
+            "0000000000000004",
+            UnitTargetKind::Lib,
+            "dep_lib",
+            Some(101),
+            active_rustc,
+            &[],
+            NOW - 4 * DAY,
+            1000,
+        );
+        push_v2_unit(
+            &mut profile,
+            "dep_lib",
+            "0000000000000005",
+            UnitTargetKind::Lib,
+            "dep_lib",
+            Some(102),
+            active_rustc,
+            &[],
+            NOW - 6 * DAY,
+            1000,
+        );
+        // Stale rustc_hash unit -> MUST BE SWEPT with StaleRustcHash
+        push_v2_unit(
+            &mut profile,
+            "old_crate",
+            "0000000000000006",
+            UnitTargetKind::Lib,
+            "old_crate",
+            Some(300),
+            old_rustc,
+            &[],
+            NOW - 4 * DAY,
+            2000,
+        );
+        // Incomplete aborted unit older than 2h -> MUST BE SWEPT with IncompleteAbortedUnit
+        profile.v2_units.push(BuildUnit {
+            id: BuildUnitId::V2 {
+                pkg: CompactString::new("aborted"),
+                unit_hash: CompactString::new("0000000000000007"),
             },
-            // Incomplete unit within 2h cooldown (30m old) -> MUST SURVIVE
-            BuildUnit {
-                id: BuildUnitId::V2 {
-                    pkg: CompactString::new("fresh_aborted"),
-                    unit_hash: CompactString::new("0000000000000008"),
-                },
-                pkg_group: CompactString::new("fresh_aborted"),
-                metadata: UnitMetadata::Incomplete {
-                    mtime_unix: NOW - 1800,
-                },
-                v1_build_dir: None,
-                v1_dep_entries: vec![],
-                allocated_bytes: 300,
+            metadata: UnitMetadata::Incomplete {
+                mtime_unix: NOW - 3 * HOUR,
             },
-        ];
+            v1: None,
+            allocated_bytes: 300,
+        });
+        // Incomplete unit within 2h cooldown (30m old) -> MUST SURVIVE
+        profile.v2_units.push(BuildUnit {
+            id: BuildUnitId::V2 {
+                pkg: CompactString::new("fresh_aborted"),
+                unit_hash: CompactString::new("0000000000000008"),
+            },
+            metadata: UnitMetadata::Incomplete {
+                mtime_unix: NOW - 1800,
+            },
+            v1: None,
+            allocated_bytes: 300,
+        });
 
         let target = mk_target(profile, None);
         let action = plan_profile_build_sweep(
@@ -875,7 +908,8 @@ mod tests {
         let mut profile = base_profile(TargetLayout::BuildDirV2);
 
         // Two leaf test binaries: testK = 1 even in Calm -> older test swept
-        let t_new = v2_unit(
+        push_v2_unit(
+            &mut profile,
             "app",
             "aaaaaaaaaaaaaaaa",
             UnitTargetKind::Test,
@@ -886,7 +920,8 @@ mod tests {
             NOW - 3 * HOUR,
             100,
         );
-        let t_old = v2_unit(
+        push_v2_unit(
+            &mut profile,
             "app",
             "bbbbbbbbbbbbbbbb",
             UnitTargetKind::Test,
@@ -898,7 +933,8 @@ mod tests {
             100,
         );
         // Proc-macro unit with stale rustc, but auto-pinned via `pinned_unit_paths` -> survives!
-        let pinned_macro = v2_unit(
+        push_v2_unit(
+            &mut profile,
             "my_macro",
             "cccccccccccccccc",
             UnitTargetKind::Lib,
@@ -910,7 +946,6 @@ mod tests {
             100,
         );
 
-        profile.v2_units = vec![t_new, t_old, pinned_macro];
         let target = mk_target(profile, None);
         let pin_path = target
             .root
@@ -940,7 +975,8 @@ mod tests {
     fn mixed_v1_v2_expires_stale_layer_and_corrupt_fingerprint_fails_closed() {
         let cfg = Config::default();
         let mut profile = base_profile(TargetLayout::MixedV1V2);
-        profile.v2_units = vec![v2_unit(
+        push_v2_unit(
+            &mut profile,
             "app",
             "1111111111111111",
             UnitTargetKind::Bin,
@@ -950,7 +986,7 @@ mod tests {
             &[],
             NOW - 3 * HOUR,
             100,
-        )];
+        );
         let mut v1_targets = SmallVec::new();
         v1_targets.push(UnitTargetAnchor {
             target_kind: UnitTargetKind::Bin,
@@ -962,15 +998,18 @@ mod tests {
                 fingerprint_dir: Some(CompactString::new("app-2222222222222222")),
                 unit_hash: CompactString::new("2222222222222222"),
             },
-            pkg_group: CompactString::new("app"),
             metadata: UnitMetadata::Complete {
                 targets: v1_targets,
                 rustc_hash: 100,
-                dep_fp_hashes: SmallVec::new(),
+                dep_fp_start: 0,
+                dep_fp_len: 0,
                 mtime_unix: NOW - 10 * DAY, // > 7d older than V2 layer in Calm -> stale layer!
             },
-            v1_build_dir: None,
-            v1_dep_entries: vec![CompactString::new("app-2222222222222222.d")],
+            v1: Some(Box::new(V1UnitExtras {
+                pkg_group: CompactString::new("app"),
+                build_dir: None,
+                dep_entry_count: 1,
+            })),
             allocated_bytes: 500,
         }];
 
@@ -1016,7 +1055,7 @@ mod tests {
         let working_only_new = IncrementalDir {
             dir_name: CompactString::new("app-work000000001"),
             crate_name: CompactString::new("app"),
-            sessions: vec![IncrementalSession {
+            sessions: smallvec::smallvec![IncrementalSession {
                 dir_name: CompactString::new("s-001-aaa-working"),
                 lock_file: Some(CompactString::new("s-001-aaa.lock")),
                 state: SessionState::Working,
@@ -1032,7 +1071,7 @@ mod tests {
         let finalized_1 = IncrementalDir {
             dir_name: CompactString::new("app-fin0000000001"),
             crate_name: CompactString::new("app"),
-            sessions: vec![
+            sessions: smallvec::smallvec![
                 IncrementalSession {
                     dir_name: CompactString::new("s-002-bbb-finalnew"),
                     lock_file: Some(CompactString::new("s-002-bbb.lock")),
@@ -1066,7 +1105,7 @@ mod tests {
         let finalized_2 = IncrementalDir {
             dir_name: CompactString::new("app-fin0000000002"),
             crate_name: CompactString::new("app"),
-            sessions: vec![IncrementalSession {
+            sessions: smallvec::smallvec![IncrementalSession {
                 dir_name: CompactString::new("s-001-ccc-final"),
                 lock_file: None,
                 state: SessionState::Finalized,
@@ -1082,7 +1121,7 @@ mod tests {
         let finalized_3_old = IncrementalDir {
             dir_name: CompactString::new("app-fin0000000003"),
             crate_name: CompactString::new("app"),
-            sessions: vec![IncrementalSession {
+            sessions: smallvec::smallvec![IncrementalSession {
                 dir_name: CompactString::new("s-001-ddd-final"),
                 lock_file: None,
                 state: SessionState::Finalized,
@@ -1175,52 +1214,54 @@ mod tests {
         // Fresh active app depends on a 30-day-old live dep (MUST survive via BFS!)
         // Deleted test (10d behind max_t > 7d Calm leaf TTL) and removed crate (20d > 14d Calm core TTL)
         // have active rustc_hash but are unreachable -> MUST be swept!
-        profile.v2_units = vec![
-            v2_unit(
-                "app",
-                "1111111111111111",
-                UnitTargetKind::Bin,
-                "app",
-                Some(10),
-                rustc,
-                &[20],
-                NOW - 3 * HOUR,
-                1000,
-            ),
-            v2_unit(
-                "live_old_dep",
-                "2222222222222222",
-                UnitTargetKind::Lib,
-                "live_old_dep",
-                Some(20),
-                rustc,
-                &[],
-                NOW - 30 * DAY,
-                2000,
-            ),
-            v2_unit(
-                "app",
-                "3333333333333333",
-                UnitTargetKind::Test,
-                "deleted_it_test",
-                Some(30),
-                rustc,
-                &[],
-                NOW - 10 * DAY,
-                1500,
-            ),
-            v2_unit(
-                "removed_crate",
-                "4444444444444444",
-                UnitTargetKind::Lib,
-                "removed_crate",
-                Some(40),
-                rustc,
-                &[],
-                NOW - 20 * DAY,
-                3000,
-            ),
-        ];
+        push_v2_unit(
+            &mut profile,
+            "app",
+            "1111111111111111",
+            UnitTargetKind::Bin,
+            "app",
+            Some(10),
+            rustc,
+            &[20],
+            NOW - 3 * HOUR,
+            1000,
+        );
+        push_v2_unit(
+            &mut profile,
+            "live_old_dep",
+            "2222222222222222",
+            UnitTargetKind::Lib,
+            "live_old_dep",
+            Some(20),
+            rustc,
+            &[],
+            NOW - 30 * DAY,
+            2000,
+        );
+        push_v2_unit(
+            &mut profile,
+            "app",
+            "3333333333333333",
+            UnitTargetKind::Test,
+            "deleted_it_test",
+            Some(30),
+            rustc,
+            &[],
+            NOW - 10 * DAY,
+            1500,
+        );
+        push_v2_unit(
+            &mut profile,
+            "removed_crate",
+            "4444444444444444",
+            UnitTargetKind::Lib,
+            "removed_crate",
+            Some(40),
+            rustc,
+            &[],
+            NOW - 20 * DAY,
+            3000,
+        );
 
         let target = mk_target(profile, None);
         let action = plan_profile_build_sweep(
@@ -1251,7 +1292,7 @@ mod tests {
         let fresh_inc = IncrementalDir {
             dir_name: CompactString::new("app-1111111111111"),
             crate_name: CompactString::new("app"),
-            sessions: vec![IncrementalSession {
+            sessions: smallvec::smallvec![IncrementalSession {
                 dir_name: CompactString::new("s-001-aaa-fin"),
                 lock_file: None,
                 state: SessionState::Finalized,
@@ -1267,7 +1308,7 @@ mod tests {
         let dead_inc = IncrementalDir {
             dir_name: CompactString::new("deleted_test-2222222222222"),
             crate_name: CompactString::new("deleted_test"),
-            sessions: vec![IncrementalSession {
+            sessions: smallvec::smallvec![IncrementalSession {
                 dir_name: CompactString::new("s-001-bbb-fin"),
                 lock_file: None,
                 state: SessionState::Finalized,
