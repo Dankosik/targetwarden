@@ -45,6 +45,10 @@ pub(crate) enum AppError {
         #[source]
         source: io::Error,
     },
+    #[error("state store error at `{path}`: {message}")]
+    Store { path: PathBuf, message: String },
+    #[error("another targetwarden instance holds run.lock")]
+    RunLockBusy,
     #[error("cannot write standard output: {0}")]
     Output(#[source] io::Error),
 }

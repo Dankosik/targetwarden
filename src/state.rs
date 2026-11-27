@@ -3,13 +3,14 @@
 //!
 //! Allowed dependencies: `model`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    DiskPressure, KnownTargetEntry, PinEntry, PinScope, ReclaimHoldState, SCHEMA_VERSION,
+    ActionOutcome, ActionReceipt, CargoTarget, DiskPressure, KnownTargetEntry, PinEntry, PinScope,
+    ReclaimHoldState, SCHEMA_VERSION,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +68,53 @@ impl State {
         }
         matched
     }
+
+    /// Update `known_targets` from a completed scan snapshot.
+    /// If `full_walk && !walk_partial`, unseen targets are retired and `last_full_walk_unix` advances.
+    /// If `walk_partial`, unseen `known_targets` are preserved without eviction.
+    pub(crate) fn record_scan_targets(
+        &mut self,
+        targets: &[CargoTarget],
+        now_unix: u64,
+        full_walk: bool,
+        walk_partial: bool,
+    ) {
+        let mut seen: HashSet<&Path> = HashSet::with_capacity(targets.len());
+        for target in targets {
+            seen.insert(target.root.as_path());
+            let first_seen = self
+                .known_targets
+                .get(&target.root)
+                .map_or(now_unix, |entry| entry.first_seen_unix);
+            self.known_targets.insert(
+                target.root.clone(),
+                KnownTargetEntry {
+                    first_seen_unix: first_seen,
+                    last_seen_unix: now_unix,
+                    last_layout: target.layout,
+                    last_allocated_bytes: target.allocated_bytes,
+                    last_activity_unix: target.last_activity_unix,
+                },
+            );
+        }
+
+        if full_walk && !walk_partial {
+            self.last_full_walk_unix = Some(now_unix);
+            self.known_targets
+                .retain(|path, _| seen.contains(path.as_path()));
+        }
+    }
+
+    /// Accumulate reclaimed allocated bytes from applied action receipts.
+    pub(crate) fn apply_receipts(&mut self, receipts: &[ActionReceipt]) {
+        for receipt in receipts {
+            if matches!(receipt.outcome, ActionOutcome::Applied) {
+                self.cumulative_reclaimed_allocated_bytes = self
+                    .cumulative_reclaimed_allocated_bytes
+                    .saturating_add(receipt.allocated_bytes);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -74,7 +122,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::State;
-    use crate::model::{DiskPressure, PinEntry, PinScope, SCHEMA_VERSION};
+    use crate::model::{
+        CargoTarget, DiskPressure, GitDiscovery, PinEntry, PinScope, SCHEMA_VERSION, TargetLayout,
+        TargetOrigin, WorktreeKind,
+    };
 
     #[test]
     fn default_state_serializes_with_schema_version_1() {
@@ -132,5 +183,52 @@ mod tests {
             state.matching_pin(Path::new("/Users/dev/Other/target"), None),
             None
         );
+    }
+
+    #[test]
+    fn record_scan_targets_preserves_unseen_when_walk_partial_and_retires_when_complete() {
+        let mk_target = |root: &str| CargoTarget {
+            root: PathBuf::from(root),
+            dev_id: 1,
+            ino: 1,
+            origin: TargetOrigin::VerifiedCargoTag,
+            layout: TargetLayout::BuildDirV2,
+            symlink_or_mount_boundary: false,
+            has_unverified_top_entries: false,
+            has_pin_marker: false,
+            parent_target: None,
+            nested_target_roots: vec![],
+            worktree_kind: WorktreeKind::NonGit,
+            git: GitDiscovery::NotInGitRepo,
+            project_dir: None,
+            profiles: vec![],
+            doc_dir: None,
+            allocated_bytes: 1024,
+            last_activity_unix: 500,
+        };
+
+        let mut state = State::new_default();
+        state.record_scan_targets(
+            &[mk_target("/a/target"), mk_target("/b/target")],
+            1000,
+            true,
+            false,
+        );
+        assert_eq!(state.known_targets.len(), 2);
+        assert_eq!(state.last_full_walk_unix, Some(1000));
+
+        // Partial walk only saw /a/target -> must keep /b/target and not advance last_full_walk
+        state.record_scan_targets(&[mk_target("/a/target")], 1100, true, true);
+        assert_eq!(state.known_targets.len(), 2);
+        assert_eq!(state.last_full_walk_unix, Some(1000));
+
+        // Complete full walk only saw /a/target -> retires /b/target and advances last_full_walk
+        state.record_scan_targets(&[mk_target("/a/target")], 1200, true, false);
+        assert_eq!(state.known_targets.len(), 1);
+        assert_eq!(
+            state.known_targets[Path::new("/a/target")].first_seen_unix,
+            1000
+        );
+        assert_eq!(state.last_full_walk_unix, Some(1200));
     }
 }

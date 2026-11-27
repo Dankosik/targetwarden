@@ -162,3 +162,266 @@ fn scan_nonexistent_path_exits_1_with_sanitized_stderr() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("error:"));
 }
+
+#[cfg(target_os = "macos")]
+fn backdate_tree(root: &Path, age: Duration) {
+    let ts = std::time::SystemTime::now() - age;
+    let mut dirs = Vec::new();
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        let path = entry.path().to_path_buf();
+        if entry.file_type().is_dir() {
+            dirs.push(path);
+        } else if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
+            let _ = file.set_modified(ts);
+        }
+    }
+    // Touch directories bottom-up so child updates don't overwrite parent mtime.
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for dir in dirs {
+        let _ = std::process::Command::new("/usr/bin/touch")
+            .args(["-m", "-d", "2020-01-01T00:00:00Z"])
+            .arg(&dir)
+            .output();
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reclaim_dry_run_and_apply_sweep_only_and_history_roundtrip() {
+    let home = tempfile::tempdir().unwrap();
+    let state_dir = home.path().join("state");
+    let target = home.path().join("Projects/app/target");
+    let debug = target.join("debug");
+
+    fs::create_dir_all(debug.join("build/app/1111111111111111/fingerprint")).unwrap();
+    fs::create_dir_all(debug.join("build/old_crate/2222222222222222/fingerprint")).unwrap();
+    fs::create_dir_all(debug.join("incremental/app-fin0000000001/s-100-aaa-final")).unwrap();
+    fs::create_dir_all(debug.join("incremental/app-wrk0000000002/s-200-bbb-working")).unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# Created by cargo.\n",
+    )
+    .unwrap();
+    fs::write(
+        debug.join("build/app/1111111111111111/fingerprint/bin-app.json"),
+        r#"{"rustc":99999,"deps":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        debug.join("build/old_crate/2222222222222222/fingerprint/lib-old_crate.json"),
+        r#"{"rustc":11111,"deps":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        debug.join("build/old_crate/2222222222222222/out_blob"),
+        vec![0u8; 8192],
+    )
+    .unwrap();
+
+    // Backdate everything > 48h; make active unit 5h old so rustc=99999 is active while rustc=11111 is stale (> 24h).
+    backdate_tree(&target, Duration::from_secs(48 * 3600));
+    let recent_ts = std::time::SystemTime::now() - Duration::from_secs(5 * 3600);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(debug.join("build/app/1111111111111111/fingerprint/bin-app.json"))
+        .unwrap()
+        .set_modified(recent_ts)
+        .unwrap();
+
+    // 1. Dry-run must NOT mutate target or create state_dir
+    let dry = command(home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .args([
+            "reclaim",
+            "--dry-run",
+            "--profile",
+            "sweep-only",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        dry.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry.stdout).unwrap();
+    assert_eq!(dry_json["schema_version"], 1);
+    assert_eq!(dry_json["dry_run"], true);
+    assert!(dry_json["summary"]["planned_actions"].as_u64().unwrap() >= 2);
+    assert!(!state_dir.exists());
+    assert!(debug.join("build/old_crate/2222222222222222").exists());
+
+    // 2. Apply sweep-only removes stale unit & working-only inc dir, keeps active & finalized
+    let apply = command(home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .args(["reclaim", "--profile", "sweep-only", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        apply.status.success(),
+        "apply failed: {}",
+        String::from_utf8_lossy(&apply.stderr)
+    );
+    let apply_json: serde_json::Value = serde_json::from_slice(&apply.stdout).unwrap();
+    assert_eq!(apply_json["dry_run"], false);
+    assert!(apply_json["summary"]["applied_actions"].as_u64().unwrap() >= 2);
+    assert!(debug.join("build/app/1111111111111111").exists());
+    assert!(!debug.join("build/old_crate/2222222222222222").exists());
+    assert!(debug.join("incremental/app-fin0000000001").exists());
+    assert!(!debug.join("incremental/app-wrk0000000002").exists());
+
+    // 3. History reads back recorded actions in JSON and text
+    let hist = command(home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .args(["history", "--limit", "10", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(hist.status.success());
+    let hist_json: serde_json::Value = serde_json::from_slice(&hist.stdout).unwrap();
+    assert_eq!(hist_json["schema_version"], 1);
+    assert!(hist_json["count"].as_u64().unwrap() >= 2);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn real_cargo_sweep_preserves_zero_recompilation_on_cargo_check() {
+    let home = tempfile::tempdir().unwrap();
+    let state_dir = home.path().join("state");
+    let proj = home.path().join("Projects/mini_ws");
+    fs::create_dir_all(proj.join("dep_lib/src")).unwrap();
+    fs::create_dir_all(proj.join("app/src")).unwrap();
+    fs::write(
+        proj.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"dep_lib\", \"app\"]\nresolver = \"2\"\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("dep_lib/Cargo.toml"),
+        "[package]\nname = \"dep_lib\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("dep_lib/src/lib.rs"),
+        "pub fn answer() -> u32 { 42 }\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("app/Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\ndep_lib = { path = \"../dep_lib\" }\n[features]\nextra = []\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("app/src/main.rs"),
+        "fn main() { println!(\"{}\", dep_lib::answer()); }\n",
+    )
+    .unwrap();
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let run_cargo = |args: &[&str]| {
+        std::process::Command::new(&cargo)
+            .args(args)
+            .current_dir(&proj)
+            .env_remove("CARGO_TARGET_DIR")
+            .output()
+            .expect("cargo executes")
+    };
+
+    // Build once with `--features extra`, then once with default features
+    let c1 = run_cargo(&["check", "--features", "extra"]);
+    assert!(
+        c1.status.success(),
+        "cargo check --features extra failed: {}",
+        String::from_utf8_lossy(&c1.stderr)
+    );
+    let c2 = run_cargo(&["check"]);
+    assert!(
+        c2.status.success(),
+        "cargo check failed: {}",
+        String::from_utf8_lossy(&c2.stderr)
+    );
+
+    // Inject an obsolete stale-rustc unit & abandoned working incremental dir alongside real artifacts,
+    // then backdate target/ so cooling passes while keeping real units valid.
+    let target = proj.join("target");
+    fs::create_dir_all(target.join("debug/.fingerprint/stale_dep-000000000000cafe")).unwrap();
+    fs::write(
+        target.join("debug/.fingerprint/stale_dep-000000000000cafe/lib-stale_dep.json"),
+        r#"{"rustc":1,"deps":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        target.join("debug/deps/libstale_dep-000000000000cafe.rlib"),
+        vec![0u8; 4096],
+    )
+    .unwrap();
+    fs::create_dir_all(target.join("debug/incremental/app-dead000000001/s-old-abc-working"))
+        .unwrap();
+
+    // Backdate source files to 48h ago so `source_mtime < fingerprint_mtime`,
+    // backdate `target/` to 48h ago (so stale_dep is > 24h older than active rustc window),
+    // and set real fingerprint files to 4h ago (> 2h dup_cooldown).
+    backdate_tree(&proj, Duration::from_secs(48 * 3600));
+    backdate_tree(&target, Duration::from_secs(48 * 3600));
+
+    let real_ts = std::time::SystemTime::now() - Duration::from_secs(4 * 3600);
+    for entry in walkdir::WalkDir::new(target.join("debug/.fingerprint"))
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.path().to_string_lossy().contains("stale_dep") {
+            continue;
+        }
+        if entry.file_type().is_file()
+            && let Ok(f) = fs::OpenOptions::new().write(true).open(entry.path())
+        {
+            let _ = f.set_modified(real_ts);
+        }
+    }
+
+    let sweep = command(home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .args(["reclaim", "--profile", "sweep-only", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        sweep.status.success(),
+        "sweep failed: {}",
+        String::from_utf8_lossy(&sweep.stderr)
+    );
+    let sweep_json: serde_json::Value = serde_json::from_slice(&sweep.stdout).unwrap();
+    assert!(
+        sweep_json["summary"]["applied_actions"].as_u64().unwrap() >= 2,
+        "expected build + incremental sweep: {sweep_json}"
+    );
+    assert!(
+        !target
+            .join("debug/.fingerprint/stale_dep-000000000000cafe")
+            .exists()
+    );
+    assert!(
+        !target
+            .join("debug/deps/libstale_dep-000000000000cafe.rlib")
+            .exists()
+    );
+    assert!(!target.join("debug/incremental/app-dead000000001").exists());
+
+    // Subsequent `cargo check` MUST be a 100% cache hit (`recompiled = []`)!
+    let c3 = run_cargo(&["check"]);
+    assert!(
+        c3.status.success(),
+        "post-sweep cargo check failed: {}",
+        String::from_utf8_lossy(&c3.stderr)
+    );
+    let stderr3 = String::from_utf8_lossy(&c3.stderr);
+    assert!(
+        !stderr3.contains("Compiling ") && !stderr3.contains("Checking "),
+        "expected zero recompilation after surgical sweep, got:\n{stderr3}"
+    );
+}

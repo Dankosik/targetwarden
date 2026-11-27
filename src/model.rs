@@ -28,6 +28,12 @@ pub(crate) enum ReclaimProfile {
     Full,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlanMode {
+    pub profile: ReclaimProfile,
+    pub ignore_snapshot_hold: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DiskStats {
     pub mount: PathBuf,
@@ -113,7 +119,6 @@ pub(crate) struct DocDirInfo {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct CargoTarget {
     pub root: PathBuf,
     pub dev_id: u64,
@@ -123,6 +128,7 @@ pub(crate) struct CargoTarget {
     pub symlink_or_mount_boundary: bool,
     pub has_unverified_top_entries: bool,
     pub has_pin_marker: bool,
+    #[allow(dead_code)] // Used in Stage 3 parent/nested eviction checks
     pub parent_target: Option<PathBuf>,
     pub nested_target_roots: Vec<PathBuf>,
     pub worktree_kind: WorktreeKind,
@@ -144,7 +150,6 @@ impl CargoTarget {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct ProfileDir {
     pub name: CompactString,
     pub rel_path: PathBuf,
@@ -163,7 +168,6 @@ pub(crate) struct ProfileDir {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub(crate) enum BuildUnitId {
     V2 {
         pkg: CompactString,
@@ -175,7 +179,7 @@ pub(crate) enum BuildUnitId {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum UnitTargetKind {
     Lib,
     Bin,
@@ -189,7 +193,6 @@ pub(crate) enum UnitTargetKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct UnitTargetAnchor {
     pub target_kind: UnitTargetKind,
     pub target_name: CompactString,
@@ -197,7 +200,6 @@ pub(crate) struct UnitTargetAnchor {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) enum UnitMetadata {
     Complete {
         targets: SmallVec<[UnitTargetAnchor; 2]>,
@@ -210,8 +212,15 @@ pub(crate) enum UnitMetadata {
     },
 }
 
+impl UnitMetadata {
+    pub fn mtime_unix(&self) -> u64 {
+        match self {
+            Self::Complete { mtime_unix, .. } | Self::Incomplete { mtime_unix } => *mtime_unix,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct BuildUnit {
     pub id: BuildUnitId,
     pub pkg_group: CompactString,
@@ -228,7 +237,6 @@ pub(crate) enum SessionState {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct IncrementalSession {
     pub dir_name: CompactString,
     pub lock_file: Option<CompactString>,
@@ -239,7 +247,6 @@ pub(crate) struct IncrementalSession {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct IncrementalDir {
     pub dir_name: CompactString,
     pub crate_name: CompactString,
@@ -250,7 +257,6 @@ pub(crate) struct IncrementalDir {
 }
 
 impl IncrementalDir {
-    #[allow(dead_code)]
     pub fn has_finalized(&self) -> bool {
         self.sessions
             .iter()
@@ -330,6 +336,248 @@ pub(crate) struct ReclaimHoldState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum RuleId {
+    CrashRecovery,
+    R1DeadWorktree,
+    R2BuildSweep,
+    R2DocPrune,
+    R3IncrementalPrune,
+    R4CooledWorktree,
+    R5PressureLru,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SweepUnitReason {
+    StaleRustcHash,
+    UnreachableDuplicate,
+    IncompleteAbortedUnit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct V2UnitRemoval {
+    pub pkg: CompactString,
+    pub unit_hash: CompactString,
+    pub allocated_bytes: u64,
+    pub reason: SweepUnitReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct V1UnitRemoval {
+    pub fingerprint_dir: CompactString,
+    pub build_dir: Option<CompactString>,
+    pub dep_entries: Vec<CompactString>,
+    pub allocated_bytes: u64,
+    pub reason: SweepUnitReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SweepOps {
+    V2(Vec<V2UnitRemoval>),
+    V1(Vec<V1UnitRemoval>),
+    Mixed {
+        v2: Vec<V2UnitRemoval>,
+        v1: Vec<V1UnitRemoval>,
+    },
+}
+
+impl SweepOps {
+    pub fn unit_count(&self) -> usize {
+        match self {
+            Self::V2(units) => units.len(),
+            Self::V1(units) => units.len(),
+            Self::Mixed { v2, v1 } => v2.len().saturating_add(v1.len()),
+        }
+    }
+
+    pub fn summary_reason(&self) -> CompactString {
+        let mut stale = false;
+        let mut dup = false;
+        let mut incomplete = false;
+        let mut record = |reason: SweepUnitReason| match reason {
+            SweepUnitReason::StaleRustcHash => stale = true,
+            SweepUnitReason::UnreachableDuplicate => dup = true,
+            SweepUnitReason::IncompleteAbortedUnit => incomplete = true,
+        };
+        match self {
+            Self::V2(v2) => v2.iter().for_each(|u| record(u.reason)),
+            Self::V1(v1) => v1.iter().for_each(|u| record(u.reason)),
+            Self::Mixed { v2, v1 } => {
+                v2.iter().for_each(|u| record(u.reason));
+                v1.iter().for_each(|u| record(u.reason));
+            }
+        }
+        let mut parts: SmallVec<[&'static str; 3]> = SmallVec::new();
+        if stale {
+            parts.push("stale_rustc");
+        }
+        if dup {
+            parts.push("unreachable_duplicates");
+        }
+        if incomplete {
+            parts.push("incomplete_units");
+        }
+        if parts.is_empty() {
+            CompactString::new("build_sweep")
+        } else {
+            CompactString::from(parts.join("_and_"))
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IncrementalRemoval {
+    WholeCrateDir {
+        dir_name: CompactString,
+        allocated_bytes: u64,
+    },
+    SingleSession {
+        crate_dir: CompactString,
+        session_dir: CompactString,
+        lock_file: Option<CompactString>,
+        allocated_bytes: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReclaimAction {
+    ReapLeftoverStaging {
+        staging_dir: PathBuf,
+        expected_dev: u64,
+    },
+    SweepBuildUnits {
+        target_root: PathBuf,
+        target_dev: u64,
+        target_ino: u64,
+        expected_activity_unix: u64,
+        profile_rel: PathBuf,
+        profile_locks: SmallVec<[PathBuf; 4]>,
+        ops: SweepOps,
+        estimated_allocated_bytes: u64,
+    },
+    RemoveDoc {
+        target_root: PathBuf,
+        target_dev: u64,
+        target_ino: u64,
+        expected_doc_mtime_unix: u64,
+        locks: SmallVec<[PathBuf; 5]>,
+        estimated_allocated_bytes: u64,
+    },
+    PruneIncremental {
+        target_root: PathBuf,
+        target_dev: u64,
+        target_ino: u64,
+        expected_activity_unix: u64,
+        profile_rel: PathBuf,
+        profile_locks: SmallVec<[PathBuf; 4]>,
+        removals: Vec<IncrementalRemoval>,
+        estimated_allocated_bytes: u64,
+    },
+}
+
+impl ReclaimAction {
+    pub fn rule_id(&self) -> RuleId {
+        match self {
+            Self::ReapLeftoverStaging { .. } => RuleId::CrashRecovery,
+            Self::SweepBuildUnits { .. } => RuleId::R2BuildSweep,
+            Self::RemoveDoc { .. } => RuleId::R2DocPrune,
+            Self::PruneIncremental { .. } => RuleId::R3IncrementalPrune,
+        }
+    }
+
+    pub fn target_root(&self) -> &Path {
+        match self {
+            Self::ReapLeftoverStaging { staging_dir, .. } => staging_dir.as_path(),
+            Self::SweepBuildUnits { target_root, .. }
+            | Self::RemoveDoc { target_root, .. }
+            | Self::PruneIncremental { target_root, .. } => target_root.as_path(),
+        }
+    }
+
+    pub fn profile_rel(&self) -> Option<&Path> {
+        match self {
+            Self::SweepBuildUnits { profile_rel, .. }
+            | Self::PruneIncremental { profile_rel, .. } => Some(profile_rel.as_path()),
+            Self::ReapLeftoverStaging { .. } | Self::RemoveDoc { .. } => None,
+        }
+    }
+
+    pub fn estimated_allocated_bytes(&self) -> u64 {
+        match self {
+            Self::ReapLeftoverStaging { .. } => 0,
+            Self::SweepBuildUnits {
+                estimated_allocated_bytes,
+                ..
+            }
+            | Self::RemoveDoc {
+                estimated_allocated_bytes,
+                ..
+            }
+            | Self::PruneIncremental {
+                estimated_allocated_bytes,
+                ..
+            } => *estimated_allocated_bytes,
+        }
+    }
+
+    pub fn unit_count(&self) -> u32 {
+        let count = match self {
+            Self::ReapLeftoverStaging { .. } | Self::RemoveDoc { .. } => 1,
+            Self::SweepBuildUnits { ops, .. } => ops.unit_count(),
+            Self::PruneIncremental { removals, .. } => removals.len(),
+        };
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    pub fn reason(&self) -> CompactString {
+        match self {
+            Self::ReapLeftoverStaging { .. } => CompactString::new("leftover_staging_recovery"),
+            Self::SweepBuildUnits { ops, .. } => ops.summary_reason(),
+            Self::RemoveDoc { .. } => CompactString::new("stale_doc_dir"),
+            Self::PruneIncremental { .. } => CompactString::new("stale_incremental_sessions"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReclaimPlan {
+    pub generated_at_unix: u64,
+    pub disk: DiskStats,
+    pub pressure: DiskPressure,
+    pub hold_active: bool,
+    pub actions: Vec<ReclaimAction>,
+    pub estimated_allocated_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum ActionOutcome {
+    Applied,
+    DryRun,
+    SkippedContested { reason: CompactString },
+    SkippedRevalidateChanged { reason: CompactString },
+    Failed { error: CompactString },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActionReceipt {
+    pub ts_unix: u64,
+    pub rule: RuleId,
+    pub target_root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_rel: Option<PathBuf>,
+    pub outcome: ActionOutcome,
+    pub units_removed: u32,
+    pub allocated_bytes: u64,
+    pub free_before_bytes: u64,
+    pub free_after_bytes: u64,
+    pub duration_ms: u64,
+    pub pressure: DiskPressure,
+    pub reason: CompactString,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum PinScope {
     Full,
     AllowSweep,
@@ -353,7 +601,6 @@ pub(crate) struct KnownTargetEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct LeftoverStaging {
     pub staging_dir: PathBuf,
     pub expected_dev: u64,
@@ -367,7 +614,6 @@ pub(crate) struct ScanSnapshot {
     pub mount_table_available: bool,
     pub targets: Vec<CargoTarget>,
     pub walk_partial: bool,
-    #[allow(dead_code)]
     pub leftover_staging: Vec<LeftoverStaging>,
     pub scanned_roots: Vec<PathBuf>,
 }

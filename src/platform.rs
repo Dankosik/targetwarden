@@ -978,6 +978,7 @@ com.apple.os.update-ZZZ
             platform.try_lock_readonly(&lock_path).unwrap(),
             LockProbe::Contested
         ));
+        holder.unlock().unwrap();
         drop(holder);
 
         assert!(matches!(

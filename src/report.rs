@@ -10,9 +10,9 @@ use serde::Serialize;
 
 use crate::error::{AppError, sanitize_terminal_text};
 use crate::model::{
-    CargoTarget, DiskPressure, OutputFormat, ProtectedReason, ReclaimHoldState, SCHEMA_VERSION,
-    SafetyVerdict, ScanSnapshot, SweepOnlyReason, TargetLayout, TargetOrigin, WorktreeKind,
-    bytes_to_gib,
+    ActionOutcome, ActionReceipt, CargoTarget, DiskPressure, OutputFormat, ProtectedReason,
+    ReclaimHoldState, ReclaimPlan, RuleId, SCHEMA_VERSION, SafetyVerdict, ScanSnapshot,
+    SweepOnlyReason, TargetLayout, TargetOrigin, WorktreeKind, bytes_to_gib,
 };
 use crate::state::State;
 
@@ -368,6 +368,237 @@ fn format_protected_reason(reason: &ProtectedReason) -> String {
         ProtectedReason::ProcessSnapshotUnavailable => "lsof_unavailable".to_owned(),
         ProtectedReason::MountTableUnavailable => "mount_unavailable".to_owned(),
         ProtectedReason::GitInspectionFailed => "git_failed".to_owned(),
+    }
+}
+
+#[derive(Serialize)]
+struct ReclaimSummary {
+    planned_actions: usize,
+    applied_actions: usize,
+    dry_run_actions: usize,
+    skipped_actions: usize,
+    failed_actions: usize,
+    estimated_allocated_bytes: u64,
+    estimated_allocated_gib: f64,
+    reclaimed_allocated_bytes: u64,
+    reclaimed_allocated_gib: f64,
+}
+
+#[derive(Serialize)]
+struct ReclaimJsonReport<'a> {
+    schema_version: u32,
+    command: &'static str,
+    dry_run: bool,
+    generated_at_unix: u64,
+    disk: DiskReport<'a>,
+    pressure: DiskPressure,
+    hold_active: bool,
+    summary: ReclaimSummary,
+    receipts: &'a [ActionReceipt],
+}
+
+/// Format `reclaim` results (`--dry-run` or live execution) as GiB text or `schema_version = 1` JSON.
+pub(crate) fn write_reclaim_report(
+    plan: &ReclaimPlan,
+    receipts: &[ActionReceipt],
+    dry_run: bool,
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> Result<(), AppError> {
+    let mut applied = 0usize;
+    let mut dry_runs = 0usize;
+    let mut skipped = 0usize;
+    let mut failed = 0usize;
+    let mut reclaimed_bytes = 0u64;
+
+    for r in receipts {
+        match &r.outcome {
+            ActionOutcome::Applied => {
+                applied += 1;
+                reclaimed_bytes = reclaimed_bytes.saturating_add(r.allocated_bytes);
+            }
+            ActionOutcome::DryRun => dry_runs += 1,
+            ActionOutcome::SkippedContested { .. }
+            | ActionOutcome::SkippedRevalidateChanged { .. } => skipped += 1,
+            ActionOutcome::Failed { .. } => failed += 1,
+        }
+    }
+
+    let summary = ReclaimSummary {
+        planned_actions: plan.actions.len(),
+        applied_actions: applied,
+        dry_run_actions: dry_runs,
+        skipped_actions: skipped,
+        failed_actions: failed,
+        estimated_allocated_bytes: plan.estimated_allocated_bytes,
+        estimated_allocated_gib: round2(bytes_to_gib(plan.estimated_allocated_bytes)),
+        reclaimed_allocated_bytes: reclaimed_bytes,
+        reclaimed_allocated_gib: round2(bytes_to_gib(reclaimed_bytes)),
+    };
+
+    match format {
+        OutputFormat::Json => {
+            let report = ReclaimJsonReport {
+                schema_version: SCHEMA_VERSION,
+                command: "reclaim",
+                dry_run,
+                generated_at_unix: plan.generated_at_unix,
+                disk: DiskReport {
+                    mount: &plan.disk.mount,
+                    total_bytes: plan.disk.total_bytes,
+                    free_bytes: plan.disk.free_bytes,
+                    total_gib: round2(bytes_to_gib(plan.disk.total_bytes)),
+                    free_gib: round2(bytes_to_gib(plan.disk.free_bytes)),
+                    local_snapshots: plan.disk.local_snapshots.as_deref(),
+                },
+                pressure: plan.pressure,
+                hold_active: plan.hold_active,
+                summary,
+                receipts,
+            };
+            serde_json::to_writer(&mut *out, &report)
+                .map_err(|e| AppError::Output(std::io::Error::other(e)))?;
+            writeln!(out).map_err(AppError::Output)?;
+            out.flush().map_err(AppError::Output)?;
+        }
+        OutputFormat::Text => {
+            writeln!(
+                out,
+                "Reclaim ({})  Free: {:.2} / {:.2} GiB  Pressure: {}  Hold: {}",
+                if dry_run { "dry-run" } else { "apply" },
+                bytes_to_gib(plan.disk.free_bytes),
+                bytes_to_gib(plan.disk.total_bytes),
+                pressure_label(plan.pressure),
+                if plan.hold_active { "active" } else { "off" },
+            )
+            .map_err(AppError::Output)?;
+            writeln!(
+                out,
+                "Actions: {} planned ({:.2} GiB est.) | {} applied ({:.2} GiB), {} skipped, {} failed",
+                summary.planned_actions,
+                bytes_to_gib(summary.estimated_allocated_bytes),
+                summary.applied_actions,
+                bytes_to_gib(summary.reclaimed_allocated_bytes),
+                summary.skipped_actions,
+                summary.failed_actions,
+            )
+            .map_err(AppError::Output)?;
+
+            if !receipts.is_empty() {
+                writeln!(out).map_err(AppError::Output)?;
+                writeln!(
+                    out,
+                    "{:<18}  {:<12}  {:>9}  {:>6}  PATH",
+                    "RULE", "OUTCOME", "SIZE", "UNITS"
+                )
+                .map_err(AppError::Output)?;
+                for receipt in receipts {
+                    write_receipt_row(receipt, out)?;
+                }
+            }
+            out.flush().map_err(AppError::Output)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct HistoryJsonReport<'a> {
+    schema_version: u32,
+    command: &'static str,
+    count: usize,
+    entries: &'a [ActionReceipt],
+}
+
+/// Format recent `actions.jsonl` entries for `targetwarden history`.
+pub(crate) fn write_history_report(
+    receipts: &[ActionReceipt],
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> Result<(), AppError> {
+    match format {
+        OutputFormat::Json => {
+            let report = HistoryJsonReport {
+                schema_version: SCHEMA_VERSION,
+                command: "history",
+                count: receipts.len(),
+                entries: receipts,
+            };
+            serde_json::to_writer(&mut *out, &report)
+                .map_err(|e| AppError::Output(std::io::Error::other(e)))?;
+            writeln!(out).map_err(AppError::Output)?;
+            out.flush().map_err(AppError::Output)?;
+        }
+        OutputFormat::Text => {
+            if receipts.is_empty() {
+                writeln!(out, "No reclamation actions recorded yet.").map_err(AppError::Output)?;
+            } else {
+                writeln!(
+                    out,
+                    "{:<12}  {:<18}  {:<12}  {:>9}  {:>6}  PATH",
+                    "TS_UNIX", "RULE", "OUTCOME", "SIZE", "UNITS"
+                )
+                .map_err(AppError::Output)?;
+                for receipt in receipts {
+                    let path_display = match &receipt.profile_rel {
+                        Some(rel) => format!("{}/{}", receipt.target_root.display(), rel.display()),
+                        None => receipt.target_root.display().to_string(),
+                    };
+                    writeln!(
+                        out,
+                        "{:<12}  {:<18}  {:<12}  {:>6.2} GiB  {:>6}  {}",
+                        receipt.ts_unix,
+                        rule_label(receipt.rule),
+                        outcome_label(&receipt.outcome),
+                        bytes_to_gib(receipt.allocated_bytes),
+                        receipt.units_removed,
+                        sanitize_terminal_text(&path_display),
+                    )
+                    .map_err(AppError::Output)?;
+                }
+            }
+            out.flush().map_err(AppError::Output)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_receipt_row(receipt: &ActionReceipt, out: &mut impl Write) -> Result<(), AppError> {
+    let path_display = match &receipt.profile_rel {
+        Some(rel) => format!("{}/{}", receipt.target_root.display(), rel.display()),
+        None => receipt.target_root.display().to_string(),
+    };
+    writeln!(
+        out,
+        "{:<18}  {:<12}  {:>6.2} GiB  {:>6}  {}",
+        rule_label(receipt.rule),
+        outcome_label(&receipt.outcome),
+        bytes_to_gib(receipt.allocated_bytes),
+        receipt.units_removed,
+        sanitize_terminal_text(&path_display),
+    )
+    .map_err(AppError::Output)
+}
+
+fn rule_label(rule: RuleId) -> &'static str {
+    match rule {
+        RuleId::CrashRecovery => "crash_recovery",
+        RuleId::R1DeadWorktree => "r1_dead_worktree",
+        RuleId::R2BuildSweep => "r2_build_sweep",
+        RuleId::R2DocPrune => "r2_doc_prune",
+        RuleId::R3IncrementalPrune => "r3_inc_prune",
+        RuleId::R4CooledWorktree => "r4_cooled_wt",
+        RuleId::R5PressureLru => "r5_pressure_lru",
+    }
+}
+
+fn outcome_label(outcome: &ActionOutcome) -> &'static str {
+    match outcome {
+        ActionOutcome::Applied => "applied",
+        ActionOutcome::DryRun => "dry_run",
+        ActionOutcome::SkippedContested { .. } => "contested",
+        ActionOutcome::SkippedRevalidateChanged { .. } => "revalidated",
+        ActionOutcome::Failed { .. } => "failed",
     }
 }
 

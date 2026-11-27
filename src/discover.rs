@@ -1005,7 +1005,11 @@ fn inspect_doc_dir(
     let (lock_file, locked_now) =
         if fs::symlink_metadata(&lock_candidate).is_ok_and(|m| m.file_type().is_file()) {
             let locked = match platform.try_lock_readonly(&lock_candidate) {
-                Ok(LockProbe::Acquired(_)) | Ok(LockProbe::NotFound) => false,
+                Ok(LockProbe::Acquired(file)) => {
+                    let _ = file.unlock();
+                    false
+                }
+                Ok(LockProbe::NotFound) => false,
                 Ok(LockProbe::Contested) | Err(_) => true,
             };
             (Some(lock_candidate), locked)
@@ -1049,7 +1053,10 @@ fn inspect_profile_dir(
     let mut locked_now = false;
     for lock_path in &lock_files {
         match platform.try_lock_readonly(lock_path) {
-            Ok(LockProbe::Acquired(_)) | Ok(LockProbe::NotFound) => {}
+            Ok(LockProbe::Acquired(file)) => {
+                let _ = file.unlock();
+            }
+            Ok(LockProbe::NotFound) => {}
             Ok(LockProbe::Contested) | Err(_) => {
                 locked_now = true;
             }
@@ -1649,7 +1656,11 @@ fn inspect_incremental_dir(
         };
         if meta.file_type().is_file() && name.starts_with("s-") && name.ends_with(".lock") {
             let locked = match platform.try_lock_readonly(&entry_path) {
-                Ok(LockProbe::Acquired(_)) | Ok(LockProbe::NotFound) => false,
+                Ok(LockProbe::Acquired(file)) => {
+                    let _ = file.unlock();
+                    false
+                }
+                Ok(LockProbe::NotFound) => false,
                 Ok(LockProbe::Contested) | Err(_) => true,
             };
             let mtime = meta_mtime_unix(&meta);

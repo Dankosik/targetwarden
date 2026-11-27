@@ -130,12 +130,101 @@ impl Default for ReclaimHoldConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SweepConfig {
+    pub active_rustc_window_secs: u64,
+    pub dup_cooldown_calm_secs: u64,
+    pub dup_cooldown_elevated_secs: u64,
+    pub dup_cooldown_high_secs: u64,
+    pub dup_cooldown_critical_secs: u64,
+    pub inc_cooldown_calm_secs: u64,
+    pub inc_cooldown_elevated_secs: u64,
+    pub inc_cooldown_high_secs: u64,
+    pub inc_cooldown_critical_secs: u64,
+    pub mixed_stale_calm_secs: u64,
+    pub mixed_stale_elevated_secs: u64,
+    pub mixed_stale_high_secs: u64,
+    pub doc_prune_calm_secs: u64,
+    pub doc_prune_high_secs: u64,
+}
+
+impl Default for SweepConfig {
+    fn default() -> Self {
+        Self {
+            active_rustc_window_secs: 24 * 3600,
+            dup_cooldown_calm_secs: 2 * 3600,
+            dup_cooldown_elevated_secs: 3600,
+            dup_cooldown_high_secs: 30 * 60,
+            dup_cooldown_critical_secs: 15 * 60,
+            inc_cooldown_calm_secs: 2 * 3600,
+            inc_cooldown_elevated_secs: 3600,
+            inc_cooldown_high_secs: 30 * 60,
+            inc_cooldown_critical_secs: 15 * 60,
+            mixed_stale_calm_secs: 7 * 86_400,
+            mixed_stale_elevated_secs: 86_400,
+            mixed_stale_high_secs: 2 * 3600,
+            doc_prune_calm_secs: 7 * 86_400,
+            doc_prune_high_secs: 86_400,
+        }
+    }
+}
+
+impl SweepConfig {
+    pub fn dup_cooldown_secs(self, pressure: DiskPressure) -> u64 {
+        match pressure {
+            DiskPressure::Calm => self.dup_cooldown_calm_secs,
+            DiskPressure::Elevated => self.dup_cooldown_elevated_secs,
+            DiskPressure::High => self.dup_cooldown_high_secs,
+            DiskPressure::Critical => self.dup_cooldown_critical_secs,
+        }
+    }
+
+    pub fn inc_cooldown_secs(self, pressure: DiskPressure) -> u64 {
+        match pressure {
+            DiskPressure::Calm => self.inc_cooldown_calm_secs,
+            DiskPressure::Elevated => self.inc_cooldown_elevated_secs,
+            DiskPressure::High => self.inc_cooldown_high_secs,
+            DiskPressure::Critical => self.inc_cooldown_critical_secs,
+        }
+    }
+
+    pub fn anchor_slots_k(self, pressure: DiskPressure) -> usize {
+        match pressure {
+            DiskPressure::Calm | DiskPressure::Elevated => 2,
+            DiskPressure::High | DiskPressure::Critical => 1,
+        }
+    }
+
+    pub fn inc_finalized_keep_m(self, pressure: DiskPressure) -> usize {
+        match pressure {
+            DiskPressure::Calm | DiskPressure::Elevated => 2,
+            DiskPressure::High | DiskPressure::Critical => 1,
+        }
+    }
+
+    pub fn mixed_stale_layer_secs(self, pressure: DiskPressure) -> u64 {
+        match pressure {
+            DiskPressure::Calm => self.mixed_stale_calm_secs,
+            DiskPressure::Elevated => self.mixed_stale_elevated_secs,
+            DiskPressure::High | DiskPressure::Critical => self.mixed_stale_high_secs,
+        }
+    }
+
+    pub fn doc_prune_age_secs(self, pressure: DiskPressure) -> u64 {
+        match pressure {
+            DiskPressure::Calm | DiskPressure::Elevated => self.doc_prune_calm_secs,
+            DiskPressure::High | DiskPressure::Critical => self.doc_prune_high_secs,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Config {
     pub configured_roots: Vec<PathBuf>,
     pub pressure: PressureThresholds,
     pub discovery: DiscoveryBudgets,
     pub cooling: CoolingConfig,
+    pub sweep: SweepConfig,
     pub reclaim_hold: ReclaimHoldConfig,
 }
 
