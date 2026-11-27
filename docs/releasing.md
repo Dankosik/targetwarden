@@ -6,7 +6,7 @@ request, validates the tag and repository against Cargo metadata, builds on
 each native runner, tests the executable after extracting it from its final
 archive, and attests each archive's build provenance. A single final job
 creates a draft GitHub Release with both archives, `SHA256SUMS`,
-`install.sh` (planned for Stage 4 before the first release), and the tagged
+`install.sh`, and the tagged
 version's [changelog](../CHANGELOG.md) section, then publishes it. The repository
 has immutable releases on: once published, a release's assets and tag cannot
 change.
@@ -90,6 +90,6 @@ corruption. Authenticity comes from the build provenance attestation:
 repository's release workflow built it.
 
 When changing a target, update the release workflow matrix, `TARGETS` in
-`scripts/release.py`, `install.sh` (once added), this table, and the
+`scripts/release.py`, `install.sh`, this table, and the
 corresponding verification evidence. Keep the aggregate `required` CI check as
 the branch protection target.

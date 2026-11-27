@@ -4,7 +4,15 @@ Automatic safe Cargo `target/` disk reclaimer for macOS workstations running par
 
 [Specification](specs/targetwarden/README.md) · [Empirical Research](specs/targetwarden/research.md) · [Implementation Plan](specs/targetwarden/plan.md) · [Architecture](docs/architecture.md)
 
-> **Status:** Stages 1–4 (`T1–T14`) implemented and verified on macOS (`status`, `scan`, `reclaim`, `watch`, `pin`, `unpin`, `history`, `install`, `uninstall`, `completions`). Next: 48-hour `watch --dry-run` field soak (`T15`) and `v0.1.0` release packaging (`T16`).
+> **Status:** `v0.1.0` ready for macOS (`aarch64-apple-darwin` and `x86_64-apple-darwin`) — `status`, `scan`, `reclaim`, `watch`, `pin`, `unpin`, `history`, `install`, `uninstall`, and `completions`.
+
+## Install
+
+```sh
+curl -fsSL https://github.com/Dankosik/targetwarden/releases/latest/download/install.sh | sh
+```
+
+Requires macOS (Apple Silicon or Intel). After installing, check your workspace with `targetwarden status`, run a one-shot sweep with `targetwarden reclaim --profile sweep-only`, or install the background LaunchAgent with `targetwarden install` (or `targetwarden install --watch-dry-run` for observation first).
 
 ## What `targetwarden` solves
 

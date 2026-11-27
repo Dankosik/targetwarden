@@ -2972,7 +2972,6 @@ fn sum_dir_fd_recursive(
         MtimePolicy::V2UnitFingerprint { unit_depth } => depth == unit_depth,
     };
     if stat_self_dir && let Ok(st) = dir.stat() {
-        record_stat_blocks(&st, true, out);
         out.max_mtime = out.max_mtime.max(u64::try_from(st.st_mtime).unwrap_or(0));
     }
 
@@ -3015,7 +3014,7 @@ fn sum_dir_fd_recursive(
             child_dirs.push(name.to_owned());
             continue;
         }
-        record_stat_blocks(&st, false, out);
+        record_stat_blocks(&st, out);
         if track_child_file_mtime {
             out.max_mtime = out.max_mtime.max(u64::try_from(st.st_mtime).unwrap_or(0));
         }
@@ -3064,11 +3063,12 @@ fn sum_dir_fd_recursive(
 }
 
 #[cfg(unix)]
-fn record_stat_blocks(st: &rustix::fs::Stat, is_dir: bool, out: &mut TreeAccounting) {
+fn record_stat_blocks(st: &rustix::fs::Stat, out: &mut TreeAccounting) {
     let blocks = u64::try_from(st.st_blocks).unwrap_or(0);
     let bytes = blocks.saturating_mul(512);
+    #[allow(clippy::useless_conversion)]
     let nlink = u64::from(st.st_nlink);
-    if !is_dir && nlink > 1 {
+    if nlink > 1 {
         #[allow(clippy::unnecessary_cast)]
         let dev = st.st_dev as u64;
         #[allow(clippy::unnecessary_cast)]
