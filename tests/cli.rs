@@ -351,6 +351,13 @@ fn real_cargo_sweep_preserves_zero_recompilation_on_cargo_check() {
         "cargo check --features extra failed: {}",
         String::from_utf8_lossy(&c1.stderr)
     );
+    let target = proj.join("target");
+    let fp_root = target.join("debug/.fingerprint");
+    let c1_fp_dirs: std::collections::HashSet<std::ffi::OsString> = fs::read_dir(&fp_root)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
     let c2 = run_cargo(&["check"]);
     assert!(
         c2.status.success(),
@@ -360,7 +367,6 @@ fn real_cargo_sweep_preserves_zero_recompilation_on_cargo_check() {
 
     // Inject an obsolete stale-rustc unit & abandoned working incremental dir alongside real artifacts,
     // then backdate target/ so cooling passes while keeping real units valid.
-    let target = proj.join("target");
     fs::create_dir_all(target.join("debug/.fingerprint/stale_dep-000000000000cafe")).unwrap();
     fs::write(
         target.join("debug/.fingerprint/stale_dep-000000000000cafe/lib-stale_dep.json"),
@@ -377,23 +383,32 @@ fn real_cargo_sweep_preserves_zero_recompilation_on_cargo_check() {
 
     // Backdate source files to 48h ago so `source_mtime < fingerprint_mtime`,
     // backdate `target/` to 48h ago (so stale_dep is > 24h older than active rustc window),
-    // and set real fingerprint files to 4h ago (> 2h dup_cooldown).
+    // and set real fingerprint files to 6h/4h ago (> 2h dup_cooldown, keeping default build newest).
     backdate_tree(&proj, Duration::from_secs(48 * 3600));
     backdate_tree(&target, Duration::from_secs(48 * 3600));
 
-    let real_ts = std::time::SystemTime::now() - Duration::from_secs(4 * 3600);
-    for entry in walkdir::WalkDir::new(target.join("debug/.fingerprint"))
-        .follow_links(false)
-        .into_iter()
-        .flatten()
-    {
-        if entry.path().to_string_lossy().contains("stale_dep") {
+    let older_real_ts = std::time::SystemTime::now() - Duration::from_secs(6 * 3600);
+    let newer_real_ts = std::time::SystemTime::now() - Duration::from_secs(4 * 3600);
+    for dir_entry in fs::read_dir(&fp_root).unwrap().flatten() {
+        let dir_name = dir_entry.file_name();
+        if dir_name.to_string_lossy().contains("stale_dep") {
             continue;
         }
-        if entry.file_type().is_file()
-            && let Ok(f) = fs::OpenOptions::new().write(true).open(entry.path())
+        let ts = if c1_fp_dirs.contains(&dir_name) {
+            older_real_ts
+        } else {
+            newer_real_ts
+        };
+        for entry in walkdir::WalkDir::new(dir_entry.path())
+            .follow_links(false)
+            .into_iter()
+            .flatten()
         {
-            let _ = f.set_modified(real_ts);
+            if entry.file_type().is_file()
+                && let Ok(f) = fs::OpenOptions::new().write(true).open(entry.path())
+            {
+                let _ = f.set_modified(ts);
+            }
         }
     }
 
