@@ -695,6 +695,137 @@ pub(crate) fn write_unpin_report(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct InstallJsonReport<'a> {
+    schema_version: u32,
+    command: &'static str,
+    dry_run: bool,
+    label: &'a str,
+    domain: &'a str,
+    plist_path: &'a std::path::Path,
+    log_path: &'a std::path::Path,
+    plist_xml: &'a str,
+    launchctl_actions: &'a [String],
+}
+
+/// Format `targetwarden install` output (`--dry-run` or applied).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_install_report(
+    label: &str,
+    domain: &str,
+    plist_path: &std::path::Path,
+    log_path: &std::path::Path,
+    plist_xml: &str,
+    launchctl_actions: &[String],
+    dry_run: bool,
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> Result<(), AppError> {
+    match format {
+        OutputFormat::Json => {
+            let report = InstallJsonReport {
+                schema_version: SCHEMA_VERSION,
+                command: "install",
+                dry_run,
+                label,
+                domain,
+                plist_path,
+                log_path,
+                plist_xml,
+                launchctl_actions,
+            };
+            write_json_line(&report, out)?;
+        }
+        OutputFormat::Text => {
+            let mode = if dry_run { "dry-run" } else { "installed" };
+            writeln!(
+                out,
+                "LaunchAgent ({mode}): {} ({})",
+                sanitize_terminal_text(label),
+                sanitize_terminal_text(domain),
+            )
+            .map_err(AppError::Output)?;
+            writeln!(
+                out,
+                "Plist: {}",
+                sanitize_terminal_text(&plist_path.to_string_lossy())
+            )
+            .map_err(AppError::Output)?;
+            writeln!(
+                out,
+                "Log:   {}",
+                sanitize_terminal_text(&log_path.to_string_lossy())
+            )
+            .map_err(AppError::Output)?;
+            if dry_run {
+                writeln!(out, "\nLaunchctl commands:").map_err(AppError::Output)?;
+                for cmd in launchctl_actions {
+                    writeln!(out, "  {}", sanitize_terminal_text(cmd)).map_err(AppError::Output)?;
+                }
+                writeln!(out, "\nGenerated plist:\n{plist_xml}").map_err(AppError::Output)?;
+            }
+            out.flush().map_err(AppError::Output)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct UninstallJsonReport<'a> {
+    schema_version: u32,
+    command: &'static str,
+    label: &'a str,
+    domain: &'a str,
+    plist_path: &'a std::path::Path,
+    removed_plist: bool,
+    booted_out: bool,
+}
+
+/// Format `targetwarden uninstall` output.
+pub(crate) fn write_uninstall_report(
+    label: &str,
+    domain: &str,
+    plist_path: &std::path::Path,
+    removed_plist: bool,
+    booted_out: bool,
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> Result<(), AppError> {
+    match format {
+        OutputFormat::Json => {
+            let report = UninstallJsonReport {
+                schema_version: SCHEMA_VERSION,
+                command: "uninstall",
+                label,
+                domain,
+                plist_path,
+                removed_plist,
+                booted_out,
+            };
+            write_json_line(&report, out)?;
+        }
+        OutputFormat::Text => {
+            writeln!(
+                out,
+                "LaunchAgent uninstalled: {} ({}) [booted_out={}, removed_plist={}]",
+                sanitize_terminal_text(label),
+                sanitize_terminal_text(domain),
+                booted_out,
+                removed_plist,
+            )
+            .map_err(AppError::Output)?;
+            writeln!(
+                out,
+                "Plist: {}",
+                sanitize_terminal_text(&plist_path.to_string_lossy())
+            )
+            .map_err(AppError::Output)?;
+            out.flush().map_err(AppError::Output)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

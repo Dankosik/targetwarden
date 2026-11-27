@@ -490,3 +490,177 @@ fn broken_pipe_on_stdout_exits_0_cleanly() {
     );
     assert!(out.stderr.is_empty());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn install_dry_run_renders_plist_without_touching_disk_or_launchd() {
+    let home = tempfile::tempdir().unwrap();
+    let json_out = command(home.path())
+        .args(["install", "--dry-run", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        json_out.status.success(),
+        "install --dry-run json failed: {}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    assert!(json_out.stderr.is_empty());
+    let json: serde_json::Value = serde_json::from_slice(&json_out.stdout).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["command"], "install");
+    assert_eq!(json["dry_run"], true);
+    assert_eq!(json["label"], "io.github.dankosik.targetwarden");
+    let xml = json["plist_xml"].as_str().unwrap();
+    assert!(xml.contains("<key>Nice</key>\n    <integer>10</integer>"));
+    assert!(xml.contains("<string>watch</string>"));
+    assert!(!xml.contains("ProcessType"));
+    assert!(!xml.contains("LowPriorityIO"));
+    assert!(!home.path().join("Library").exists());
+
+    let text_out = command(home.path())
+        .args(["install", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(text_out.status.success());
+    let text = String::from_utf8(text_out.stdout).unwrap();
+    assert!(text.contains("io.github.dankosik.targetwarden"));
+    assert!(text.contains("launchctl bootstrap"));
+    assert!(!home.path().join("Library").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn watch_handles_bare_fast_path_singleton_lock_concurrent_pin_and_sigterm() {
+    use std::process::{Child, Command as StdCommand, Stdio};
+    use std::time::Instant;
+
+    use rustix::process::{Pid, Signal, kill_process};
+
+    struct ChildGuard(Option<Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let home = tempfile::tempdir().unwrap();
+    let state_dir = home.path().join("state");
+    let demo_proj = home.path().join("Projects/demo");
+    let demo_target = demo_proj.join("target");
+    fs::create_dir_all(demo_target.join("debug/build/demo/1111111111111111/fingerprint")).unwrap();
+    fs::write(
+        demo_target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# Created by cargo.\n",
+    )
+    .unwrap();
+    fs::write(demo_proj.join(".targetwarden-pin"), b"").unwrap();
+
+    // Launch bare `targetwarden watch` (fast-path skipping clap & stdout lock).
+    let bin = assert_cmd::cargo::cargo_bin("targetwarden");
+    let child = StdCommand::new(bin)
+        .arg("watch")
+        .env_remove("TARGETWARDEN_FORMAT")
+        .env_remove("TARGETWARDEN_CONFIG")
+        .env_remove("CARGO_TARGET_DIR")
+        .env("HOME", home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("watch spawned");
+    let child_pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    let mut guard = ChildGuard(Some(child));
+
+    // Wait for tick 1 to flush `state.json` and enter `poll` sleep.
+    let state_file = state_dir.join("state.json");
+    let wait_deadline = Instant::now() + Duration::from_secs(20);
+    while !state_file.exists() {
+        assert!(
+            Instant::now() < wait_deadline,
+            "watch did not persist state.json within 20s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Second `watch` instance MUST fail immediately with exit 1 (`watch.lock` busy).
+    let dup_start = Instant::now();
+    let dup = command(home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .arg("watch")
+        .output()
+        .unwrap();
+    assert_eq!(dup.status.code(), Some(1));
+    assert!(
+        dup_start.elapsed() < Duration::from_secs(5),
+        "duplicate watch must fail fast, took {:?}",
+        dup_start.elapsed()
+    );
+
+    // Interactive `pin` MUST succeed while `watch` is sleeping (`run.lock` released between ticks).
+    let pin = command(home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .args(["pin", demo_proj.to_str().unwrap(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        pin.status.success(),
+        "pin while watch sleeps failed: {}",
+        String::from_utf8_lossy(&pin.stderr)
+    );
+
+    // Send real SIGTERM -> must wake immediately from `poll`, flush, and exit 0 with empty stdout!
+    kill_process(child_pid, Signal::TERM).unwrap();
+    let child = guard.0.take().unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "watch SIGTERM must exit 0, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "watch must never write to stdout");
+    let state_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
+    assert_eq!(state_json["schema_version"], 1);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn watch_fails_immediately_when_run_lock_is_held() {
+    use std::time::Instant;
+
+    let home = tempfile::tempdir().unwrap();
+    let state_dir = home.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let lock_path = state_dir.join("run.lock");
+    let holder = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    holder.try_lock().unwrap();
+
+    let started = Instant::now();
+    let out = command(home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .args(["watch", "--dry-run"])
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    holder.unlock().unwrap();
+    drop(holder);
+
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "watch must fail immediately on busy run.lock, took {elapsed:?}"
+    );
+}

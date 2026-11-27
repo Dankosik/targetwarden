@@ -3033,6 +3033,12 @@ mod tests {
                 Ok(LockProbe::NotFound)
             }
         }
+        fn run_launchctl(&self, _args: &[&str]) -> Result<CommandOutput, AppError> {
+            Err(AppError::CommandFailed {
+                program: "launchctl",
+                message: "disabled in unit test".to_owned(),
+            })
+        }
     }
 
     fn write_cargo_tag(dir: &Path) {
@@ -3420,6 +3426,12 @@ mod tests {
             }
             fn try_lock_readonly(&self, _path: &Path) -> Result<LockProbe, AppError> {
                 Ok(LockProbe::NotFound)
+            }
+            fn run_launchctl(&self, _args: &[&str]) -> Result<CommandOutput, AppError> {
+                Err(AppError::CommandFailed {
+                    program: "launchctl",
+                    message: "unused".to_owned(),
+                })
             }
         }
 

@@ -1685,6 +1685,12 @@ mod tests {
                 }),
             }
         }
+        fn run_launchctl(&self, _args: &[&str]) -> Result<CommandOutput, AppError> {
+            Err(AppError::CommandFailed {
+                program: "launchctl",
+                message: "unused".to_owned(),
+            })
+        }
     }
 
     #[cfg(unix)]
@@ -1972,6 +1978,12 @@ mod tests {
             fn try_lock_readonly(&self, path: &Path) -> Result<LockProbe, AppError> {
                 RealLockTestPlatform { now: self.now }.try_lock_readonly(path)
             }
+            fn run_launchctl(&self, _args: &[&str]) -> Result<CommandOutput, AppError> {
+                Err(AppError::CommandFailed {
+                    program: "launchctl",
+                    message: "unused".to_owned(),
+                })
+            }
         }
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2126,6 +2138,12 @@ mod tests {
             }
             fn try_lock_readonly(&self, path: &Path) -> Result<LockProbe, AppError> {
                 RealLockTestPlatform { now: self.now }.try_lock_readonly(path)
+            }
+            fn run_launchctl(&self, _args: &[&str]) -> Result<CommandOutput, AppError> {
+                Err(AppError::CommandFailed {
+                    program: "launchctl",
+                    message: "unused".to_owned(),
+                })
             }
         }
 

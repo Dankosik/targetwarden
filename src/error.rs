@@ -4,11 +4,6 @@ use std::path::PathBuf;
 /// Typed application errors for fail-closed handling and exit status mapping.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AppError {
-    #[error("`{command}` is not implemented yet (scheduled for {stage})")]
-    NotImplemented {
-        command: &'static str,
-        stage: &'static str,
-    },
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     #[error("targetwarden supports macOS only")]
     UnsupportedPlatform,
@@ -39,6 +34,9 @@ pub(crate) enum AppError {
         program: &'static str,
         message: String,
     },
+    #[cfg_attr(not(unix), allow(dead_code))]
+    #[error("signal handling error: {0}")]
+    Signal(String),
     #[error("lock probe failed for `{path}`: {source}")]
     LockProbe {
         path: PathBuf,

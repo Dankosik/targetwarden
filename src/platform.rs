@@ -52,6 +52,7 @@ pub(crate) trait Platform {
     fn mount_table(&self) -> Result<Vec<MountEntry>, AppError>;
     fn run_git(&self, cwd: &Path, args: &[&str]) -> Result<CommandOutput, AppError>;
     fn try_lock_readonly(&self, path: &Path) -> Result<LockProbe, AppError>;
+    fn run_launchctl(&self, args: &[&str]) -> Result<CommandOutput, AppError>;
 }
 
 #[cfg(target_os = "macos")]
@@ -95,6 +96,10 @@ impl Platform for NoPlatform {
     }
 
     fn try_lock_readonly(&self, _path: &Path) -> Result<LockProbe, AppError> {
+        Err(AppError::UnsupportedPlatform)
+    }
+
+    fn run_launchctl(&self, _args: &[&str]) -> Result<CommandOutput, AppError> {
         Err(AppError::UnsupportedPlatform)
     }
 }
@@ -229,6 +234,18 @@ impl Platform for MacPlatform {
                 source,
             }),
         }
+    }
+
+    fn run_launchctl(&self, args: &[&str]) -> Result<CommandOutput, AppError> {
+        run_bounded_command(
+            "/bin/launchctl",
+            args,
+            Some(Path::new("/")),
+            &[],
+            std::time::Duration::from_secs(SUBPROCESS_TIMEOUT_SECS),
+            SUBPROCESS_STDOUT_CAP,
+            SUBPROCESS_STDERR_CAP,
+        )
     }
 }
 
@@ -971,6 +988,172 @@ fn metadata_dev(_meta: &std::fs::Metadata) -> u64 {
     0
 }
 
+/// Non-blocking self-pipe `SIGTERM`/`SIGINT` watcher backed by `signal-hook` + `rustix::event::poll`.
+#[cfg(unix)]
+pub(crate) struct SignalWatcher {
+    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    read_end: std::os::unix::net::UnixStream,
+    sig_ids: Vec<signal_hook::SigId>,
+}
+
+#[cfg(unix)]
+impl SignalWatcher {
+    pub(crate) fn install() -> Result<Self, AppError> {
+        use std::os::unix::net::UnixStream;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        use signal_hook::consts::signal::{SIGINT, SIGTERM};
+        use signal_hook::flag;
+        use signal_hook::low_level::{pipe, unregister};
+
+        let (read_end, write_term) = UnixStream::pair().map_err(|error| {
+            AppError::Signal(format!("cannot create signal self-pipe: {error}"))
+        })?;
+        read_end
+            .set_nonblocking(true)
+            .map_err(|error| AppError::Signal(format!("cannot configure self-pipe: {error}")))?;
+        write_term
+            .set_nonblocking(true)
+            .map_err(|error| AppError::Signal(format!("cannot configure self-pipe: {error}")))?;
+        let write_int = write_term
+            .try_clone()
+            .map_err(|error| AppError::Signal(format!("cannot clone self-pipe: {error}")))?;
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let mut sig_ids = Vec::with_capacity(4);
+
+        let register_result: std::io::Result<()> = (|| {
+            // Set flag FIRST, then write pipe so waking reader always sees `stop_flag == true`.
+            sig_ids.push(flag::register(SIGTERM, Arc::clone(&stop_flag))?);
+            sig_ids.push(flag::register(SIGINT, Arc::clone(&stop_flag))?);
+            sig_ids.push(pipe::register(SIGTERM, write_term)?);
+            sig_ids.push(pipe::register(SIGINT, write_int)?);
+            Ok(())
+        })();
+
+        if let Err(error) = register_result {
+            for id in sig_ids {
+                unregister(id);
+            }
+            return Err(AppError::Signal(format!(
+                "cannot register SIGTERM/SIGINT handlers: {error}"
+            )));
+        }
+
+        Ok(Self {
+            stop_flag,
+            read_end,
+            sig_ids,
+        })
+    }
+
+    pub(crate) fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.stop_flag)
+    }
+
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stop_flag.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Block via `rustix::event::poll` until `timeout` elapses or `SIGTERM`/`SIGINT` arrives.
+    /// Returns `Ok(true)` if a shutdown signal was received, `Ok(false)` on timeout.
+    pub(crate) fn wait_for_stop_or_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<bool, AppError> {
+        use std::time::{Duration, Instant};
+
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        use rustix::io::Errno;
+
+        let deadline = Instant::now() + timeout;
+        let max_slice = Duration::from_secs(3600);
+        let mut drain_buf = [0u8; 64];
+
+        loop {
+            if self.is_stopped() {
+                drain_nonblocking(&mut self.read_end, &mut drain_buf);
+                return Ok(true);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let slice = deadline.saturating_duration_since(now).min(max_slice);
+            let ts = Timespec {
+                tv_sec: i64::try_from(slice.as_secs()).unwrap_or(i64::MAX),
+                tv_nsec: i64::from(slice.subsec_nanos()),
+            };
+            let mut poll_fds = [PollFd::new(&self.read_end, PollFlags::IN)];
+            match poll(&mut poll_fds, Some(&ts)) {
+                Ok(0) => {
+                    if self.is_stopped() {
+                        drain_nonblocking(&mut self.read_end, &mut drain_buf);
+                        return Ok(true);
+                    }
+                }
+                Ok(_) => {
+                    drain_nonblocking(&mut self.read_end, &mut drain_buf);
+                    if self.is_stopped() {
+                        return Ok(true);
+                    }
+                }
+                Err(Errno::INTR) => continue,
+                Err(error) => {
+                    return Err(AppError::Signal(format!("signal poll failed: {error}")));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn drain_nonblocking(stream: &mut std::os::unix::net::UnixStream, buf: &mut [u8]) {
+    use std::io::Read;
+    loop {
+        match stream.read(buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalWatcher {
+    fn drop(&mut self) {
+        for id in self.sig_ids.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) struct SignalWatcher {
+    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(not(unix))]
+impl SignalWatcher {
+    pub(crate) fn install() -> Result<Self, AppError> {
+        Err(AppError::UnsupportedPlatform)
+    }
+
+    pub(crate) fn stop_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::clone(&self.stop_flag)
+    }
+
+    pub(crate) fn wait_for_stop_or_timeout(
+        &mut self,
+        _timeout: std::time::Duration,
+    ) -> Result<bool, AppError> {
+        Err(AppError::UnsupportedPlatform)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -1124,5 +1307,17 @@ com.apple.os.update-ZZZ
             platform.try_lock_readonly(&lock_path).unwrap(),
             LockProbe::Acquired(_)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_watcher_times_out_cleanly_without_signals() {
+        let mut watcher = super::SignalWatcher::install().unwrap();
+        assert!(!watcher.is_stopped());
+        let stopped = watcher
+            .wait_for_stop_or_timeout(std::time::Duration::from_millis(20))
+            .unwrap();
+        assert!(!stopped);
+        assert!(!watcher.is_stopped());
     }
 }

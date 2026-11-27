@@ -50,12 +50,26 @@ pub(crate) fn acquire_run_lock(
     state_dir: &Path,
     retry_timeout: Duration,
 ) -> Result<RunLockGuard, AppError> {
+    acquire_named_lock(state_dir, "run.lock", retry_timeout)
+}
+
+/// Acquire `<state_dir>/watch.lock` non-blocking to guarantee a single `watch` daemon instance
+/// while allowing `run.lock` to be released between ticks for CLI `pin`/`unpin`/`reclaim`.
+pub(crate) fn acquire_watch_lock(state_dir: &Path) -> Result<RunLockGuard, AppError> {
+    acquire_named_lock(state_dir, "watch.lock", Duration::ZERO)
+}
+
+fn acquire_named_lock(
+    state_dir: &Path,
+    file_name: &str,
+    retry_timeout: Duration,
+) -> Result<RunLockGuard, AppError> {
     fs::create_dir_all(state_dir).map_err(|error| AppError::Store {
         path: state_dir.to_path_buf(),
         message: format!("cannot create state directory: {error}"),
     })?;
 
-    let lock_path = state_dir.join("run.lock");
+    let lock_path = state_dir.join(file_name);
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -64,7 +78,7 @@ pub(crate) fn acquire_run_lock(
         .open(&lock_path)
         .map_err(|error| AppError::Store {
             path: lock_path.clone(),
-            message: format!("cannot open run.lock: {error}"),
+            message: format!("cannot open {file_name}: {error}"),
         })?;
 
     let deadline = Instant::now() + retry_timeout;
@@ -80,7 +94,7 @@ pub(crate) fn acquire_run_lock(
             Err(TryLockError::Error(error)) => {
                 return Err(AppError::Store {
                     path: lock_path,
-                    message: format!("cannot lock run.lock: {error}"),
+                    message: format!("cannot lock {file_name}: {error}"),
                 });
             }
         }
@@ -204,7 +218,6 @@ impl StateCache {
 
     /// Load `state.json`, recovering cleanly to default state with a diagnostic message if corrupt
     /// (used by `watch` per Section 6.2).
-    #[allow(dead_code)] // Used by Stage 4 `watch`
     pub(crate) fn load_or_recover(&mut self) -> (State, Option<String>) {
         match self.load() {
             Ok(state) => (state, None),
