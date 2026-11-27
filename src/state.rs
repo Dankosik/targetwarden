@@ -105,15 +105,45 @@ impl State {
         }
     }
 
-    /// Accumulate reclaimed allocated bytes from applied action receipts.
+    /// Accumulate reclaimed allocated bytes from applied action receipts and retire evicted targets.
     pub(crate) fn apply_receipts(&mut self, receipts: &[ActionReceipt]) {
         for receipt in receipts {
             if matches!(receipt.outcome, ActionOutcome::Applied) {
                 self.cumulative_reclaimed_allocated_bytes = self
                     .cumulative_reclaimed_allocated_bytes
                     .saturating_add(receipt.allocated_bytes);
+                if matches!(
+                    receipt.rule,
+                    crate::model::RuleId::R1DeadWorktree
+                        | crate::model::RuleId::R4CooledWorktree
+                        | crate::model::RuleId::R5PressureLru
+                ) {
+                    self.known_targets
+                        .retain(|path, _| !path.starts_with(&receipt.target_root));
+                }
             }
         }
+    }
+
+    pub(crate) fn add_pin(
+        &mut self,
+        path: PathBuf,
+        scope: PinScope,
+        note: Option<String>,
+        now_unix: u64,
+    ) {
+        self.pins.insert(
+            path,
+            PinEntry {
+                pinned_at_unix: now_unix,
+                scope,
+                note,
+            },
+        );
+    }
+
+    pub(crate) fn remove_pin(&mut self, path: &Path) -> bool {
+        self.pins.remove(path).is_some()
     }
 }
 
@@ -203,6 +233,8 @@ mod tests {
             project_dir: None,
             profiles: vec![],
             doc_dir: None,
+            root_lock_file: None,
+            root_locked_now: false,
             allocated_bytes: 1024,
             last_activity_unix: 500,
         };

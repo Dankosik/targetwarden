@@ -26,22 +26,22 @@ use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::discover::{ScanDetail, ScanRequest, ScanRoot};
 use crate::error::AppError;
-use crate::model::{ActionOutcome, PlanMode};
+use crate::model::{ActionOutcome, DiskPressure, PinScope, PlanMode};
 use crate::platform::{Platform, default_platform};
 use crate::state::State;
 use crate::store::{CLI_RUN_LOCK_RETRY_TIMEOUT, StateCache};
 
 const EXIT_PARTIAL: u8 = 3;
 
-/// Parse CLI arguments, run the requested command once (or loop in `watch`), and map exit status.
+/// Parse CLI arguments, run the requested command once, and map exit status.
 pub fn run() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => return report_parser_error(error),
     };
 
-    let result = dispatch(cli, &mut io::stdout().lock());
-    match result {
+    let mut stdout = io::stdout().lock();
+    match dispatch(cli, &mut stdout) {
         Ok(code) => code,
         Err(error) if error.is_stdout_closed() => ExitCode::SUCCESS,
         Err(error) => {
@@ -204,14 +204,16 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
             let snapshot = discover::scan(&platform, &config, &req)?;
 
             if snapshot.processes.is_none() {
-                return Err(AppError::ProcessSnapshot(
-                    "lsof process snapshot unavailable; refusing all mutations".to_owned(),
-                ));
+                let detail = snapshot.process_snapshot_error.unwrap_or_else(|| {
+                    "lsof process snapshot unavailable; refusing all mutations".to_owned()
+                });
+                return Err(AppError::ProcessSnapshot(detail));
             }
             if !snapshot.mount_table_available {
-                return Err(AppError::MountTable(
-                    "mount table unavailable; refusing all mutations".to_owned(),
-                ));
+                let detail = snapshot.mount_table_error.unwrap_or_else(|| {
+                    "mount table unavailable; refusing all mutations".to_owned()
+                });
+                return Err(AppError::MountTable(detail));
             }
 
             let current_pressure = pressure::evaluate_pressure(
@@ -243,7 +245,7 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                 profile,
                 ignore_snapshot_hold,
             };
-            let plan = rules::plan(
+            let mut plan = rules::plan(
                 &snapshot,
                 &verdicts,
                 &state,
@@ -251,24 +253,39 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                 current_pressure,
                 mode,
             );
-            let receipts = execute::execute_plan(&plan, &platform, dry_run, None);
+            let r5_target = rules::r5_headroom_target(current_pressure, &config);
+            let exec = execute::execute_plan(
+                &plan,
+                &platform,
+                dry_run,
+                r5_target,
+                |reclaimed, gain| {
+                    pressure::should_trigger_hold(reclaimed, gain, &config.reclaim_hold)
+                },
+                None,
+            );
 
             if !dry_run {
                 state.pressure = current_pressure;
+                if let Some(hold) = exec.triggered_hold {
+                    plan.hold_active = true;
+                    state.reclaim_hold = Some(hold);
+                }
                 state.record_scan_targets(
                     &snapshot.targets,
                     snapshot.captured_at_unix,
                     true,
                     snapshot.walk_partial,
                 );
-                state.apply_receipts(&receipts);
-                store::append_receipts(&state_dir, &receipts)?;
+                state.apply_receipts(&exec.receipts);
+                store::append_receipts(&state_dir, &exec.receipts)?;
                 state_cache.save(&state)?;
             }
 
-            report::write_reclaim_report(&plan, &receipts, dry_run, cli.format, stdout)?;
+            report::write_reclaim_report(&plan, &exec.receipts, dry_run, cli.format, stdout)?;
 
-            let any_failed = receipts
+            let any_failed = exec
+                .receipts
                 .iter()
                 .any(|r| matches!(r.outcome, ActionOutcome::Failed { .. }));
             if any_failed {
@@ -286,14 +303,58 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
             report::write_history_report(&receipts, cli.format, stdout)?;
             Ok(ExitCode::SUCCESS)
         }
-        Command::Pin { .. } => Err(AppError::NotImplemented {
-            command: "pin",
-            stage: "Stage 3",
-        }),
-        Command::Unpin { .. } => Err(AppError::NotImplemented {
-            command: "unpin",
-            stage: "Stage 3",
-        }),
+        Command::Pin {
+            path,
+            allow_sweep,
+            note,
+        } => {
+            let platform = default_platform();
+            ensure_non_root(&platform)?;
+            if !path.exists() {
+                return Err(AppError::InvalidPath {
+                    path,
+                    message: "path to pin does not exist".to_owned(),
+                });
+            }
+            let canonical =
+                std::fs::canonicalize(&path).map_err(|error| AppError::InvalidPath {
+                    path: path.clone(),
+                    message: format!("cannot resolve path: {error}"),
+                })?;
+            let home = resolve_home()?;
+            let state_dir = store::resolve_state_dir(&home);
+            let _run_lock = store::acquire_run_lock(&state_dir, CLI_RUN_LOCK_RETRY_TIMEOUT)?;
+            let mut state_cache = StateCache::new(state_dir);
+            let mut state = state_cache.load()?;
+            let scope = if allow_sweep {
+                PinScope::AllowSweep
+            } else {
+                PinScope::Full
+            };
+            state.add_pin(canonical.clone(), scope, note.clone(), platform.now_unix());
+            state_cache.save(&state)?;
+            report::write_pin_report(&canonical, scope, note.as_deref(), cli.format, stdout)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Unpin { path } => {
+            let platform = default_platform();
+            ensure_non_root(&platform)?;
+            let normalized = platform::normalize_macos_system_symlinks(&path);
+            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| normalized.clone());
+            let home = resolve_home()?;
+            let state_dir = store::resolve_state_dir(&home);
+            let _run_lock = store::acquire_run_lock(&state_dir, CLI_RUN_LOCK_RETRY_TIMEOUT)?;
+            let mut state_cache = StateCache::new(state_dir);
+            let mut state = state_cache.load()?;
+            let removed = state.remove_pin(&canonical)
+                || state.remove_pin(&normalized)
+                || state.remove_pin(&path);
+            if removed {
+                state_cache.save(&state)?;
+            }
+            report::write_unpin_report(&canonical, removed, cli.format, stdout)?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Watch { .. } => Err(AppError::NotImplemented {
             command: "watch",
             stage: "Stage 4",
@@ -326,7 +387,7 @@ fn resolve_home() -> Result<PathBuf, AppError> {
 fn apply_readonly_hold_check(
     state: &State,
     snapshot: &model::ScanSnapshot,
-    current_pressure: model::DiskPressure,
+    current_pressure: DiskPressure,
     config: &Config,
 ) -> State {
     let mut effective = state.clone();

@@ -13,37 +13,126 @@ use compact_str::CompactString;
 
 use crate::error::AppError;
 use crate::model::{
-    ActionOutcome, ActionReceipt, DiskPressure, IncrementalRemoval, MountEntry, ProcessEntry,
-    ProcessSnapshot, ReclaimAction, ReclaimPlan, SweepOps, V1UnitRemoval, V2UnitRemoval,
+    ActionOutcome, ActionReceipt, DiskPressure, EvictRule, IncrementalRemoval, ProcessSnapshot,
+    ReclaimAction, ReclaimHoldState, ReclaimPlan, SweepOps, V1UnitRemoval, V2UnitRemoval,
 };
-use crate::platform::{DEFAULT_VOLUME_MOUNT, LockProbe, Platform};
+use crate::platform::{
+    DEFAULT_VOLUME_MOUNT, LockProbe, Platform, crosses_mount_boundary, has_symlink_boundary,
+};
 
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 const STAGING_MARKER: &str = ".targetwarden-reap.";
+const PIN_MARKER_FILE: &str = ".targetwarden-pin";
 
-/// Execute all actions in a `ReclaimPlan`, honoring `dry_run` and optional cooperative stop flag.
-pub(crate) fn execute_plan(
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionOutcome {
+    pub receipts: Vec<ActionReceipt>,
+    pub triggered_hold: Option<ReclaimHoldState>,
+}
+
+/// Execute all actions in a `ReclaimPlan`, honoring `dry_run`, optional cooperative stop flag,
+/// live `statvfs` headroom stop for `R5`, and APFS `ReclaimHoldState` circuit breaker.
+pub(crate) fn execute_plan<F>(
     plan: &ReclaimPlan,
     platform: &impl Platform,
     dry_run: bool,
+    r5_target_free_bytes: Option<u64>,
+    should_trip_hold: F,
     stop_flag: Option<&AtomicBool>,
-) -> Vec<ActionReceipt> {
+) -> ExecutionOutcome
+where
+    F: Fn(u64, u64) -> bool,
+{
     let mut receipts = Vec::with_capacity(plan.actions.len());
+    let mut r5_reclaimed_allocated: u64 = 0;
+    let mut r5_free_before_first: Option<u64> = None;
+    let mut r5_halted = false;
+    let mut triggered_hold: Option<ReclaimHoldState> = None;
+
     for action in &plan.actions {
-        if stop_flag.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        if stop_flag.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             break;
         }
-        receipts.push(execute_action(action, platform, plan.pressure, dry_run));
+        let is_r5 = matches!(
+            action,
+            ReclaimAction::EvictTarget {
+                rule: EvictRule::R5PressureLru,
+                ..
+            }
+        );
+        if is_r5 && !dry_run {
+            if r5_halted || triggered_hold.is_some() {
+                continue;
+            }
+            if let Some(target_free) = r5_target_free_bytes
+                && let Some(free_now) = current_free_bytes_opt(platform)
+            {
+                if free_now >= target_free {
+                    r5_halted = true;
+                    continue;
+                }
+                r5_free_before_first.get_or_insert(free_now);
+            }
+        }
+
+        let receipt = execute_action_with_disk_free(
+            action,
+            platform,
+            plan.pressure,
+            dry_run,
+            Some(plan.disk.free_bytes),
+        );
+
+        if is_r5 && !dry_run && matches!(receipt.outcome, ActionOutcome::Applied) {
+            r5_reclaimed_allocated = r5_reclaimed_allocated.saturating_add(receipt.allocated_bytes);
+            let baseline = *r5_free_before_first.get_or_insert(receipt.free_before_bytes);
+            if let Some(free_now) = current_free_bytes_opt(platform) {
+                let observed_gain = free_now.saturating_sub(baseline);
+                if should_trip_hold(r5_reclaimed_allocated, observed_gain) {
+                    let snapshots_at_detection = current_disk_stats(platform)
+                        .and_then(|d| d.local_snapshots)
+                        .unwrap_or_default();
+                    triggered_hold = Some(ReclaimHoldState {
+                        detected_at_unix: platform.now_unix(),
+                        reclaimed_allocated_bytes: r5_reclaimed_allocated,
+                        observed_free_gain_bytes: observed_gain,
+                        free_bytes_at_detection: free_now,
+                        pressure_at_detection: plan.pressure,
+                        snapshots_at_detection,
+                    });
+                    r5_halted = true;
+                } else if r5_target_free_bytes.is_some_and(|target_free| free_now >= target_free) {
+                    r5_halted = true;
+                }
+            }
+        }
+
+        receipts.push(receipt);
     }
-    receipts
+
+    ExecutionOutcome {
+        receipts,
+        triggered_hold,
+    }
 }
 
 /// Execute one `ReclaimAction` under the full TOCTOU-safe protocol.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn execute_action(
     action: &ReclaimAction,
     platform: &impl Platform,
     pressure: DiskPressure,
     dry_run: bool,
+) -> ActionReceipt {
+    execute_action_with_disk_free(action, platform, pressure, dry_run, None)
+}
+
+fn execute_action_with_disk_free(
+    action: &ReclaimAction,
+    platform: &impl Platform,
+    pressure: DiskPressure,
+    dry_run: bool,
+    known_free_bytes: Option<u64>,
 ) -> ActionReceipt {
     let started = Instant::now();
     let ts_unix = platform.now_unix();
@@ -55,7 +144,7 @@ pub(crate) fn execute_action(
     let planned_units = action.unit_count();
 
     if dry_run {
-        let free_now = current_free_bytes(platform);
+        let free_now = known_free_bytes.unwrap_or_else(|| current_free_bytes(platform));
         return ActionReceipt {
             ts_unix,
             rule,
@@ -83,6 +172,8 @@ pub(crate) fn execute_action(
             target_dev,
             target_ino,
             expected_activity_unix,
+            expected_target_activity_unix,
+            worktree_root,
             profile_rel,
             profile_locks,
             ops,
@@ -92,6 +183,8 @@ pub(crate) fn execute_action(
             *target_dev,
             *target_ino,
             *expected_activity_unix,
+            *expected_target_activity_unix,
+            worktree_root.as_deref(),
             profile_rel,
             profile_locks,
             ops,
@@ -103,6 +196,7 @@ pub(crate) fn execute_action(
             target_dev,
             target_ino,
             expected_doc_mtime_unix,
+            worktree_root,
             locks,
             estimated_allocated_bytes,
         } => execute_remove_doc(
@@ -110,6 +204,7 @@ pub(crate) fn execute_action(
             *target_dev,
             *target_ino,
             *expected_doc_mtime_unix,
+            worktree_root.as_deref(),
             locks,
             *estimated_allocated_bytes,
             platform,
@@ -119,6 +214,8 @@ pub(crate) fn execute_action(
             target_dev,
             target_ino,
             expected_activity_unix,
+            expected_target_activity_unix,
+            worktree_root,
             profile_rel,
             profile_locks,
             removals,
@@ -128,9 +225,30 @@ pub(crate) fn execute_action(
             *target_dev,
             *target_ino,
             *expected_activity_unix,
+            *expected_target_activity_unix,
+            worktree_root.as_deref(),
             profile_rel,
             profile_locks,
             removals,
+            *estimated_allocated_bytes,
+            platform,
+        ),
+        ReclaimAction::EvictTarget {
+            target_root,
+            target_dev,
+            target_ino,
+            expected_activity_unix,
+            worktree_root,
+            all_locks,
+            estimated_allocated_bytes,
+            ..
+        } => execute_evict_target(
+            target_root,
+            *target_dev,
+            *target_ino,
+            *expected_activity_unix,
+            worktree_root.as_deref(),
+            all_locks,
             *estimated_allocated_bytes,
             platform,
         ),
@@ -155,15 +273,24 @@ pub(crate) fn execute_action(
     }
 }
 
-fn current_free_bytes(platform: &impl Platform) -> u64 {
-    let mount = if Path::new(DEFAULT_VOLUME_MOUNT).exists() {
+fn default_volume_path() -> &'static Path {
+    if Path::new(DEFAULT_VOLUME_MOUNT).exists() {
         Path::new(DEFAULT_VOLUME_MOUNT)
     } else {
         Path::new("/")
-    };
-    platform
-        .disk_stats(mount)
-        .map_or(0, |stats| stats.free_bytes)
+    }
+}
+
+fn current_disk_stats(platform: &impl Platform) -> Option<crate::model::DiskStats> {
+    platform.disk_stats(default_volume_path()).ok()
+}
+
+fn current_free_bytes_opt(platform: &impl Platform) -> Option<u64> {
+    platform.free_bytes(default_volume_path()).ok()
+}
+
+fn current_free_bytes(platform: &impl Platform) -> u64 {
+    current_free_bytes_opt(platform).unwrap_or(0)
 }
 
 fn execute_reap_staging(
@@ -261,6 +388,8 @@ fn execute_sweep_build_units(
     target_dev: u64,
     target_ino: u64,
     expected_activity_unix: u64,
+    expected_target_activity_unix: u64,
+    worktree_root: Option<&Path>,
     profile_rel: &Path,
     profile_locks: &[PathBuf],
     ops: &SweepOps,
@@ -279,8 +408,12 @@ fn execute_sweep_build_units(
         target_ino,
         &profile_dir,
         expected_activity_unix,
+        Some(expected_target_activity_unix),
+        worktree_root,
         platform,
-        |proc_snap| has_blocking_process_for_sweep(proc_snap, target_root, &profile_dir, ops),
+        |proc_snap| {
+            has_blocking_process_for_sweep(proc_snap, target_root, worktree_root, &profile_dir, ops)
+        },
     ) {
         release_locks(held_locks);
         return (outcome, 0, 0);
@@ -346,6 +479,7 @@ fn execute_remove_doc(
     target_dev: u64,
     target_ino: u64,
     expected_doc_mtime_unix: u64,
+    worktree_root: Option<&Path>,
     locks: &[PathBuf],
     estimated_allocated_bytes: u64,
     platform: &impl Platform,
@@ -362,11 +496,27 @@ fn execute_remove_doc(
         target_ino,
         &doc_dir,
         expected_doc_mtime_unix,
+        None,
+        worktree_root,
         platform,
-        |proc_snap| has_hard_blocked_process_in_dir(proc_snap, &doc_dir),
+        |proc_snap| {
+            has_hard_blocked_process_for_target(proc_snap, target_root, worktree_root, &doc_dir)
+        },
     ) {
         release_locks(held_locks);
         return (outcome, 0, 0);
+    }
+    if let Ok(lock_meta) = fs::symlink_metadata(doc_dir.join(".lock"))
+        && meta_mtime_unix(&lock_meta) > expected_doc_mtime_unix
+    {
+        release_locks(held_locks);
+        return (
+            ActionOutcome::SkippedRevalidateChanged {
+                reason: CompactString::new("doc_lock_mtime_advanced"),
+            },
+            0,
+            0,
+        );
     }
 
     let staging_dir = match create_internal_staging_dir(target_root, target_dev) {
@@ -425,6 +575,8 @@ fn execute_prune_incremental(
     target_dev: u64,
     target_ino: u64,
     expected_activity_unix: u64,
+    expected_target_activity_unix: u64,
+    worktree_root: Option<&Path>,
     profile_rel: &Path,
     profile_locks: &[PathBuf],
     removals: &[IncrementalRemoval],
@@ -475,8 +627,12 @@ fn execute_prune_incremental(
         target_ino,
         &inc_root,
         expected_activity_unix,
+        Some(expected_target_activity_unix),
+        worktree_root,
         platform,
-        |proc_snap| has_hard_blocked_process_in_dir(proc_snap, &inc_root),
+        |proc_snap| {
+            has_hard_blocked_process_for_target(proc_snap, target_root, worktree_root, &inc_root)
+        },
     ) {
         release_locks(held_locks);
         return (outcome, 0, 0);
@@ -584,6 +740,168 @@ fn execute_prune_incremental(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_evict_target(
+    target_root: &Path,
+    target_dev: u64,
+    target_ino: u64,
+    expected_activity_unix: u64,
+    worktree_root: Option<&Path>,
+    all_locks: &[PathBuf],
+    estimated_allocated_bytes: u64,
+    platform: &impl Platform,
+) -> (ActionOutcome, u32, u64) {
+    let Some(parent_dir) = target_root.parent() else {
+        return (
+            ActionOutcome::Failed {
+                error: CompactString::new("refusing to evict filesystem root"),
+            },
+            0,
+            0,
+        );
+    };
+    let Some(leaf_name) = target_root.file_name().and_then(|n| n.to_str()) else {
+        return (
+            ActionOutcome::Failed {
+                error: CompactString::new("target directory name is not valid UTF-8"),
+            },
+            0,
+            0,
+        );
+    };
+
+    let held_locks = match acquire_sorted_locks(all_locks, platform) {
+        Ok(locks) => locks,
+        Err(outcome) => return (outcome, 0, 0),
+    };
+
+    if let Err(outcome) = revalidate_target_under_lock(
+        target_root,
+        target_dev,
+        target_ino,
+        target_root,
+        expected_activity_unix,
+        Some(expected_activity_unix),
+        worktree_root,
+        platform,
+        |proc_snap| has_any_process_for_eviction(proc_snap, target_root, worktree_root),
+    ) {
+        release_locks(held_locks);
+        return (outcome, 0, 0);
+    }
+
+    // Atomic sibling staging rename on same APFS volume: `<parent>/<name>` -> `<parent>/.<name>.targetwarden-reap.<pid>.<seq>`
+    let pid = std::process::id();
+    let mut staged_path: Option<PathBuf> = None;
+    let mut rename_error: Option<String> = None;
+    for _ in 0..32 {
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let staging_name = format!(".{leaf_name}.targetwarden-reap.{pid}.{seq}");
+        let candidate = parent_dir.join(&staging_name);
+        if fs::symlink_metadata(&candidate).is_ok() {
+            continue;
+        }
+        match rename_entry_atomic(parent_dir, leaf_name, parent_dir, &staging_name) {
+            Ok(true) => {
+                staged_path = Some(candidate);
+                break;
+            }
+            Ok(false) => {
+                release_locks(held_locks);
+                return (
+                    ActionOutcome::SkippedRevalidateChanged {
+                        reason: CompactString::new("target_already_absent"),
+                    },
+                    0,
+                    0,
+                );
+            }
+            Err(error) => {
+                rename_error = Some(format!("sibling staging rename failed: {error}"));
+                break;
+            }
+        }
+    }
+
+    // Release all parent + nested locks immediately after the atomic rename.
+    release_locks(held_locks);
+
+    if let Some(error) = rename_error {
+        return (
+            ActionOutcome::Failed {
+                error: CompactString::from(error),
+            },
+            0,
+            0,
+        );
+    }
+
+    let Some(sibling_staging) = staged_path else {
+        return (
+            ActionOutcome::Failed {
+                error: CompactString::new("exhausted unique sibling staging names"),
+            },
+            0,
+            0,
+        );
+    };
+
+    match remove_tree_safe(&sibling_staging, target_dev) {
+        Ok(()) => (ActionOutcome::Applied, 1, estimated_allocated_bytes),
+        Err(error) => (
+            ActionOutcome::Failed {
+                error: CompactString::from(format!(
+                    "safe remove of evicted target failed: {error}"
+                )),
+            },
+            0,
+            0,
+        ),
+    }
+}
+
+fn has_any_process_for_eviction(
+    proc_snap: &ProcessSnapshot,
+    target_root: &Path,
+    worktree_root: Option<&Path>,
+) -> Option<CompactString> {
+    for proc_entry in &proc_snap.processes {
+        if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
+            continue;
+        }
+        if proc_entry
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.starts_with(target_root))
+            || proc_entry
+                .open_paths
+                .iter()
+                .any(|open| open.starts_with(target_root))
+        {
+            return Some(CompactString::from(format!(
+                "process_in_target:{}",
+                proc_entry.comm
+            )));
+        }
+        if let Some(wt) = worktree_root
+            && (proc_entry
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| cwd.starts_with(wt))
+                || proc_entry
+                    .open_paths
+                    .iter()
+                    .any(|open| open.starts_with(wt)))
+        {
+            return Some(CompactString::from(format!(
+                "process_in_worktree:{}",
+                proc_entry.comm
+            )));
+        }
+    }
+    None
+}
+
 fn release_locks(held: Vec<File>) {
     for file in &held {
         let _ = file.unlock();
@@ -627,12 +945,15 @@ fn acquire_sorted_locks(
     Ok(held)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn revalidate_target_under_lock<F>(
     target_root: &Path,
     expected_dev: u64,
     expected_ino: u64,
     activity_dir: &Path,
     expected_mtime_unix: u64,
+    expected_target_mtime_unix: Option<u64>,
+    worktree_root: Option<&Path>,
     platform: &impl Platform,
     proc_blocked: F,
 ) -> Result<(), ActionOutcome>
@@ -653,20 +974,34 @@ where
             reason: CompactString::new("target_inode_changed"),
         });
     }
+    if has_symlink_boundary(target_root) {
+        return Err(ActionOutcome::SkippedRevalidateChanged {
+            reason: CompactString::new("symlink_boundary_detected"),
+        });
+    }
 
-    // Revalidate mount table (fail-closed)
+    // Revalidate pin marker wasn't created after scan (TOCTOU fail-closed)
+    if fs::symlink_metadata(target_root.join(PIN_MARKER_FILE)).is_ok()
+        || worktree_root.is_some_and(|wt| fs::symlink_metadata(wt.join(PIN_MARKER_FILE)).is_ok())
+    {
+        return Err(ActionOutcome::SkippedRevalidateChanged {
+            reason: CompactString::new("pin_marker_appeared"),
+        });
+    }
+
+    // Revalidate mount table using single-owner boundary validator (fail-closed)
     let mounts = platform
         .mount_table()
         .map_err(|_| ActionOutcome::SkippedRevalidateChanged {
             reason: CompactString::new("mount_table_unavailable"),
         })?;
-    if target_crosses_mount(target_root, expected_dev, &mounts) {
+    if crosses_mount_boundary(target_root, expected_dev, Some(&mounts)) {
         return Err(ActionOutcome::SkippedRevalidateChanged {
             reason: CompactString::new("mount_boundary_detected"),
         });
     }
 
-    // Revalidate mtime did not advance on the activity root (or `.rustc_info.json`)
+    // Revalidate mtime did not advance on the activity dir (and `.rustc_info.json` vs target mtime)
     if let Ok(act_meta) = fs::symlink_metadata(activity_dir)
         && meta_mtime_unix(&act_meta) > expected_mtime_unix
     {
@@ -674,8 +1009,9 @@ where
             reason: CompactString::new("mtime_advanced"),
         });
     }
-    if let Ok(ri_meta) = fs::symlink_metadata(target_root.join(".rustc_info.json"))
-        && meta_mtime_unix(&ri_meta) > expected_mtime_unix
+    if let Some(target_mtime) = expected_target_mtime_unix
+        && let Ok(ri_meta) = fs::symlink_metadata(target_root.join(".rustc_info.json"))
+        && meta_mtime_unix(&ri_meta) > target_mtime
     {
         return Err(ActionOutcome::SkippedRevalidateChanged {
             reason: CompactString::new("rustc_info_mtime_advanced"),
@@ -696,30 +1032,10 @@ where
     Ok(())
 }
 
-fn target_crosses_mount(target_root: &Path, target_dev: u64, mounts: &[MountEntry]) -> bool {
-    if let Some(parent) = target_root.parent() {
-        let Ok(pmeta) = fs::symlink_metadata(parent) else {
-            return true;
-        };
-        if meta_dev(&pmeta) != target_dev {
-            return true;
-        }
-    }
-    for entry in mounts {
-        let mp = entry.mount_point.as_path();
-        if mp == Path::new("/") || mp == Path::new(DEFAULT_VOLUME_MOUNT) {
-            continue;
-        }
-        if mp == target_root || mp.starts_with(target_root) {
-            return true;
-        }
-    }
-    false
-}
-
 fn has_blocking_process_for_sweep(
     proc_snap: &ProcessSnapshot,
     target_root: &Path,
+    worktree_root: Option<&Path>,
     profile_dir: &Path,
     ops: &SweepOps,
 ) -> Option<CompactString> {
@@ -727,7 +1043,7 @@ fn has_blocking_process_for_sweep(
         if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
             continue;
         }
-        let is_pm_srv = is_proc_macro_srv(proc_entry);
+        let is_pm_srv = proc_entry.is_rust_analyzer_proc_macro_srv();
         if proc_entry
             .cwd
             .as_deref()
@@ -750,6 +1066,80 @@ fn has_blocking_process_for_sweep(
             }
             return Some(CompactString::from(format!(
                 "process_open_in_target:{}",
+                proc_entry.comm
+            )));
+        }
+        if let Some(wt) = worktree_root
+            && proc_entry.is_active_compiler_or_tool()
+            && (proc_entry
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| cwd.starts_with(wt))
+                || proc_entry
+                    .open_paths
+                    .iter()
+                    .any(|open| open.starts_with(wt)))
+        {
+            return Some(CompactString::from(format!(
+                "compiler_in_worktree:{}",
+                proc_entry.comm
+            )));
+        }
+    }
+    None
+}
+
+fn has_hard_blocked_process_for_target(
+    proc_snap: &ProcessSnapshot,
+    target_root: &Path,
+    worktree_root: Option<&Path>,
+    action_dir: &Path,
+) -> Option<CompactString> {
+    for proc_entry in &proc_snap.processes {
+        if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
+            continue;
+        }
+        let is_pm_srv = proc_entry.is_rust_analyzer_proc_macro_srv();
+        if proc_entry
+            .cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd.starts_with(target_root) || cwd.starts_with(action_dir))
+        {
+            return Some(CompactString::from(format!(
+                "process_cwd_in_target:{}",
+                proc_entry.comm
+            )));
+        }
+        for open in &proc_entry.open_paths {
+            if open.starts_with(action_dir) {
+                return Some(CompactString::from(format!(
+                    "process_open_in_dir:{}",
+                    proc_entry.comm
+                )));
+            }
+            if open.starts_with(target_root) {
+                if is_pm_srv && open.extension().and_then(|e| e.to_str()) == Some("dylib") {
+                    continue;
+                }
+                return Some(CompactString::from(format!(
+                    "process_open_in_target:{}",
+                    proc_entry.comm
+                )));
+            }
+        }
+        if let Some(wt) = worktree_root
+            && proc_entry.is_active_compiler_or_tool()
+            && (proc_entry
+                .cwd
+                .as_deref()
+                .is_some_and(|cwd| cwd.starts_with(wt))
+                || proc_entry
+                    .open_paths
+                    .iter()
+                    .any(|open| open.starts_with(wt)))
+        {
+            return Some(CompactString::from(format!(
+                "compiler_in_worktree:{}",
                 proc_entry.comm
             )));
         }
@@ -791,15 +1181,12 @@ fn path_hits_swept_unit(path: &Path, profile_dir: &Path, ops: &SweepOps) -> bool
     }
 }
 
-fn has_hard_blocked_process_in_dir(
-    proc_snap: &ProcessSnapshot,
-    dir: &Path,
-) -> Option<CompactString> {
-    for proc_entry in &proc_snap.processes {
+fn any_process_in_dir(proc_snap: &ProcessSnapshot, dir: &Path) -> bool {
+    proc_snap.processes.iter().any(|proc_entry| {
         if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
-            continue;
+            return false;
         }
-        if proc_entry
+        proc_entry
             .cwd
             .as_deref()
             .is_some_and(|cwd| cwd.starts_with(dir))
@@ -807,30 +1194,7 @@ fn has_hard_blocked_process_in_dir(
                 .open_paths
                 .iter()
                 .any(|open| open.starts_with(dir))
-        {
-            return Some(CompactString::from(format!(
-                "process_active_in_dir:{}",
-                proc_entry.comm
-            )));
-        }
-    }
-    None
-}
-
-fn any_process_in_dir(proc_snap: &ProcessSnapshot, dir: &Path) -> bool {
-    has_hard_blocked_process_in_dir(proc_snap, dir).is_some()
-}
-
-fn is_proc_macro_srv(proc_entry: &ProcessEntry) -> bool {
-    let matches =
-        |s: &str| s == "rust-analyzer-proc-macro-srv" || s.starts_with("rust-analyzer-proc-macro");
-    matches(proc_entry.comm.as_str())
-        || proc_entry
-            .exe_path
-            .as_deref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .is_some_and(matches)
+    })
 }
 
 fn stage_sweep_ops(
@@ -1388,6 +1752,8 @@ mod tests {
             target_dev: dev,
             target_ino: ino,
             expected_activity_unix: future_mtime,
+            expected_target_activity_unix: future_mtime,
+            worktree_root: None,
             profile_rel: PathBuf::from("debug"),
             profile_locks: plocks.clone(),
             ops: SweepOps::V2(vec![V2UnitRemoval {
@@ -1419,6 +1785,7 @@ mod tests {
             target_dev: dev,
             target_ino: ino,
             expected_doc_mtime_unix: future_mtime,
+            worktree_root: None,
             locks: dlocks,
             estimated_allocated_bytes: 100,
         };
@@ -1436,6 +1803,8 @@ mod tests {
             target_dev: dev,
             target_ino: ino,
             expected_activity_unix: future_mtime,
+            expected_target_activity_unix: future_mtime,
+            worktree_root: None,
             profile_rel: PathBuf::from("debug"),
             profile_locks: plocks,
             removals: vec![IncrementalRemoval::WholeCrateDir {
@@ -1498,6 +1867,8 @@ mod tests {
             target_dev: dev,
             target_ino: ino,
             expected_activity_unix: future_mtime,
+            expected_target_activity_unix: future_mtime,
+            worktree_root: None,
             profile_rel: PathBuf::from("debug"),
             profile_locks: SmallVec::new(),
             ops: SweepOps::V1(vec![V1UnitRemoval {
@@ -1527,6 +1898,8 @@ mod tests {
             target_dev: dev,
             target_ino: ino,
             expected_activity_unix: future_mtime,
+            expected_target_activity_unix: future_mtime,
+            worktree_root: None,
             profile_rel: PathBuf::from("debug"),
             profile_locks: SmallVec::new(),
             ops: SweepOps::V1(vec![V1UnitRemoval {
@@ -1545,5 +1918,301 @@ mod tests {
         ));
         assert!(debug.join("build/other-1111111111111111").exists());
         assert!(debug.join("deps/libother-1111111111111111.rlib").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn evict_target_checks_nested_lock_worktree_process_and_trips_apfs_hold() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        use super::execute_plan;
+        use crate::model::{EvictRule, ProcessEntry, ReclaimPlan};
+
+        struct DynamicPlatform {
+            now: u64,
+            free_bytes: AtomicU64,
+            procs: Vec<ProcessEntry>,
+        }
+
+        impl Platform for DynamicPlatform {
+            fn euid(&self) -> Result<u32, AppError> {
+                Ok(501)
+            }
+            fn now_unix(&self) -> u64 {
+                self.now
+            }
+            fn disk_stats(&self, volume: &Path) -> Result<DiskStats, AppError> {
+                Ok(DiskStats {
+                    mount: volume.to_path_buf(),
+                    total_bytes: 460 * GIB,
+                    free_bytes: self.free_bytes.load(Ordering::Relaxed),
+                    local_snapshots: Some(vec![CompactString::new("com.apple.os.update-test")]),
+                })
+            }
+            fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
+                Ok(ProcessSnapshot {
+                    captured_at_unix: self.now,
+                    self_pid: std::process::id(),
+                    processes: self.procs.clone(),
+                })
+            }
+            fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
+                Ok(vec![MountEntry {
+                    source: CompactString::new("/dev/disk3s5"),
+                    mount_point: PathBuf::from("/"),
+                    fstype: CompactString::new("apfs"),
+                }])
+            }
+            fn run_git(&self, _cwd: &Path, _args: &[&str]) -> Result<CommandOutput, AppError> {
+                Err(AppError::CommandFailed {
+                    program: "git",
+                    message: "unused".to_owned(),
+                })
+            }
+            fn try_lock_readonly(&self, path: &Path) -> Result<LockProbe, AppError> {
+                RealLockTestPlatform { now: self.now }.try_lock_readonly(path)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let wt1 = base.join("wt1");
+        let t1 = wt1.join("target");
+        let nested_lock = t1.join("grpc-codegen/debug/.cargo-build-lock");
+        fs::create_dir_all(nested_lock.parent().unwrap()).unwrap();
+        fs::write(&nested_lock, b"").unwrap();
+        fs::write(wt1.join("Cargo.toml"), b"[package]\nname=\"wt1\"\n").unwrap();
+
+        let t2 = base.join("wt2/target");
+        fs::create_dir_all(t2.join("debug")).unwrap();
+
+        let m1 = fs::symlink_metadata(&t1).unwrap();
+        let m2 = fs::symlink_metadata(&t2).unwrap();
+        let future = meta_mtime_unix(&m1).max(meta_mtime_unix(&m2)) + 1000;
+
+        let evict1 = ReclaimAction::EvictTarget {
+            rule: EvictRule::R5PressureLru,
+            target_root: t1.clone(),
+            target_dev: meta_dev(&m1),
+            target_ino: meta_ino(&m1),
+            expected_activity_unix: future,
+            worktree_root: Some(wt1.clone()),
+            all_locks: vec![nested_lock.clone()],
+            estimated_allocated_bytes: 6 * GIB,
+            reason: CompactString::new("pressure_lru_linked_worktree"),
+        };
+        let evict2 = ReclaimAction::EvictTarget {
+            rule: EvictRule::R5PressureLru,
+            target_root: t2.clone(),
+            target_dev: meta_dev(&m2),
+            target_ino: meta_ino(&m2),
+            expected_activity_unix: future,
+            worktree_root: None,
+            all_locks: vec![],
+            estimated_allocated_bytes: 6 * GIB,
+            reason: CompactString::new("pressure_lru_non_git"),
+        };
+
+        // 1. Live nested lock blocks parent eviction
+        let holder = fs::File::open(&nested_lock).unwrap();
+        holder.try_lock().unwrap();
+        let clean_plat = DynamicPlatform {
+            now: future,
+            free_bytes: AtomicU64::new(40 * GIB),
+            procs: vec![],
+        };
+        let r_locked = execute_action(&evict1, &clean_plat, DiskPressure::High, false);
+        assert!(matches!(
+            r_locked.outcome,
+            ActionOutcome::SkippedContested { .. }
+        ));
+        assert!(t1.exists());
+        holder.unlock().unwrap();
+        drop(holder);
+
+        // 2. Live process in worktree aborts eviction at post-lock lsof revalidation
+        let busy_plat = DynamicPlatform {
+            now: future,
+            free_bytes: AtomicU64::new(40 * GIB),
+            procs: vec![ProcessEntry {
+                pid: 7777,
+                comm: CompactString::new("zsh"),
+                exe_path: None,
+                cwd: Some(wt1.clone()),
+                open_paths: vec![],
+            }],
+        };
+        let r_proc = execute_action(&evict1, &busy_plat, DiskPressure::High, false);
+        assert!(matches!(
+            r_proc.outcome,
+            ActionOutcome::SkippedRevalidateChanged { .. }
+        ));
+        assert!(t1.exists());
+
+        // 3. Plan with 2 x 6 GiB R5 actions where statvfs free stays 40 GiB (APFS snapshot holds blocks!):
+        //    First evicts cleanly -> trips ReclaimHoldState -> second R5 action is HALTED!
+        let plan = ReclaimPlan {
+            generated_at_unix: future,
+            disk: DiskStats {
+                mount: PathBuf::from("/System/Volumes/Data"),
+                total_bytes: 460 * GIB,
+                free_bytes: 40 * GIB,
+                local_snapshots: Some(vec![CompactString::new("com.apple.os.update-test")]),
+            },
+            pressure: DiskPressure::High,
+            hold_active: false,
+            actions: vec![evict1, evict2],
+            estimated_allocated_bytes: 12 * GIB,
+        };
+        let outcome = execute_plan(
+            &plan,
+            &clean_plat,
+            false,
+            Some(55 * GIB),
+            |reclaimed, gain| reclaimed >= 5 * GIB && gain * 5 < reclaimed,
+            None,
+        );
+        assert_eq!(outcome.receipts.len(), 1);
+        assert_eq!(outcome.receipts[0].outcome, ActionOutcome::Applied);
+        assert!(outcome.triggered_hold.is_some());
+        assert!(!t1.exists());
+        assert!(wt1.join("Cargo.toml").exists()); // Source files untouched!
+        assert!(t2.exists()); // Second R5 target halted by APFS hold circuit breaker!
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revalidation_allows_newer_rustc_info_for_doc_and_blocks_worktree_compiler_or_pin_marker() {
+        use crate::model::ProcessEntry;
+
+        struct ProcPlatform {
+            now: u64,
+            procs: Vec<ProcessEntry>,
+        }
+        impl Platform for ProcPlatform {
+            fn euid(&self) -> Result<u32, AppError> {
+                Ok(501)
+            }
+            fn now_unix(&self) -> u64 {
+                self.now
+            }
+            fn disk_stats(&self, volume: &Path) -> Result<DiskStats, AppError> {
+                Ok(DiskStats {
+                    mount: volume.to_path_buf(),
+                    total_bytes: 460 * GIB,
+                    free_bytes: 100 * GIB,
+                    local_snapshots: Some(vec![]),
+                })
+            }
+            fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
+                Ok(ProcessSnapshot {
+                    captured_at_unix: self.now,
+                    self_pid: std::process::id(),
+                    processes: self.procs.clone(),
+                })
+            }
+            fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
+                Ok(vec![MountEntry {
+                    source: CompactString::new("/dev/disk3s5"),
+                    mount_point: PathBuf::from("/"),
+                    fstype: CompactString::new("apfs"),
+                }])
+            }
+            fn run_git(&self, _cwd: &Path, _args: &[&str]) -> Result<CommandOutput, AppError> {
+                Err(AppError::CommandFailed {
+                    program: "git",
+                    message: "unused".to_owned(),
+                })
+            }
+            fn try_lock_readonly(&self, path: &Path) -> Result<LockProbe, AppError> {
+                RealLockTestPlatform { now: self.now }.try_lock_readonly(path)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let wt = base.join("proj");
+        let root = wt.join("target");
+        fs::create_dir_all(root.join("doc")).unwrap();
+        fs::create_dir_all(root.join("debug/build/demo/aaaaaaaaaaaaaaaa")).unwrap();
+        // Make `.rustc_info.json` 1 hour newer than `doc/` and `debug/` deterministically without subprocesses.
+        let future_ts = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let ri_path = root.join(".rustc_info.json");
+        fs::write(&ri_path, b"{}").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&ri_path)
+            .unwrap()
+            .set_modified(future_ts)
+            .unwrap();
+
+        let tmeta = fs::symlink_metadata(&root).unwrap();
+        let doc_meta = fs::symlink_metadata(root.join("doc")).unwrap();
+        let debug_meta = fs::symlink_metadata(root.join("debug")).unwrap();
+        let ri_meta = fs::symlink_metadata(root.join(".rustc_info.json")).unwrap();
+        let dev = meta_dev(&tmeta);
+        let ino = meta_ino(&tmeta);
+
+        // 1. RemoveDoc must SUCCEED even though `.rustc_info.json` is years newer than `target/doc/`.
+        let doc_action = ReclaimAction::RemoveDoc {
+            target_root: root.clone(),
+            target_dev: dev,
+            target_ino: ino,
+            expected_doc_mtime_unix: meta_mtime_unix(&doc_meta),
+            worktree_root: Some(wt.clone()),
+            locks: SmallVec::new(),
+            estimated_allocated_bytes: 100,
+        };
+        let clean_plat = ProcPlatform {
+            now: meta_mtime_unix(&ri_meta) + 100,
+            procs: vec![],
+        };
+        let doc_res = execute_action(&doc_action, &clean_plat, DiskPressure::Calm, false);
+        assert_eq!(doc_res.outcome, ActionOutcome::Applied);
+        assert!(!root.join("doc").exists());
+
+        // 2. Active compiler (`cargo`) in worktree_root aborts SweepBuildUnits at post-lock lsof!
+        let sweep_action = ReclaimAction::SweepBuildUnits {
+            target_root: root.clone(),
+            target_dev: dev,
+            target_ino: ino,
+            expected_activity_unix: meta_mtime_unix(&debug_meta),
+            expected_target_activity_unix: meta_mtime_unix(&ri_meta),
+            worktree_root: Some(wt.clone()),
+            profile_rel: PathBuf::from("debug"),
+            profile_locks: SmallVec::new(),
+            ops: SweepOps::V2(vec![V2UnitRemoval {
+                pkg: CompactString::new("demo"),
+                unit_hash: CompactString::new("aaaaaaaaaaaaaaaa"),
+                allocated_bytes: 100,
+                reason: SweepUnitReason::StaleRustcHash,
+            }]),
+            estimated_allocated_bytes: 100,
+        };
+        let compiler_plat = ProcPlatform {
+            now: meta_mtime_unix(&ri_meta) + 100,
+            procs: vec![ProcessEntry {
+                pid: 4242,
+                comm: CompactString::new("cargo"),
+                exe_path: None,
+                cwd: Some(wt.clone()),
+                open_paths: vec![],
+            }],
+        };
+        let comp_res = execute_action(&sweep_action, &compiler_plat, DiskPressure::Calm, false);
+        assert!(matches!(
+            comp_res.outcome,
+            ActionOutcome::SkippedRevalidateChanged { .. }
+        ));
+        assert!(root.join("debug/build/demo/aaaaaaaaaaaaaaaa").exists());
+
+        // 3. Newly created `.targetwarden-pin` marker aborts sweep at post-lock revalidation!
+        fs::write(wt.join(".targetwarden-pin"), b"").unwrap();
+        let pin_res = execute_action(&sweep_action, &clean_plat, DiskPressure::Calm, false);
+        assert!(matches!(
+            pin_res.outcome,
+            ActionOutcome::SkippedRevalidateChanged { .. }
+        ));
+        assert!(root.join("debug/build/demo/aaaaaaaaaaaaaaaa").exists());
     }
 }

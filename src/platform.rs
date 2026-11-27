@@ -44,6 +44,10 @@ pub(crate) trait Platform {
     fn euid(&self) -> Result<u32, AppError>;
     fn now_unix(&self) -> u64;
     fn disk_stats(&self, volume: &Path) -> Result<DiskStats, AppError>;
+    /// Fast free-space probe (`statvfs` only, without invoking `tmutil`).
+    fn free_bytes(&self, volume: &Path) -> Result<u64, AppError> {
+        self.disk_stats(volume).map(|stats| stats.free_bytes)
+    }
     fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError>;
     fn mount_table(&self) -> Result<Vec<MountEntry>, AppError>;
     fn run_git(&self, cwd: &Path, args: &[&str]) -> Result<CommandOutput, AppError>;
@@ -110,19 +114,7 @@ impl Platform for MacPlatform {
     }
 
     fn disk_stats(&self, volume: &Path) -> Result<DiskStats, AppError> {
-        let stat = rustix::fs::statvfs(volume).map_err(|error| AppError::DiskStats {
-            path: volume.to_path_buf(),
-            message: error.to_string(),
-        })?;
-        let frsize = stat.f_frsize;
-        if frsize == 0 || stat.f_blocks == 0 {
-            return Err(AppError::DiskStats {
-                path: volume.to_path_buf(),
-                message: "statvfs returned zero block size or zero total blocks".to_owned(),
-            });
-        }
-        let total_bytes = stat.f_blocks.saturating_mul(frsize);
-        let free_bytes = stat.f_bavail.saturating_mul(frsize);
+        let (total_bytes, free_bytes) = statvfs_totals(volume)?;
         let local_snapshots = list_local_snapshots();
         Ok(DiskStats {
             mount: volume.to_path_buf(),
@@ -132,11 +124,15 @@ impl Platform for MacPlatform {
         })
     }
 
+    fn free_bytes(&self, volume: &Path) -> Result<u64, AppError> {
+        statvfs_totals(volume).map(|(_, free_bytes)| free_bytes)
+    }
+
     fn process_snapshot(&self) -> Result<ProcessSnapshot, AppError> {
         let output = run_bounded_command(
             "/usr/sbin/lsof",
             &["-n", "-P", "-F0pcftn"],
-            None,
+            Some(Path::new("/")),
             &[],
             std::time::Duration::from_secs(LSOF_TIMEOUT_SECS),
             LSOF_STDOUT_CAP,
@@ -165,7 +161,7 @@ impl Platform for MacPlatform {
         let output = run_bounded_command(
             "/sbin/mount",
             &[],
-            None,
+            Some(Path::new("/")),
             &[],
             std::time::Duration::from_secs(SUBPROCESS_TIMEOUT_SECS),
             SUBPROCESS_STDOUT_CAP,
@@ -243,11 +239,29 @@ fn unix_now() -> u64 {
 }
 
 #[cfg(target_os = "macos")]
+fn statvfs_totals(volume: &Path) -> Result<(u64, u64), AppError> {
+    let stat = rustix::fs::statvfs(volume).map_err(|error| AppError::DiskStats {
+        path: volume.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let frsize = stat.f_frsize;
+    if frsize == 0 || stat.f_blocks == 0 {
+        return Err(AppError::DiskStats {
+            path: volume.to_path_buf(),
+            message: "statvfs returned zero block size or zero total blocks".to_owned(),
+        });
+    }
+    let total_bytes = stat.f_blocks.saturating_mul(frsize);
+    let free_bytes = stat.f_bavail.saturating_mul(frsize);
+    Ok((total_bytes, free_bytes))
+}
+
+#[cfg(target_os = "macos")]
 fn list_local_snapshots() -> Option<Vec<CompactString>> {
     let output = run_bounded_command(
         "/usr/bin/tmutil",
         &["listlocalsnapshots", "/"],
-        None,
+        Some(Path::new("/")),
         &[],
         std::time::Duration::from_secs(SUBPROCESS_TIMEOUT_SECS),
         SUBPROCESS_STDOUT_CAP,
@@ -621,12 +635,18 @@ pub(crate) fn parse_lsof_output(
                     }
                 }
 
-                let ftype = file_type.ok_or_else(|| {
-                    AppError::ProcessSnapshot(format!(
+                let Some(ftype) = file_type else {
+                    // Darwin `lsof` omits the `t` field when a numeric FD closes between
+                    // `PROC_PIDLISTFDS` and `proc_pidfdinfo`, emitting `n<kind>: FD unavailable`.
+                    let is_numeric_fd = !fd.is_empty() && fd.iter().all(u8::is_ascii_digit);
+                    if is_numeric_fd && name_raw.is_some_and(|n| n.ends_with(b": FD unavailable")) {
+                        continue;
+                    }
+                    return Err(AppError::ProcessSnapshot(format!(
                         "lsof fd record missing `t` type field for pid {}",
                         entry.pid
-                    ))
-                })?;
+                    )));
+                };
 
                 let allowed_empty_name = matches!(ftype, b"PIPE" | b"NPOLICY" | b"NEXUS");
                 let decoded_name = match name_raw {
@@ -844,6 +864,113 @@ pub(crate) fn parse_tmutil_snapshots(raw: &str) -> Vec<CompactString> {
     snapshots
 }
 
+/// Normalize macOS firmlink/symlink system prefixes (`/var`, `/tmp`, `/etc` -> `/private/...`).
+pub(crate) fn normalize_macos_system_symlinks(path: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(rest) = path.strip_prefix("/var") {
+            return Path::new("/private/var").join(rest);
+        }
+        if let Ok(rest) = path.strip_prefix("/tmp") {
+            return Path::new("/private/tmp").join(rest);
+        }
+        if let Ok(rest) = path.strip_prefix("/etc") {
+            return Path::new("/private/etc").join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Return `true` if `path` or any ancestor component is a non-system symlink (fail-closed on error).
+pub(crate) fn has_symlink_boundary(path: &Path) -> bool {
+    let Ok(canon) = std::fs::canonicalize(path) else {
+        return true;
+    };
+    let normalized = normalize_macos_system_symlinks(path);
+    canon != normalized
+}
+
+/// Single-owner mount-boundary validator shared by `discover` and post-lock `execute` revalidation.
+/// Checks parent-vs-target `st_dev` mismatch, mount points at/under `target_root`, and non-local
+/// (NFS/SMB/FUSE/OrbStack) mounts at any ancestor of `target_root`.
+pub(crate) fn crosses_mount_boundary(
+    target_root: &Path,
+    target_dev: u64,
+    mounts: Option<&[MountEntry]>,
+) -> bool {
+    if let Some(parent) = target_root.parent() {
+        let Ok(parent_meta) = std::fs::symlink_metadata(parent) else {
+            return true;
+        };
+        if metadata_dev(&parent_meta) != target_dev {
+            return true;
+        }
+    }
+
+    let Some(entries) = mounts else {
+        return false;
+    };
+
+    let norm_target = normalize_mount_path(target_root);
+    for entry in entries {
+        let mp = entry.mount_point.as_path();
+        if mp == Path::new("/") || mp == Path::new(DEFAULT_VOLUME_MOUNT) {
+            continue;
+        }
+        let norm_mp = normalize_mount_path(mp);
+        if norm_mp == Path::new("/") {
+            continue;
+        }
+        if norm_mp == norm_target || norm_mp.starts_with(&norm_target) {
+            return true;
+        }
+        if norm_target.starts_with(&norm_mp) && is_non_local_fstype(&entry.fstype) {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_mount_path(path: &Path) -> PathBuf {
+    let stripped = if let Ok(rest) = path.strip_prefix(DEFAULT_VOLUME_MOUNT) {
+        if rest.as_os_str().is_empty() {
+            PathBuf::from("/")
+        } else {
+            Path::new("/").join(rest)
+        }
+    } else {
+        path.to_path_buf()
+    };
+    normalize_macos_system_symlinks(&stripped)
+}
+
+fn is_non_local_fstype(fstype: &str) -> bool {
+    let lower = fstype.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "nfs"
+            | "smbfs"
+            | "afpfs"
+            | "webdav"
+            | "autofs"
+            | "devfs"
+            | "nullfs"
+            | "macfuse"
+            | "osxfuse"
+    ) || lower.starts_with("fuse")
+}
+
+#[cfg(unix)]
+fn metadata_dev(meta: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.dev()
+}
+
+#[cfg(not(unix))]
+fn metadata_dev(_meta: &std::fs::Metadata) -> u64 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -864,6 +991,8 @@ mod tests {
             "f5\0tNEXUS\0\n",
             "f6\0tREG\0n/Users/dev/Projects/repo/target/debug/deps/libmacro.dylib\0\n",
             "f7\0tsystm\0n[ctl com.apple.netsrc id 7 unit 16]\0\n",
+            "f15\0nvnode: FD unavailable\0\n",
+            "f2774\0npipe: FD unavailable\0\n",
         );
 
         let snap = parse_lsof_output(sample.as_bytes(), 1234, 9999).unwrap();
@@ -905,6 +1034,16 @@ mod tests {
 
         let truncated_escape = b"p10\0ccargo\0\nf3\0tREG\0n/tmp/\\\0\n";
         assert!(parse_lsof_output(truncated_escape, 1, 0).is_err());
+
+        let missing_type_unexpected = b"p10\0ccargo\0\nf3\0n/tmp/a\0\n";
+        assert!(parse_lsof_output(missing_type_unexpected, 1, 0).is_err());
+
+        // `FD unavailable` on non-numeric special FDs (`cwd`, `txt`) MUST still fail closed!
+        let cwd_unavailable = b"p10\0ccargo\0\nfcwd\0nvnode: FD unavailable\0\n";
+        assert!(parse_lsof_output(cwd_unavailable, 1, 0).is_err());
+
+        let txt_unavailable = b"p10\0ccargo\0\nftxt\0nvnode: FD unavailable\0\n";
+        assert!(parse_lsof_output(txt_unavailable, 1, 0).is_err());
 
         assert!(parse_lsof_output(b"", 1, 0).is_err());
         assert!(decode_lsof_bytes(b"\\q").is_err());

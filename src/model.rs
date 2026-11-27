@@ -58,6 +58,53 @@ pub(crate) struct ProcessEntry {
     pub open_paths: Vec<PathBuf>,
 }
 
+impl ProcessEntry {
+    pub(crate) fn exe_name(&self) -> Option<&str> {
+        self.exe_path
+            .as_deref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+    }
+
+    pub(crate) fn is_rust_analyzer_proc_macro_srv(&self) -> bool {
+        let matches_name = |name: &str| {
+            name == "rust-analyzer-proc-macro-srv" || name.starts_with("rust-analyzer-proc-macro")
+        };
+        matches_name(self.comm.as_str()) || self.exe_name().is_some_and(matches_name)
+    }
+
+    pub(crate) fn is_rust_analyzer(&self) -> bool {
+        let matches_name = |name: &str| name == "rust-analyzer";
+        matches_name(self.comm.as_str()) || self.exe_name().is_some_and(matches_name)
+    }
+
+    pub(crate) fn is_active_compiler_or_tool(&self) -> bool {
+        let matches_sccache = |name: &str| name == "sccache";
+        if matches_sccache(self.comm.as_str()) || self.exe_name().is_some_and(matches_sccache) {
+            // Background `sccache` daemon has `cwd == /`; only block when `cwd != /`.
+            return self.cwd.as_deref().is_some_and(|cwd| cwd != Path::new("/"));
+        }
+
+        let matches_tool = |name: &str| {
+            matches!(
+                name,
+                "cargo"
+                    | "rustc"
+                    | "clippy-driver"
+                    | "rustdoc"
+                    | "miri"
+                    | "lldb"
+                    | "gdb"
+                    | "sqlx"
+                    | "ld"
+                    | "lld"
+                    | "rust-lld"
+            ) || name.starts_with("cargo-")
+        };
+        matches_tool(self.comm.as_str()) || self.exe_name().is_some_and(matches_tool)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProcessSnapshot {
     pub captured_at_unix: u64,
@@ -128,7 +175,6 @@ pub(crate) struct CargoTarget {
     pub symlink_or_mount_boundary: bool,
     pub has_unverified_top_entries: bool,
     pub has_pin_marker: bool,
-    #[allow(dead_code)] // Used in Stage 3 parent/nested eviction checks
     pub parent_target: Option<PathBuf>,
     pub nested_target_roots: Vec<PathBuf>,
     pub worktree_kind: WorktreeKind,
@@ -136,6 +182,8 @@ pub(crate) struct CargoTarget {
     pub project_dir: Option<PathBuf>,
     pub profiles: Vec<ProfileDir>,
     pub doc_dir: Option<DocDirInfo>,
+    pub root_lock_file: Option<PathBuf>,
+    pub root_locked_now: bool,
     pub allocated_bytes: u64,
     pub last_activity_unix: u64,
 }
@@ -336,6 +384,14 @@ pub(crate) struct ReclaimHoldState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum EvictRule {
+    R1DeadWorktree,
+    R4CooledWorktree,
+    R5PressureLru,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RuleId {
     CrashRecovery,
     R1DeadWorktree,
@@ -450,6 +506,8 @@ pub(crate) enum ReclaimAction {
         target_dev: u64,
         target_ino: u64,
         expected_activity_unix: u64,
+        expected_target_activity_unix: u64,
+        worktree_root: Option<PathBuf>,
         profile_rel: PathBuf,
         profile_locks: SmallVec<[PathBuf; 4]>,
         ops: SweepOps,
@@ -460,6 +518,7 @@ pub(crate) enum ReclaimAction {
         target_dev: u64,
         target_ino: u64,
         expected_doc_mtime_unix: u64,
+        worktree_root: Option<PathBuf>,
         locks: SmallVec<[PathBuf; 5]>,
         estimated_allocated_bytes: u64,
     },
@@ -468,10 +527,23 @@ pub(crate) enum ReclaimAction {
         target_dev: u64,
         target_ino: u64,
         expected_activity_unix: u64,
+        expected_target_activity_unix: u64,
+        worktree_root: Option<PathBuf>,
         profile_rel: PathBuf,
         profile_locks: SmallVec<[PathBuf; 4]>,
         removals: Vec<IncrementalRemoval>,
         estimated_allocated_bytes: u64,
+    },
+    EvictTarget {
+        rule: EvictRule,
+        target_root: PathBuf,
+        target_dev: u64,
+        target_ino: u64,
+        expected_activity_unix: u64,
+        worktree_root: Option<PathBuf>,
+        all_locks: Vec<PathBuf>,
+        estimated_allocated_bytes: u64,
+        reason: CompactString,
     },
 }
 
@@ -482,6 +554,11 @@ impl ReclaimAction {
             Self::SweepBuildUnits { .. } => RuleId::R2BuildSweep,
             Self::RemoveDoc { .. } => RuleId::R2DocPrune,
             Self::PruneIncremental { .. } => RuleId::R3IncrementalPrune,
+            Self::EvictTarget { rule, .. } => match rule {
+                EvictRule::R1DeadWorktree => RuleId::R1DeadWorktree,
+                EvictRule::R4CooledWorktree => RuleId::R4CooledWorktree,
+                EvictRule::R5PressureLru => RuleId::R5PressureLru,
+            },
         }
     }
 
@@ -490,7 +567,8 @@ impl ReclaimAction {
             Self::ReapLeftoverStaging { staging_dir, .. } => staging_dir.as_path(),
             Self::SweepBuildUnits { target_root, .. }
             | Self::RemoveDoc { target_root, .. }
-            | Self::PruneIncremental { target_root, .. } => target_root.as_path(),
+            | Self::PruneIncremental { target_root, .. }
+            | Self::EvictTarget { target_root, .. } => target_root.as_path(),
         }
     }
 
@@ -498,7 +576,9 @@ impl ReclaimAction {
         match self {
             Self::SweepBuildUnits { profile_rel, .. }
             | Self::PruneIncremental { profile_rel, .. } => Some(profile_rel.as_path()),
-            Self::ReapLeftoverStaging { .. } | Self::RemoveDoc { .. } => None,
+            Self::ReapLeftoverStaging { .. }
+            | Self::RemoveDoc { .. }
+            | Self::EvictTarget { .. } => None,
         }
     }
 
@@ -516,13 +596,19 @@ impl ReclaimAction {
             | Self::PruneIncremental {
                 estimated_allocated_bytes,
                 ..
+            }
+            | Self::EvictTarget {
+                estimated_allocated_bytes,
+                ..
             } => *estimated_allocated_bytes,
         }
     }
 
     pub fn unit_count(&self) -> u32 {
         let count = match self {
-            Self::ReapLeftoverStaging { .. } | Self::RemoveDoc { .. } => 1,
+            Self::ReapLeftoverStaging { .. }
+            | Self::RemoveDoc { .. }
+            | Self::EvictTarget { .. } => 1,
             Self::SweepBuildUnits { ops, .. } => ops.unit_count(),
             Self::PruneIncremental { removals, .. } => removals.len(),
         };
@@ -535,6 +621,7 @@ impl ReclaimAction {
             Self::SweepBuildUnits { ops, .. } => ops.summary_reason(),
             Self::RemoveDoc { .. } => CompactString::new("stale_doc_dir"),
             Self::PruneIncremental { .. } => CompactString::new("stale_incremental_sessions"),
+            Self::EvictTarget { reason, .. } => reason.clone(),
         }
     }
 }
@@ -611,7 +698,9 @@ pub(crate) struct ScanSnapshot {
     pub captured_at_unix: u64,
     pub disk: DiskStats,
     pub processes: Option<ProcessSnapshot>,
+    pub process_snapshot_error: Option<String>,
     pub mount_table_available: bool,
+    pub mount_table_error: Option<String>,
     pub targets: Vec<CargoTarget>,
     pub walk_partial: bool,
     pub leftover_staging: Vec<LeftoverStaging>,

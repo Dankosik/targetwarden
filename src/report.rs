@@ -10,9 +10,9 @@ use serde::Serialize;
 
 use crate::error::{AppError, sanitize_terminal_text};
 use crate::model::{
-    ActionOutcome, ActionReceipt, CargoTarget, DiskPressure, OutputFormat, ProtectedReason,
-    ReclaimHoldState, ReclaimPlan, RuleId, SCHEMA_VERSION, SafetyVerdict, ScanSnapshot,
-    SweepOnlyReason, TargetLayout, TargetOrigin, WorktreeKind, bytes_to_gib,
+    ActionOutcome, ActionReceipt, CargoTarget, DiskPressure, OutputFormat, PinScope,
+    ProtectedReason, ReclaimHoldState, ReclaimPlan, RuleId, SCHEMA_VERSION, SafetyVerdict,
+    ScanSnapshot, SweepOnlyReason, TargetLayout, TargetOrigin, WorktreeKind, bytes_to_gib,
 };
 use crate::state::State;
 
@@ -197,15 +197,21 @@ pub(crate) fn write_inventory_report(
                 totals,
                 targets: target_reports,
             };
-            serde_json::to_writer(&mut *out, &report)
-                .map_err(|e| AppError::Output(std::io::Error::other(e)))?;
-            writeln!(out).map_err(AppError::Output)?;
-            out.flush().map_err(AppError::Output)?;
+            write_json_line(&report, out)?;
         }
         OutputFormat::Text => {
             write_inventory_text(snapshot, &order, verdicts, pressure, state, &totals, out)?;
         }
     }
+    Ok(())
+}
+
+fn write_json_line<T: Serialize>(value: &T, out: &mut impl Write) -> Result<(), AppError> {
+    let mut bytes = serde_json::to_vec(value)
+        .map_err(|error| AppError::Output(std::io::Error::other(error)))?;
+    bytes.push(b'\n');
+    out.write_all(&bytes).map_err(AppError::Output)?;
+    out.flush().map_err(AppError::Output)?;
     Ok(())
 }
 
@@ -456,10 +462,7 @@ pub(crate) fn write_reclaim_report(
                 summary,
                 receipts,
             };
-            serde_json::to_writer(&mut *out, &report)
-                .map_err(|e| AppError::Output(std::io::Error::other(e)))?;
-            writeln!(out).map_err(AppError::Output)?;
-            out.flush().map_err(AppError::Output)?;
+            write_json_line(&report, out)?;
         }
         OutputFormat::Text => {
             writeln!(
@@ -524,10 +527,7 @@ pub(crate) fn write_history_report(
                 count: receipts.len(),
                 entries: receipts,
             };
-            serde_json::to_writer(&mut *out, &report)
-                .map_err(|e| AppError::Output(std::io::Error::other(e)))?;
-            writeln!(out).map_err(AppError::Output)?;
-            out.flush().map_err(AppError::Output)?;
+            write_json_line(&report, out)?;
         }
         OutputFormat::Text => {
             if receipts.is_empty() {
@@ -602,6 +602,99 @@ fn outcome_label(outcome: &ActionOutcome) -> &'static str {
     }
 }
 
+#[derive(Serialize)]
+struct PinJsonReport<'a> {
+    schema_version: u32,
+    command: &'static str,
+    path: &'a std::path::Path,
+    scope: PinScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<&'a str>,
+}
+
+/// Format `targetwarden pin` output.
+pub(crate) fn write_pin_report(
+    path: &std::path::Path,
+    scope: PinScope,
+    note: Option<&str>,
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> Result<(), AppError> {
+    match format {
+        OutputFormat::Json => {
+            let report = PinJsonReport {
+                schema_version: SCHEMA_VERSION,
+                command: "pin",
+                path,
+                scope,
+                note,
+            };
+            write_json_line(&report, out)?;
+        }
+        OutputFormat::Text => {
+            let scope_str = match scope {
+                PinScope::Full => "full",
+                PinScope::AllowSweep => "allow_sweep",
+            };
+            writeln!(
+                out,
+                "Pinned ({scope_str}): {}",
+                sanitize_terminal_text(&path.to_string_lossy())
+            )
+            .map_err(AppError::Output)?;
+            out.flush().map_err(AppError::Output)?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct UnpinJsonReport<'a> {
+    schema_version: u32,
+    command: &'static str,
+    path: &'a std::path::Path,
+    removed: bool,
+}
+
+/// Format `targetwarden unpin` output.
+pub(crate) fn write_unpin_report(
+    path: &std::path::Path,
+    removed: bool,
+    format: OutputFormat,
+    out: &mut impl Write,
+) -> Result<(), AppError> {
+    match format {
+        OutputFormat::Json => {
+            let report = UnpinJsonReport {
+                schema_version: SCHEMA_VERSION,
+                command: "unpin",
+                path,
+                removed,
+            };
+            write_json_line(&report, out)?;
+        }
+        OutputFormat::Text => {
+            if removed {
+                writeln!(
+                    out,
+                    "Unpinned: {}",
+                    sanitize_terminal_text(&path.to_string_lossy())
+                )
+                .map_err(AppError::Output)?;
+            } else {
+                writeln!(
+                    out,
+                    "Not pinned: {}",
+                    sanitize_terminal_text(&path.to_string_lossy())
+                )
+                .map_err(AppError::Output)?;
+            }
+            out.flush().map_err(AppError::Output)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -634,6 +727,8 @@ mod tests {
             project_dir: None,
             profiles: vec![],
             doc_dir: None,
+            root_lock_file: None,
+            root_locked_now: false,
             allocated_bytes: 2 * GIB,
             last_activity_unix: 1000,
         };
@@ -646,7 +741,9 @@ mod tests {
                 local_snapshots: Some(vec![CompactString::new("snap-1")]),
             },
             processes: None,
+            process_snapshot_error: None,
             mount_table_available: true,
+            mount_table_error: None,
             targets: vec![target],
             walk_partial: false,
             leftover_staging: vec![],
@@ -688,5 +785,27 @@ mod tests {
         assert!(text.contains("2.00 GiB"));
         assert!(!text.contains('\u{1b}'));
         assert!(text.contains("\\u{1b}"));
+
+        // BrokenPipe on JSON output MUST preserve ErrorKind::BrokenPipe so CLI exits 0!
+        struct BrokenPipeWriter;
+        impl std::io::Write for BrokenPipeWriter {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let err = write_inventory_report(
+            "status",
+            &snapshot,
+            &verdicts,
+            DiskPressure::Calm,
+            &State::new_default(),
+            OutputFormat::Json,
+            &mut BrokenPipeWriter,
+        )
+        .unwrap_err();
+        assert!(err.is_stdout_closed());
     }
 }

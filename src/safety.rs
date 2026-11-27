@@ -81,6 +81,11 @@ fn evaluate_single(
     }
 
     // Barrier 3: active Cargo / rustdoc file locks
+    if target.root_locked_now {
+        protected.push(ProtectedReason::ActiveCargoLock {
+            profile: CompactString::new("target"),
+        });
+    }
     for profile in &target.profiles {
         if profile.locked_now {
             protected.push(ProtectedReason::ActiveCargoLock {
@@ -121,9 +126,10 @@ fn evaluate_single(
                 WorktreeKind::LinkedWorktree => {
                     if !git.worktree_dir_missing {
                         let r4_cooled = age_secs >= config.cooling.r4_age_secs(pressure);
+                        let r5_allowed = pressure >= DiskPressure::High && !hold_active;
                         let merged_and_clean =
                             !git.is_dirty && git.branch_merged_into_default == Some(true);
-                        if git.worktree_locked || (!merged_and_clean && !r4_cooled) {
+                        if git.worktree_locked || (!merged_and_clean && !r4_cooled && !r5_allowed) {
                             sweep_only.push(SweepOnlyReason::DirtyOrUnmergedWorktree);
                         }
                     }
@@ -208,8 +214,8 @@ fn evaluate_process_against_target(
         .filter(|path| path.starts_with(target_root))
         .collect();
 
-    let is_proc_macro_srv = is_rust_analyzer_proc_macro_srv(proc_entry);
-    let is_ra = is_rust_analyzer(proc_entry);
+    let is_proc_macro_srv = proc_entry.is_rust_analyzer_proc_macro_srv();
+    let is_ra = proc_entry.is_rust_analyzer();
 
     if is_proc_macro_srv {
         let mut has_non_dylib_target_path = cwd_in_target;
@@ -278,7 +284,7 @@ fn evaluate_process_against_target(
         return;
     }
 
-    if is_active_compiler_or_tool(proc_entry) {
+    if proc_entry.is_active_compiler_or_tool() {
         let open_in_worktree = proc_entry
             .open_paths
             .iter()
@@ -375,57 +381,6 @@ fn propagate_nested_verdicts(targets: &[CargoTarget], verdicts: &mut [SafetyVerd
     }
 }
 
-fn proc_exe_name(proc_entry: &ProcessEntry) -> Option<&str> {
-    proc_entry
-        .exe_path
-        .as_deref()
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-}
-
-fn is_rust_analyzer_proc_macro_srv(proc_entry: &ProcessEntry) -> bool {
-    let matches_name = |name: &str| {
-        name == "rust-analyzer-proc-macro-srv" || name.starts_with("rust-analyzer-proc-macro")
-    };
-    matches_name(proc_entry.comm.as_str()) || proc_exe_name(proc_entry).is_some_and(matches_name)
-}
-
-fn is_rust_analyzer(proc_entry: &ProcessEntry) -> bool {
-    let matches_name = |name: &str| name == "rust-analyzer";
-    matches_name(proc_entry.comm.as_str()) || proc_exe_name(proc_entry).is_some_and(matches_name)
-}
-
-fn is_active_compiler_or_tool(proc_entry: &ProcessEntry) -> bool {
-    let matches_sccache = |name: &str| name == "sccache";
-    if matches_sccache(proc_entry.comm.as_str())
-        || proc_exe_name(proc_entry).is_some_and(matches_sccache)
-    {
-        // Background `sccache` daemon has `cwd == /`; only block when `cwd != /`.
-        return proc_entry
-            .cwd
-            .as_deref()
-            .is_some_and(|cwd| cwd != Path::new("/"));
-    }
-
-    let matches_tool = |name: &str| {
-        matches!(
-            name,
-            "cargo"
-                | "rustc"
-                | "clippy-driver"
-                | "rustdoc"
-                | "miri"
-                | "lldb"
-                | "gdb"
-                | "sqlx"
-                | "ld"
-                | "lld"
-                | "rust-lld"
-        ) || name.starts_with("cargo-")
-    };
-    matches_tool(proc_entry.comm.as_str()) || proc_exe_name(proc_entry).is_some_and(matches_tool)
-}
-
 fn is_dylib_path(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("dylib")
 }
@@ -499,6 +454,8 @@ mod tests {
                 last_activity_unix: NOW - age_secs,
             }],
             doc_dir: None,
+            root_lock_file: None,
+            root_locked_now: false,
             allocated_bytes: GIB,
             last_activity_unix: NOW - age_secs,
         }
@@ -521,7 +478,9 @@ mod tests {
                 self_pid: 99999,
                 processes: list,
             }),
+            process_snapshot_error: None,
             mount_table_available: true,
+            mount_table_error: None,
             targets,
             walk_partial: false,
             leftover_staging: vec![],
@@ -796,5 +755,59 @@ mod tests {
         assert!(reasons.contains(&SweepOnlyReason::EvictionCooling {
             remaining_secs: 600
         }));
+    }
+
+    #[test]
+    fn unmerged_linked_worktree_becomes_eligible_for_r5_in_high_unless_locked_or_held() {
+        let cfg = Config::default();
+        let mut wt = base_target(
+            "/Users/dev/wt_wip/target",
+            WorktreeKind::LinkedWorktree,
+            3600,
+        );
+        if let GitDiscovery::Inspected(git) = &mut wt.git {
+            git.branch_merged_into_default = Some(false);
+        }
+
+        let snap = base_snapshot(vec![wt.clone()], Some(vec![]));
+        let v_calm = evaluate_all(
+            &snap,
+            &State::new_default(),
+            &cfg,
+            DiskPressure::Calm,
+            false,
+        );
+        assert!(matches!(
+            &v_calm[0],
+            SafetyVerdict::SweepOnly { reasons, .. }
+                if reasons.contains(&SweepOnlyReason::DirtyOrUnmergedWorktree)
+        ));
+
+        let v_high = evaluate_all(
+            &snap,
+            &State::new_default(),
+            &cfg,
+            DiskPressure::High,
+            false,
+        );
+        assert_eq!(v_high[0], SafetyVerdict::Eligible);
+
+        // Locked worktree stays SweepOnly even in High pressure.
+        let mut locked_wt = wt;
+        if let GitDiscovery::Inspected(git) = &mut locked_wt.git {
+            git.worktree_locked = true;
+        }
+        let v_locked = evaluate_all(
+            &base_snapshot(vec![locked_wt], Some(vec![])),
+            &State::new_default(),
+            &cfg,
+            DiskPressure::High,
+            false,
+        );
+        assert!(matches!(
+            &v_locked[0],
+            SafetyVerdict::SweepOnly { reasons, .. }
+                if reasons.contains(&SweepOnlyReason::DirtyOrUnmergedWorktree)
+        ));
     }
 }

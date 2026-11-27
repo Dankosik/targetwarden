@@ -49,7 +49,6 @@ pub(crate) fn evaluate_pressure(
 }
 
 /// Decide whether APFS snapshot retention circuit breaker should trigger after `R5` eviction.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn should_trigger_hold(
     reclaimed_allocated_bytes: u64,
     observed_free_gain_bytes: u64,

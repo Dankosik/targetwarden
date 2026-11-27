@@ -130,6 +130,8 @@ pub(crate) fn plan_profile_build_sweep(
         target_dev: target.dev_id,
         target_ino: target.ino,
         expected_activity_unix: profile.last_activity_unix,
+        expected_target_activity_unix: target.last_activity_unix,
+        worktree_root: target.worktree_root().map(Path::to_path_buf),
         profile_rel: profile.rel_path.clone(),
         profile_locks: profile.lock_files.clone(),
         ops,
@@ -441,6 +443,9 @@ pub(crate) fn plan_doc_prune(
             locks.push(lock.clone());
         }
     }
+    if let Some(root_lock) = &target.root_lock_file {
+        locks.push(root_lock.clone());
+    }
     if let Some(doc_lock) = &doc.lock_file {
         locks.push(doc_lock.clone());
     }
@@ -452,6 +457,7 @@ pub(crate) fn plan_doc_prune(
         target_dev: target.dev_id,
         target_ino: target.ino,
         expected_doc_mtime_unix: doc.last_activity_unix,
+        worktree_root: target.worktree_root().map(Path::to_path_buf),
         locks,
         estimated_allocated_bytes: doc.allocated_bytes,
     })
@@ -575,6 +581,8 @@ pub(crate) fn plan_profile_incremental_prune(
         target_dev: target.dev_id,
         target_ino: target.ino,
         expected_activity_unix: profile.last_activity_unix,
+        expected_target_activity_unix: target.last_activity_unix,
+        worktree_root: target.worktree_root().map(Path::to_path_buf),
         profile_rel: profile.rel_path.clone(),
         profile_locks: profile.lock_files.clone(),
         removals,
@@ -619,6 +627,8 @@ mod tests {
             project_dir: Some(PathBuf::from("/Users/dev/repo")),
             profiles: vec![profile],
             doc_dir,
+            root_lock_file: None,
+            root_locked_now: false,
             allocated_bytes: 10_000_000,
             last_activity_unix: NOW - 3 * HOUR,
         }

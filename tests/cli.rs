@@ -425,3 +425,68 @@ fn real_cargo_sweep_preserves_zero_recompilation_on_cargo_check() {
         "expected zero recompilation after surgical sweep, got:\n{stderr3}"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn reclaim_exits_partial_3_when_action_fails_on_unwritable_target() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let state_dir = home.path().join("state");
+    let target = home.path().join("Projects/ro_app/target");
+    let debug = target.join("debug");
+    fs::create_dir_all(debug.join("build/old_crate/2222222222222222/fingerprint")).unwrap();
+    fs::write(
+        target.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n# Created by cargo.\n",
+    )
+    .unwrap();
+    backdate_tree(&target, Duration::from_secs(48 * 3600));
+
+    // Make target root read-only (0555) so creating the internal staging dir fails -> ActionOutcome::Failed -> exit 3!
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = command(home.path())
+        .env("TARGETWARDEN_STATE_DIR", &state_dir)
+        .args(["reclaim", "--profile", "sweep-only", "--format", "json"])
+        .output()
+        .unwrap();
+    // Restore permissions immediately so tempdir cleans up cleanly!
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "expected PARTIAL exit code 3, got {:?}, stdout={}, stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(json["summary"]["failed_actions"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn broken_pipe_on_stdout_exits_0_cleanly() {
+    use std::process::{Command as StdCommand, Stdio};
+
+    let home = tempfile::tempdir().unwrap();
+    let bin = assert_cmd::cargo::cargo_bin("targetwarden");
+    let mut child = StdCommand::new(bin)
+        .args(["completions", "zsh"])
+        .env("HOME", home.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close stdout reader immediately to induce EPIPE on write!
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "BrokenPipe must exit 0, stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stderr.is_empty());
+}
