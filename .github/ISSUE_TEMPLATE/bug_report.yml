@@ -1,0 +1,23 @@
+name: Bug report
+description: targetwarden deleted or flagged something it should not have, missed a target, or failed.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened and what you expected
+      description: Include the command, its output, and exit status. For an unexpected sweep or eviction, include the matching lines of ~/Library/Application Support/targetwarden/actions.jsonl.
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: targetwarden status
+      description: Output of `targetwarden status --format json` (remove any private directory names if needed).
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Versions
+      description: targetwarden --version, cargo --version, rustc --version, macOS version, Apple Silicon or Intel.
+    validations:
+      required: true

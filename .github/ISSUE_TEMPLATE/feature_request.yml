@@ -1,0 +1,15 @@
+name: Feature request
+description: A Cargo layout, safety check, or reclamation rule targetwarden should handle.
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Which build artifacts or target layouts grow unbounded, how Cargo or IDE tools interact with them, and when they are safe to reclaim.
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Evidence and constraints
+      description: Measured disk sizes, lock/process observations, rebuild timings after cleanup, and current workarounds.

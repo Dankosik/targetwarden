@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "name": "targetwarden",
+  "repository": "https://github.com/Dankosik/targetwarden",
+  "description": "Automatic safe Cargo target/ disk reclaimer for macOS workstations running parallel AI coding agents",
+  "environment_prefix": "TARGETWARDEN",
+  "initialized": true
+}

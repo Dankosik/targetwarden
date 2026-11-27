@@ -1,0 +1,57 @@
+[package]
+name = "targetwarden"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+description = "Automatic safe Cargo target/ disk reclaimer for macOS workstations running parallel AI coding agents"
+license = "MIT"
+repository = "https://github.com/Dankosik/targetwarden"
+publish = false
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive", "env"] }
+clap_complete = "4.6.9"
+compact_str = { version = "0.10.0", default-features = false, features = ["serde", "std"] }
+memchr = "2.8.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+smallvec = { version = "1.16.1", default-features = false, features = ["const_generics", "serde", "union"] }
+tempfile = "3.27.0"
+thiserror = "2.0.20"
+toml = { version = "1.1.5", default-features = false, features = ["parse", "serde", "std"] }
+walkdir = "2.5.0"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "process", "event"] }
+signal-hook = { version = "0.3.18", default-features = false }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+large_stack_frames = "warn"
+needless_collect = "warn"
+rc_buffer = "warn"
+redundant_clone = "warn"
+set_contains_or_insert = "warn"
+suboptimal_flops = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
