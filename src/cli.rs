@@ -99,6 +99,9 @@ pub(crate) enum Command {
         /// Print the generated LaunchAgent plist and launchctl actions without writing files
         #[arg(long)]
         dry_run: bool,
+        /// Configure the LaunchAgent daemon to run `watch --dry-run` (for initial field soak)
+        #[arg(long)]
+        watch_dry_run: bool,
     },
     /// Bootout and remove the per-user LaunchAgent while keeping state and history
     Uninstall,

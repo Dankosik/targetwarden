@@ -184,6 +184,7 @@ pub(crate) struct CargoTarget {
     pub doc_dir: Option<DocDirInfo>,
     pub root_lock_file: Option<PathBuf>,
     pub root_locked_now: bool,
+    pub root_mtime_unix: u64,
     pub allocated_bytes: u64,
     pub last_activity_unix: u64,
 }
@@ -211,6 +212,8 @@ pub(crate) struct ProfileDir {
     pub v2_units: Vec<BuildUnit>,
     pub v1_units: Vec<BuildUnit>,
     pub incremental_dirs: Vec<IncrementalDir>,
+    pub profile_mtime_unix: u64,
+    pub inc_root_mtime_unix: u64,
     pub allocated_bytes: u64,
     pub last_activity_unix: u64,
 }
@@ -222,7 +225,8 @@ pub(crate) enum BuildUnitId {
         unit_hash: CompactString,
     },
     V1 {
-        fingerprint_dir: CompactString,
+        /// `None` for orphaned V1 `deps/` or `build/` artifacts whose `.fingerprint/` dir is absent.
+        fingerprint_dir: Option<CompactString>,
         unit_hash: CompactString,
     },
 }
@@ -300,6 +304,7 @@ pub(crate) struct IncrementalDir {
     pub crate_name: CompactString,
     pub sessions: Vec<IncrementalSession>,
     pub any_locked: bool,
+    pub dir_mtime_unix: u64,
     pub latest_mtime_unix: u64,
     pub allocated_bytes: u64,
 }
@@ -420,7 +425,7 @@ pub(crate) struct V2UnitRemoval {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct V1UnitRemoval {
-    pub fingerprint_dir: CompactString,
+    pub fingerprint_dir: Option<CompactString>,
     pub build_dir: Option<CompactString>,
     pub dep_entries: Vec<CompactString>,
     pub allocated_bytes: u64,
@@ -485,6 +490,7 @@ impl SweepOps {
 pub(crate) enum IncrementalRemoval {
     WholeCrateDir {
         dir_name: CompactString,
+        expected_dir_mtime_unix: u64,
         allocated_bytes: u64,
     },
     SingleSession {
@@ -505,6 +511,7 @@ pub(crate) enum ReclaimAction {
         target_root: PathBuf,
         target_dev: u64,
         target_ino: u64,
+        expected_profile_mtime_unix: u64,
         expected_activity_unix: u64,
         expected_target_activity_unix: u64,
         worktree_root: Option<PathBuf>,
@@ -526,6 +533,7 @@ pub(crate) enum ReclaimAction {
         target_root: PathBuf,
         target_dev: u64,
         target_ino: u64,
+        expected_inc_root_mtime_unix: u64,
         expected_activity_unix: u64,
         expected_target_activity_unix: u64,
         worktree_root: Option<PathBuf>,
@@ -539,6 +547,7 @@ pub(crate) enum ReclaimAction {
         target_root: PathBuf,
         target_dev: u64,
         target_ino: u64,
+        expected_root_mtime_unix: u64,
         expected_activity_unix: u64,
         worktree_root: Option<PathBuf>,
         all_locks: Vec<PathBuf>,

@@ -409,7 +409,10 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Watch { dry_run } => run_watch_command(cli.config.as_deref(), &cli.roots, dry_run),
-        Command::Install { dry_run } => {
+        Command::Install {
+            dry_run,
+            watch_dry_run,
+        } => {
             let platform = default_platform();
             ensure_non_root(&platform)?;
             let home = resolve_home()?;
@@ -418,7 +421,7 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                 message: format!("cannot resolve current executable path: {error}"),
             })?;
             let exe = std::fs::canonicalize(&exe_raw).unwrap_or(exe_raw);
-            let outcome = install::install(&exe, &home, dry_run, &platform)?;
+            let outcome = install::install(&exe, &home, dry_run, watch_dry_run, &platform)?;
             report::write_install_report(
                 outcome.label,
                 &outcome.domain,

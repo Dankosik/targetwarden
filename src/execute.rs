@@ -171,6 +171,7 @@ fn execute_action_with_disk_free(
             target_root,
             target_dev,
             target_ino,
+            expected_profile_mtime_unix,
             expected_activity_unix,
             expected_target_activity_unix,
             worktree_root,
@@ -182,6 +183,7 @@ fn execute_action_with_disk_free(
             target_root,
             *target_dev,
             *target_ino,
+            *expected_profile_mtime_unix,
             *expected_activity_unix,
             *expected_target_activity_unix,
             worktree_root.as_deref(),
@@ -213,6 +215,7 @@ fn execute_action_with_disk_free(
             target_root,
             target_dev,
             target_ino,
+            expected_inc_root_mtime_unix,
             expected_activity_unix,
             expected_target_activity_unix,
             worktree_root,
@@ -224,6 +227,7 @@ fn execute_action_with_disk_free(
             target_root,
             *target_dev,
             *target_ino,
+            *expected_inc_root_mtime_unix,
             *expected_activity_unix,
             *expected_target_activity_unix,
             worktree_root.as_deref(),
@@ -237,6 +241,7 @@ fn execute_action_with_disk_free(
             target_root,
             target_dev,
             target_ino,
+            expected_root_mtime_unix,
             expected_activity_unix,
             worktree_root,
             all_locks,
@@ -246,6 +251,7 @@ fn execute_action_with_disk_free(
             target_root,
             *target_dev,
             *target_ino,
+            *expected_root_mtime_unix,
             *expected_activity_unix,
             worktree_root.as_deref(),
             all_locks,
@@ -387,6 +393,7 @@ fn execute_sweep_build_units(
     target_root: &Path,
     target_dev: u64,
     target_ino: u64,
+    expected_profile_mtime_unix: u64,
     expected_activity_unix: u64,
     expected_target_activity_unix: u64,
     worktree_root: Option<&Path>,
@@ -407,7 +414,7 @@ fn execute_sweep_build_units(
         target_dev,
         target_ino,
         &profile_dir,
-        expected_activity_unix,
+        expected_profile_mtime_unix,
         Some(expected_target_activity_unix),
         worktree_root,
         platform,
@@ -581,6 +588,7 @@ fn execute_prune_incremental(
     target_root: &Path,
     target_dev: u64,
     target_ino: u64,
+    expected_inc_root_mtime_unix: u64,
     expected_activity_unix: u64,
     expected_target_activity_unix: u64,
     worktree_root: Option<&Path>,
@@ -644,7 +652,7 @@ fn execute_prune_incremental(
         target_dev,
         target_ino,
         &inc_root,
-        expected_activity_unix,
+        expected_inc_root_mtime_unix,
         Some(expected_target_activity_unix),
         worktree_root,
         platform,
@@ -690,6 +698,7 @@ fn execute_prune_incremental(
             IncrementalRemoval::WholeCrateDir {
                 dir_name,
                 allocated_bytes,
+                ..
             } => {
                 let dst = format!("inc_crate_{idx}");
                 match rename_entry_atomic(&inc_root, dir_name.as_str(), &staging_dir, &dst) {
@@ -778,6 +787,7 @@ fn execute_evict_target(
     target_root: &Path,
     target_dev: u64,
     target_ino: u64,
+    expected_root_mtime_unix: u64,
     expected_activity_unix: u64,
     worktree_root: Option<&Path>,
     all_locks: &[PathBuf],
@@ -813,7 +823,7 @@ fn execute_evict_target(
         target_dev,
         target_ino,
         target_root,
-        expected_activity_unix,
+        expected_root_mtime_unix,
         Some(expected_activity_unix),
         worktree_root,
         platform,
@@ -1193,9 +1203,10 @@ fn path_hits_swept_unit(path: &Path, profile_dir: &Path, ops: &SweepOps) -> bool
     let check_v1 = |v1: &[V1UnitRemoval]| {
         let deps_dir = profile_dir.join("deps");
         v1.iter().any(|u| {
-            let fp_dir = profile_dir
-                .join(".fingerprint")
-                .join(u.fingerprint_dir.as_str());
+            let fp_hit = u
+                .fingerprint_dir
+                .as_deref()
+                .is_some_and(|fp| path.starts_with(profile_dir.join(".fingerprint").join(fp)));
             let build_hit = u
                 .build_dir
                 .as_deref()
@@ -1204,7 +1215,7 @@ fn path_hits_swept_unit(path: &Path, profile_dir: &Path, ops: &SweepOps) -> bool
                 .dep_entries
                 .iter()
                 .any(|d| path.starts_with(deps_dir.join(d.as_str())));
-            path.starts_with(&fp_dir) || build_hit || dep_hit
+            fp_hit || build_hit || dep_hit
         })
     };
     match ops {
@@ -1254,10 +1265,21 @@ fn sweep_unit_mtime_advanced(profile_dir: &Path, ops: &SweepOps, expected_unix: 
     };
     let check_v1 = |v1: &[V1UnitRemoval]| {
         let fp_root = profile_dir.join(".fingerprint");
+        let build_root = profile_dir.join("build");
+        let deps_root = profile_dir.join("deps");
         v1.iter().any(|u| {
-            let fp_dir = fp_root.join(u.fingerprint_dir.as_str());
-            path_mtime_exceeds(&fp_dir, expected_unix)
-                || path_mtime_exceeds(&fp_dir.join("invoked.timestamp"), expected_unix)
+            if let Some(fp_name) = u.fingerprint_dir.as_deref() {
+                let fp_dir = fp_root.join(fp_name);
+                path_mtime_exceeds(&fp_dir, expected_unix)
+                    || path_mtime_exceeds(&fp_dir.join("invoked.timestamp"), expected_unix)
+            } else {
+                u.build_dir
+                    .as_deref()
+                    .is_some_and(|b| path_mtime_exceeds(&build_root.join(b), expected_unix))
+                    || u.dep_entries
+                        .iter()
+                        .any(|d| path_mtime_exceeds(&deps_root.join(d.as_str()), expected_unix))
+            }
         })
     };
     match ops {
@@ -1273,9 +1295,11 @@ fn incremental_mtime_advanced(
     expected_unix: u64,
 ) -> bool {
     removals.iter().any(|removal| match removal {
-        IncrementalRemoval::WholeCrateDir { dir_name, .. } => {
-            path_mtime_exceeds(&inc_root.join(dir_name.as_str()), expected_unix)
-        }
+        IncrementalRemoval::WholeCrateDir {
+            dir_name,
+            expected_dir_mtime_unix,
+            ..
+        } => path_mtime_exceeds(&inc_root.join(dir_name.as_str()), *expected_dir_mtime_unix),
         IncrementalRemoval::SingleSession {
             crate_dir,
             session_dir,
@@ -1355,6 +1379,7 @@ fn stage_v2_units(
     first_error: &mut Option<String>,
 ) {
     let build_root = profile_dir.join("build");
+    let mut touched_pkgs: Vec<&str> = Vec::new();
     for (idx, unit) in units.iter().enumerate() {
         let pkg_dir = build_root.join(unit.pkg.as_str());
         let dst = format!("v2_{idx}_{}", unit.unit_hash);
@@ -1362,6 +1387,7 @@ fn stage_v2_units(
             Ok(true) => {
                 *moved = moved.saturating_add(1);
                 *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
+                touched_pkgs.push(unit.pkg.as_str());
             }
             Ok(false) => {}
             Err(error) => {
@@ -1372,6 +1398,29 @@ fn stage_v2_units(
                 break;
             }
         }
+    }
+    touched_pkgs.sort_unstable();
+    touched_pkgs.dedup();
+    for pkg in touched_pkgs {
+        remove_empty_dir_best_effort(&build_root, pkg);
+    }
+}
+
+fn remove_empty_dir_best_effort(parent: &Path, name: &str) {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{AtFlags, Mode, OFlags, open, unlinkat};
+        if let Ok(parent_fd) = open(
+            parent,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            let _ = unlinkat(&parent_fd, name, AtFlags::REMOVEDIR);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fs::remove_dir(parent.join(name));
     }
 }
 
@@ -1387,50 +1436,55 @@ fn stage_v1_units(
     let build_root = profile_dir.join("build");
     let deps_root = profile_dir.join("deps");
     for (idx, unit) in units.iter().enumerate() {
-        // Crash-consistency invariant (Section 4.3): rename `.fingerprint/<dir>` FIRST so
-        // Cargo treats the unit as absent even if power is lost before `deps/` finishes.
-        let fp_dst = format!("v1_fp_{idx}");
-        match rename_entry_atomic(
-            &fp_root,
-            unit.fingerprint_dir.as_str(),
-            staging_dir,
-            &fp_dst,
-        ) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(error) => {
-                *first_error = Some(format!(
-                    "rename V1 .fingerprint/{}: {error}",
-                    unit.fingerprint_dir
-                ));
-                break;
+        let mut any_entry_moved = false;
+        // Crash-consistency invariant (Section 4.3): for normal V1 units, rename
+        // `.fingerprint/<dir>` FIRST so Cargo treats the unit as absent even if power is lost
+        // before `deps/` finishes. For orphaned V1 units (`fingerprint_dir == None`), stage
+        // the leftover `build_dir` and `dep_entries` directly.
+        if let Some(fp_dir) = &unit.fingerprint_dir {
+            let fp_dst = format!("v1_fp_{idx}");
+            match rename_entry_atomic(&fp_root, fp_dir.as_str(), staging_dir, &fp_dst) {
+                Ok(true) => {
+                    any_entry_moved = true;
+                }
+                Ok(false) => continue,
+                Err(error) => {
+                    *first_error = Some(format!("rename V1 .fingerprint/{fp_dir}: {error}"));
+                    break;
+                }
             }
         }
 
         if let Some(build_dir) = &unit.build_dir {
             let build_dst = format!("v1_build_{idx}");
-            if let Err(error) =
-                rename_entry_atomic(&build_root, build_dir.as_str(), staging_dir, &build_dst)
-            {
-                *first_error = Some(format!("rename V1 build/{build_dir}: {error}"));
-                break;
+            match rename_entry_atomic(&build_root, build_dir.as_str(), staging_dir, &build_dst) {
+                Ok(true) => any_entry_moved = true,
+                Ok(false) => {}
+                Err(error) => {
+                    *first_error = Some(format!("rename V1 build/{build_dir}: {error}"));
+                    break;
+                }
             }
         }
 
         for (dep_idx, dep_entry) in unit.dep_entries.iter().enumerate() {
             let dep_dst = format!("v1_dep_{idx}_{dep_idx}");
-            if let Err(error) =
-                rename_entry_atomic(&deps_root, dep_entry.as_str(), staging_dir, &dep_dst)
-            {
-                *first_error = Some(format!("rename V1 deps/{dep_entry}: {error}"));
-                break;
+            match rename_entry_atomic(&deps_root, dep_entry.as_str(), staging_dir, &dep_dst) {
+                Ok(true) => any_entry_moved = true,
+                Ok(false) => {}
+                Err(error) => {
+                    *first_error = Some(format!("rename V1 deps/{dep_entry}: {error}"));
+                    break;
+                }
             }
         }
         if first_error.is_some() {
             break;
         }
-        *moved = moved.saturating_add(1);
-        *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
+        if any_entry_moved {
+            *moved = moved.saturating_add(1);
+            *moved_bytes = moved_bytes.saturating_add(unit.allocated_bytes);
+        }
     }
 }
 
@@ -1906,6 +1960,7 @@ mod tests {
             target_root: root.clone(),
             target_dev: dev,
             target_ino: ino,
+            expected_profile_mtime_unix: future_mtime,
             expected_activity_unix: future_mtime,
             expected_target_activity_unix: future_mtime,
             worktree_root: None,
@@ -1925,10 +1980,11 @@ mod tests {
         build_holder.unlock().unwrap();
         drop(build_holder);
 
-        // Once unlocked, sweep applies cleanly!
+        // Once unlocked, sweep applies cleanly AND cleans up empty V2 `build/demo/` dir!
         let r1_ok = execute_action(&sweep_action, &platform, DiskPressure::Calm, false);
         assert_eq!(r1_ok.outcome, ActionOutcome::Applied);
         assert!(!debug.join("build/demo/0123456789abcdef").exists());
+        assert!(!debug.join("build/demo").exists());
 
         // 2. Live lock on `doc/.lock` blocks RemoveDoc
         let doc_holder = fs::File::open(&doc_lock).unwrap();
@@ -1957,6 +2013,7 @@ mod tests {
             target_root: root,
             target_dev: dev,
             target_ino: ino,
+            expected_inc_root_mtime_unix: future_mtime,
             expected_activity_unix: future_mtime,
             expected_target_activity_unix: future_mtime,
             worktree_root: None,
@@ -1964,6 +2021,7 @@ mod tests {
             profile_locks: plocks,
             removals: vec![IncrementalRemoval::WholeCrateDir {
                 dir_name: CompactString::new("app-abc1234567890"),
+                expected_dir_mtime_unix: future_mtime,
                 allocated_bytes: 100,
             }],
             estimated_allocated_bytes: 100,
@@ -2021,13 +2079,14 @@ mod tests {
             target_root: root.clone(),
             target_dev: dev,
             target_ino: ino,
+            expected_profile_mtime_unix: future_mtime,
             expected_activity_unix: future_mtime,
             expected_target_activity_unix: future_mtime,
             worktree_root: None,
             profile_rel: PathBuf::from("debug"),
             profile_locks: SmallVec::new(),
             ops: SweepOps::V1(vec![V1UnitRemoval {
-                fingerprint_dir: CompactString::new("demo-0123456789abcdef"),
+                fingerprint_dir: Some(CompactString::new("demo-0123456789abcdef")),
                 build_dir: Some(CompactString::new("demo-0123456789abcdef")),
                 dep_entries: vec![
                     CompactString::new("demo-0123456789abcdef.dSYM"),
@@ -2049,16 +2108,17 @@ mod tests {
         fs::create_dir_all(debug.join("build/other-1111111111111111")).unwrap();
         fs::write(debug.join("deps/libother-1111111111111111.rlib"), b"keep").unwrap();
         let v1_missing_fp = ReclaimAction::SweepBuildUnits {
-            target_root: root,
+            target_root: root.clone(),
             target_dev: dev,
             target_ino: ino,
+            expected_profile_mtime_unix: future_mtime,
             expected_activity_unix: future_mtime,
             expected_target_activity_unix: future_mtime,
             worktree_root: None,
             profile_rel: PathBuf::from("debug"),
             profile_locks: SmallVec::new(),
             ops: SweepOps::V1(vec![V1UnitRemoval {
-                fingerprint_dir: CompactString::new("other-1111111111111111"),
+                fingerprint_dir: Some(CompactString::new("other-1111111111111111")),
                 build_dir: Some(CompactString::new("other-1111111111111111")),
                 dep_entries: vec![CompactString::new("libother-1111111111111111.rlib")],
                 allocated_bytes: 200,
@@ -2073,6 +2133,31 @@ mod tests {
         ));
         assert!(debug.join("build/other-1111111111111111").exists());
         assert!(debug.join("deps/libother-1111111111111111.rlib").exists());
+
+        // Explicit V1 orphan sweep (`fingerprint_dir: None`) cleans orphaned `build/` & `deps/`!
+        let v1_orphan = ReclaimAction::SweepBuildUnits {
+            target_root: root,
+            target_dev: dev,
+            target_ino: ino,
+            expected_profile_mtime_unix: future_mtime,
+            expected_activity_unix: future_mtime,
+            expected_target_activity_unix: future_mtime,
+            worktree_root: None,
+            profile_rel: PathBuf::from("debug"),
+            profile_locks: SmallVec::new(),
+            ops: SweepOps::V1(vec![V1UnitRemoval {
+                fingerprint_dir: None,
+                build_dir: Some(CompactString::new("other-1111111111111111")),
+                dep_entries: vec![CompactString::new("libother-1111111111111111.rlib")],
+                allocated_bytes: 200,
+                reason: SweepUnitReason::IncompleteAbortedUnit,
+            }]),
+            estimated_allocated_bytes: 200,
+        };
+        let r_orphan = execute_action(&v1_orphan, &platform, DiskPressure::Calm, false);
+        assert_eq!(r_orphan.outcome, ActionOutcome::Applied);
+        assert!(!debug.join("build/other-1111111111111111").exists());
+        assert!(!debug.join("deps/libother-1111111111111111.rlib").exists());
     }
 
     #[cfg(unix)]
@@ -2156,6 +2241,7 @@ mod tests {
             target_root: t1.clone(),
             target_dev: meta_dev(&m1),
             target_ino: meta_ino(&m1),
+            expected_root_mtime_unix: meta_mtime_unix(&m1),
             expected_activity_unix: future,
             worktree_root: Some(wt1.clone()),
             all_locks: vec![nested_lock.clone()],
@@ -2167,6 +2253,7 @@ mod tests {
             target_root: t2.clone(),
             target_dev: meta_dev(&m2),
             target_ino: meta_ino(&m2),
+            expected_root_mtime_unix: meta_mtime_unix(&m2),
             expected_activity_unix: future,
             worktree_root: None,
             all_locks: vec![],
@@ -2343,6 +2430,7 @@ mod tests {
             target_root: root.clone(),
             target_dev: dev,
             target_ino: ino,
+            expected_profile_mtime_unix: meta_mtime_unix(&debug_meta),
             expected_activity_unix: meta_mtime_unix(&debug_meta),
             expected_target_activity_unix: meta_mtime_unix(&ri_meta),
             worktree_root: Some(wt.clone()),
@@ -2436,6 +2524,7 @@ mod tests {
             target_root: target.clone(),
             target_dev: tdev,
             target_ino: tino,
+            expected_profile_mtime_unix: baseline_mtime,
             expected_activity_unix: baseline_mtime,
             expected_target_activity_unix: baseline_mtime,
             worktree_root: None,
@@ -2461,6 +2550,7 @@ mod tests {
             target_root: target.clone(),
             target_dev: tdev,
             target_ino: tino,
+            expected_profile_mtime_unix: baseline_mtime + 7200,
             expected_activity_unix: baseline_mtime + 7200,
             expected_target_activity_unix: baseline_mtime + 7200,
             worktree_root: None,
@@ -2503,9 +2593,10 @@ mod tests {
         )
         .unwrap();
         let inc_action = ReclaimAction::PruneIncremental {
-            target_root: target,
+            target_root: target.clone(),
             target_dev: tdev,
             target_ino: tino,
+            expected_inc_root_mtime_unix: baseline_mtime + 7200,
             expected_activity_unix: baseline_mtime + 7200,
             expected_target_activity_unix: baseline_mtime + 7200,
             worktree_root: None,
@@ -2513,6 +2604,7 @@ mod tests {
             profile_locks: SmallVec::new(),
             removals: vec![IncrementalRemoval::WholeCrateDir {
                 dir_name: CompactString::new("demo-abc1234567890"),
+                expected_dir_mtime_unix: baseline_mtime + 7200,
                 allocated_bytes: 1024,
             }],
             estimated_allocated_bytes: 1024,
@@ -2524,5 +2616,25 @@ mod tests {
                 if reason == "incremental_mtime_advanced"
         ));
         assert!(inc_crate.exists());
+
+        // 5. Regression: after `SweepBuildUnits` bumps `target/` dir mtime above older artifact
+        //    `expected_activity_unix`, `EvictTarget` MUST succeed using `expected_root_mtime_unix`!
+        let post_sweep_meta = fs::symlink_metadata(&target).unwrap();
+        let post_sweep_root_mtime = meta_mtime_unix(&post_sweep_meta);
+        let evict_after_sweep = ReclaimAction::EvictTarget {
+            rule: crate::model::EvictRule::R1DeadWorktree,
+            target_root: target.clone(),
+            target_dev: tdev,
+            target_ino: tino,
+            expected_root_mtime_unix: post_sweep_root_mtime,
+            expected_activity_unix: post_sweep_root_mtime.saturating_sub(3600),
+            worktree_root: None,
+            all_locks: vec![],
+            estimated_allocated_bytes: 1024,
+            reason: CompactString::new("merged_clean_linked_worktree"),
+        };
+        let res_evict = execute_action(&evict_after_sweep, &plat, DiskPressure::Calm, false);
+        assert_eq!(res_evict.outcome, ActionOutcome::Applied);
+        assert!(!target.exists());
     }
 }

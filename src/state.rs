@@ -235,6 +235,7 @@ mod tests {
             doc_dir: None,
             root_lock_file: None,
             root_locked_now: false,
+            root_mtime_unix: 500,
             allocated_bytes: 1024,
             last_activity_unix: 500,
         };

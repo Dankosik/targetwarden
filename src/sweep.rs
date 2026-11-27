@@ -129,6 +129,7 @@ pub(crate) fn plan_profile_build_sweep(
         target_root: target.root.clone(),
         target_dev: target.dev_id,
         target_ino: target.ino,
+        expected_profile_mtime_unix: profile.profile_mtime_unix,
         expected_activity_unix: profile.last_activity_unix,
         expected_target_activity_unix: target.last_activity_unix,
         worktree_root: target.worktree_root().map(Path::to_path_buf),
@@ -224,7 +225,12 @@ fn sweep_v1_layer(
             BuildUnitId::V2 { .. } => None,
         })
         .collect();
-    removals.sort_by(|a, b| a.fingerprint_dir.cmp(&b.fingerprint_dir));
+    removals.sort_by(|a, b| {
+        a.fingerprint_dir
+            .cmp(&b.fingerprint_dir)
+            .then_with(|| a.build_dir.cmp(&b.build_dir))
+            .then_with(|| a.dep_entries.cmp(&b.dep_entries))
+    });
     removals
 }
 
@@ -291,8 +297,13 @@ fn select_swept_units(
         }
     }
 
-    // 4. Seed: top-K active units per `(pkg_group, target_kind, target_name)` across all JSON anchors.
-    if !drop_anchors && !active_rustc_hashes.is_empty() {
+    // 4. Seed: top-K active units per `(pkg_group, target_kind, target_name)` across all JSON anchors,
+    //    skipping anchors that are stale relative to the profile's latest build (`max_t`).
+    //    Live dependencies of any age remain 100% protected via BFS in step 5.
+    if !drop_anchors
+        && !active_rustc_hashes.is_empty()
+        && let Some(max_t) = max_mtime
+    {
         type GroupKey<'a> = (&'a str, UnitTargetKind, &'a str);
         let mut groups: HashMap<GroupKey<'_>, Vec<(u64, usize)>> = HashMap::new();
 
@@ -305,7 +316,11 @@ fn select_swept_units(
             } = &unit.metadata
                 && active_rustc_hashes.contains(rustc_hash)
             {
+                let lag_secs = max_t.saturating_sub(*mtime_unix);
                 for anchor in targets {
+                    if lag_secs > config.sweep.stale_anchor_secs(anchor.target_kind, pressure) {
+                        continue;
+                    }
                     groups
                         .entry((
                             unit.pkg_group.as_str(),
@@ -378,7 +393,7 @@ fn unit_sort_key(id: &BuildUnitId) -> (&str, &str) {
         BuildUnitId::V1 {
             fingerprint_dir,
             unit_hash,
-        } => (fingerprint_dir.as_str(), unit_hash.as_str()),
+        } => (fingerprint_dir.as_deref().unwrap_or(""), unit_hash.as_str()),
     }
 }
 
@@ -402,16 +417,16 @@ fn unit_matches_pinned_path(
             fingerprint_dir,
             unit_hash,
         } => {
-            let fp_dir = profile_path
-                .join(".fingerprint")
-                .join(fingerprint_dir.as_str());
+            let fp_dir = fingerprint_dir
+                .as_deref()
+                .map(|fp| profile_path.join(".fingerprint").join(fp));
             let build_dir = unit
                 .v1_build_dir
                 .as_deref()
                 .map(|b| profile_path.join("build").join(b));
             let deps_dir = profile_path.join("deps");
             pinned_unit_paths.iter().any(|p| {
-                p.starts_with(&fp_dir)
+                fp_dir.as_ref().is_some_and(|fp| p.starts_with(fp))
                     || build_dir.as_ref().is_some_and(|bd| p.starts_with(bd))
                     || (p.starts_with(&deps_dir)
                         && p.file_name()
@@ -479,6 +494,13 @@ pub(crate) fn plan_profile_incremental_prune(
 
     let inc_cooldown = config.sweep.inc_cooldown_secs(pressure);
     let keep_m = config.sweep.inc_finalized_keep_m(pressure);
+    let stale_crate_window = config.sweep.inc_stale_crate_secs(pressure);
+    let max_inc_mtime = profile
+        .incremental_dirs
+        .iter()
+        .map(|d| d.latest_mtime_unix)
+        .max()
+        .unwrap_or(0);
 
     let mut groups: BTreeMap<&str, Vec<&IncrementalDir>> = BTreeMap::new();
     for dir in &profile.incremental_dirs {
@@ -506,12 +528,15 @@ pub(crate) fn plan_profile_incremental_prune(
             if !dir.any_locked && age >= inc_cooldown {
                 removals.push(IncrementalRemoval::WholeCrateDir {
                     dir_name: dir.dir_name.clone(),
+                    expected_dir_mtime_unix: dir.dir_mtime_unix,
                     allocated_bytes: dir.allocated_bytes,
                 });
             }
         }
 
-        // Level 1b: keep top `M` finalized dirs (+ any locked or cooling dir).
+        // Level 1b: keep top `M` non-stale finalized dirs (+ any locked or cooling dir).
+        // Crates/tests untouched for > `stale_crate_window` behind the profile's latest
+        // incremental compile drop their `M` slot so deleted tests/crates do not linger forever.
         finalized.sort_by(|a, b| {
             b.latest_mtime_unix
                 .cmp(&a.latest_mtime_unix)
@@ -520,10 +545,13 @@ pub(crate) fn plan_profile_incremental_prune(
 
         for (rank, dir) in finalized.into_iter().enumerate() {
             let age = now_unix.saturating_sub(dir.latest_mtime_unix);
-            let keep_dir = rank < keep_m || dir.any_locked || age < inc_cooldown;
+            let stale_crate =
+                max_inc_mtime.saturating_sub(dir.latest_mtime_unix) > stale_crate_window;
+            let keep_dir = (!stale_crate && rank < keep_m) || dir.any_locked || age < inc_cooldown;
             if !keep_dir {
                 removals.push(IncrementalRemoval::WholeCrateDir {
                     dir_name: dir.dir_name.clone(),
+                    expected_dir_mtime_unix: dir.dir_mtime_unix,
                     allocated_bytes: dir.allocated_bytes,
                 });
                 continue;
@@ -580,6 +608,7 @@ pub(crate) fn plan_profile_incremental_prune(
         target_root: target.root.clone(),
         target_dev: target.dev_id,
         target_ino: target.ino,
+        expected_inc_root_mtime_unix: profile.inc_root_mtime_unix,
         expected_activity_unix: profile.last_activity_unix,
         expected_target_activity_unix: target.last_activity_unix,
         worktree_root: target.worktree_root().map(Path::to_path_buf),
@@ -629,6 +658,7 @@ mod tests {
             doc_dir,
             root_lock_file: None,
             root_locked_now: false,
+            root_mtime_unix: NOW - 3 * HOUR,
             allocated_bytes: 10_000_000,
             last_activity_unix: NOW - 3 * HOUR,
         }
@@ -684,6 +714,8 @@ mod tests {
             v2_units: vec![],
             v1_units: vec![],
             incremental_dirs: vec![],
+            profile_mtime_unix: NOW - 3 * HOUR,
+            inc_root_mtime_unix: NOW - 3 * HOUR,
             allocated_bytes: 0,
             last_activity_unix: NOW - 3 * HOUR,
         }
@@ -927,7 +959,7 @@ mod tests {
         });
         profile.v1_units = vec![BuildUnit {
             id: BuildUnitId::V1 {
-                fingerprint_dir: CompactString::new("app-2222222222222222"),
+                fingerprint_dir: Some(CompactString::new("app-2222222222222222")),
                 unit_hash: CompactString::new("2222222222222222"),
             },
             pkg_group: CompactString::new("app"),
@@ -957,7 +989,7 @@ mod tests {
             ReclaimAction::SweepBuildUnits {
                 ops: SweepOps::V1(ref v1),
                 ..
-            } if v1.len() == 1 && v1[0].fingerprint_dir == "app-2222222222222222"
+            } if v1.len() == 1 && v1[0].fingerprint_dir.as_deref() == Some("app-2222222222222222")
         ));
 
         // Corrupt fingerprint -> profile-local fail-closed (None)
@@ -993,6 +1025,7 @@ mod tests {
                 allocated_bytes: 200,
             }],
             any_locked: false,
+            dir_mtime_unix: NOW - 3 * HOUR,
             latest_mtime_unix: NOW - 3 * HOUR,
             allocated_bytes: 200,
         };
@@ -1026,6 +1059,7 @@ mod tests {
                 },
             ],
             any_locked: false,
+            dir_mtime_unix: NOW - 4 * HOUR,
             latest_mtime_unix: NOW - 4 * HOUR,
             allocated_bytes: 1900,
         };
@@ -1041,6 +1075,7 @@ mod tests {
                 allocated_bytes: 800,
             }],
             any_locked: false,
+            dir_mtime_unix: NOW - 20 * HOUR,
             latest_mtime_unix: NOW - 20 * HOUR,
             allocated_bytes: 800,
         };
@@ -1056,6 +1091,7 @@ mod tests {
                 allocated_bytes: 900,
             }],
             any_locked: false,
+            dir_mtime_unix: NOW - 40 * HOUR,
             latest_mtime_unix: NOW - 40 * HOUR,
             allocated_bytes: 900,
         };
@@ -1080,10 +1116,12 @@ mod tests {
         // inside finalized_1, older finalized + working sessions removed via SingleSession!
         assert!(removals.contains(&IncrementalRemoval::WholeCrateDir {
             dir_name: CompactString::new("app-work000000001"),
+            expected_dir_mtime_unix: NOW - 3 * HOUR,
             allocated_bytes: 200,
         }));
         assert!(removals.contains(&IncrementalRemoval::WholeCrateDir {
             dir_name: CompactString::new("app-fin0000000003"),
+            expected_dir_mtime_unix: NOW - 40 * HOUR,
             allocated_bytes: 900,
         }));
         assert!(!removals.iter().any(|r| matches!(
@@ -1125,5 +1163,154 @@ mod tests {
         doc_locked.locked_now = true;
         let locked_target = mk_target(profile, Some(doc_locked));
         assert!(plan_doc_prune(&locked_target, NOW, DiskPressure::High, &cfg).is_none());
+    }
+
+    #[test]
+    fn stale_deleted_tests_and_removed_crates_expire_while_reachable_old_deps_and_idle_repos_survive()
+     {
+        let cfg = Config::default();
+        let rustc = 777;
+        let mut profile = base_profile(TargetLayout::BuildDirV2);
+
+        // Fresh active app depends on a 30-day-old live dep (MUST survive via BFS!)
+        // Deleted test (10d behind max_t > 7d Calm leaf TTL) and removed crate (20d > 14d Calm core TTL)
+        // have active rustc_hash but are unreachable -> MUST be swept!
+        profile.v2_units = vec![
+            v2_unit(
+                "app",
+                "1111111111111111",
+                UnitTargetKind::Bin,
+                "app",
+                Some(10),
+                rustc,
+                &[20],
+                NOW - 3 * HOUR,
+                1000,
+            ),
+            v2_unit(
+                "live_old_dep",
+                "2222222222222222",
+                UnitTargetKind::Lib,
+                "live_old_dep",
+                Some(20),
+                rustc,
+                &[],
+                NOW - 30 * DAY,
+                2000,
+            ),
+            v2_unit(
+                "app",
+                "3333333333333333",
+                UnitTargetKind::Test,
+                "deleted_it_test",
+                Some(30),
+                rustc,
+                &[],
+                NOW - 10 * DAY,
+                1500,
+            ),
+            v2_unit(
+                "removed_crate",
+                "4444444444444444",
+                UnitTargetKind::Lib,
+                "removed_crate",
+                Some(40),
+                rustc,
+                &[],
+                NOW - 20 * DAY,
+                3000,
+            ),
+        ];
+
+        let target = mk_target(profile, None);
+        let action = plan_profile_build_sweep(
+            &target,
+            &target.profiles[0],
+            &[],
+            NOW,
+            DiskPressure::Calm,
+            &cfg,
+        )
+        .expect("expected stale unreachable units to sweep");
+        let ReclaimAction::SweepBuildUnits {
+            ops: SweepOps::V2(removals),
+            ..
+        } = action
+        else {
+            panic!("expected V2 sweep");
+        };
+        let hashes: Vec<&str> = removals.iter().map(|r| r.unit_hash.as_str()).collect();
+        assert!(!hashes.contains(&"1111111111111111"));
+        assert!(!hashes.contains(&"2222222222222222")); // 30d live dep protected by BFS!
+        assert!(hashes.contains(&"3333333333333333")); // deleted test swept
+        assert!(hashes.contains(&"4444444444444444")); // removed crate swept
+
+        // R3 incremental: stale deleted crate (20d behind active app) is swept,
+        // while an entirely idle repo (where all incremental dirs are 20d old) keeps its top-M!
+        let mut inc_profile = base_profile(TargetLayout::BuildDirV2);
+        let fresh_inc = IncrementalDir {
+            dir_name: CompactString::new("app-1111111111111"),
+            crate_name: CompactString::new("app"),
+            sessions: vec![IncrementalSession {
+                dir_name: CompactString::new("s-001-aaa-fin"),
+                lock_file: None,
+                state: SessionState::Finalized,
+                locked: false,
+                mtime_unix: NOW - 3 * HOUR,
+                allocated_bytes: 500,
+            }],
+            any_locked: false,
+            dir_mtime_unix: NOW - 3 * HOUR,
+            latest_mtime_unix: NOW - 3 * HOUR,
+            allocated_bytes: 500,
+        };
+        let dead_inc = IncrementalDir {
+            dir_name: CompactString::new("deleted_test-2222222222222"),
+            crate_name: CompactString::new("deleted_test"),
+            sessions: vec![IncrementalSession {
+                dir_name: CompactString::new("s-001-bbb-fin"),
+                lock_file: None,
+                state: SessionState::Finalized,
+                locked: false,
+                mtime_unix: NOW - 20 * DAY,
+                allocated_bytes: 800,
+            }],
+            any_locked: false,
+            dir_mtime_unix: NOW - 20 * DAY,
+            latest_mtime_unix: NOW - 20 * DAY,
+            allocated_bytes: 800,
+        };
+
+        inc_profile.incremental_dirs = vec![fresh_inc, dead_inc.clone()];
+        let active_target = mk_target(inc_profile, None);
+        let inc_action = plan_profile_incremental_prune(
+            &active_target,
+            &active_target.profiles[0],
+            NOW,
+            DiskPressure::Calm,
+            &cfg,
+        )
+        .expect("expected dead incremental dir to prune");
+        assert!(matches!(
+            inc_action,
+            ReclaimAction::PruneIncremental { ref removals, .. }
+                if removals.len() == 1
+                    && matches!(&removals[0], IncrementalRemoval::WholeCrateDir { dir_name, .. } if dir_name == "deleted_test-2222222222222")
+        ));
+
+        // Idle repo with only the 20d-old dir (0s behind max_inc_mtime) -> preserved!
+        let mut idle_profile = base_profile(TargetLayout::BuildDirV2);
+        idle_profile.incremental_dirs = vec![dead_inc];
+        let idle_target = mk_target(idle_profile, None);
+        assert!(
+            plan_profile_incremental_prune(
+                &idle_target,
+                &idle_target.profiles[0],
+                NOW,
+                DiskPressure::Calm,
+                &cfg,
+            )
+            .is_none()
+        );
     }
 }

@@ -25,7 +25,7 @@ targetwarden watch [--dry-run]
 targetwarden pin <PATH> [--allow-sweep] [--note TEXT]
 targetwarden unpin <PATH>
 targetwarden history [--limit 20] [--format text|json]
-targetwarden install [--dry-run]
+targetwarden install [--dry-run] [--watch-dry-run]
 targetwarden uninstall
 targetwarden completions <bash|zsh|fish>
 ```

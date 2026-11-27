@@ -35,7 +35,11 @@ pub(crate) struct UninstallOutcome {
 
 /// Pure LaunchAgent plist renderer (`Nice = 10`, `Aqua`, `ThrottleInterval = 60`,
 /// deliberately omitting `ProcessType=Background` and `LowPriorityIO`).
-pub(crate) fn render_plist(exe: &Path, home: &Path) -> Result<String, AppError> {
+pub(crate) fn render_plist(
+    exe: &Path,
+    home: &Path,
+    watch_dry_run: bool,
+) -> Result<String, AppError> {
     if !is_absolute_launch_path(exe) {
         return Err(AppError::InvalidPath {
             path: exe.to_path_buf(),
@@ -58,6 +62,11 @@ pub(crate) fn render_plist(exe: &Path, home: &Path) -> Result<String, AppError> 
 
     let escaped_exe = escape_xml(exe_str);
     let escaped_log = escape_xml(&log_str);
+    let extra_watch_arg = if watch_dry_run {
+        "\n        <string>--dry-run</string>"
+    } else {
+        ""
+    };
 
     Ok(format!(
         "\
@@ -70,7 +79,7 @@ pub(crate) fn render_plist(exe: &Path, home: &Path) -> Result<String, AppError> 
     <key>ProgramArguments</key>
     <array>
         <string>{escaped_exe}</string>
-        <string>watch</string>
+        <string>watch</string>{extra_watch_arg}
     </array>
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
@@ -96,6 +105,7 @@ pub(crate) fn install(
     exe: &Path,
     home: &Path,
     dry_run: bool,
+    watch_dry_run: bool,
     platform: &impl Platform,
 ) -> Result<InstallOutcome, AppError> {
     let uid = platform.euid()?;
@@ -111,7 +121,7 @@ pub(crate) fn install(
     let log_path = log_path_for(home);
 
     let plist_str = path_to_valid_xml_utf8(&plist_path)?.to_owned();
-    let plist_xml = render_plist(exe, home)?;
+    let plist_xml = render_plist(exe, home, watch_dry_run)?;
     let launchctl_actions = vec![
         format!("launchctl bootout {service_target}"),
         format!("launchctl enable {service_target}"),
@@ -380,7 +390,7 @@ mod tests {
     fn render_plist_escapes_xml_and_omits_qos_throttling_keys() {
         let exe = Path::new("/opt/tools/a&b/<c>\"d'e/targetwarden");
         let home = Path::new("/Users/dev&ops");
-        let xml = render_plist(exe, home).unwrap();
+        let xml = render_plist(exe, home, false).unwrap();
 
         let expected_label = format!("<string>{LAUNCHAGENT_LABEL}</string>");
         let expected_exe =
@@ -389,6 +399,7 @@ mod tests {
         assert!(xml.contains(&expected_label));
         assert!(xml.contains(expected_exe));
         assert!(xml.contains("<string>watch</string>"));
+        assert!(!xml.contains("<string>--dry-run</string>"));
         assert!(xml.contains("<key>LimitLoadToSessionType</key>\n    <string>Aqua</string>"));
         assert!(xml.contains("<key>RunAtLoad</key>\n    <true/>"));
         assert!(xml.contains("<key>KeepAlive</key>\n    <true/>"));
@@ -396,14 +407,18 @@ mod tests {
         assert!(xml.contains("<key>Nice</key>\n    <integer>10</integer>"));
         assert!(xml.contains(expected_log));
 
+        // `--watch-dry-run` appends `<string>--dry-run</string>` to ProgramArguments
+        let xml_dry = render_plist(exe, home, true).unwrap();
+        assert!(xml_dry.contains("<string>watch</string>\n        <string>--dry-run</string>"));
+
         // Must deliberately omit ProcessType=Background and LowPriorityIO per spec Section 4.5.
         assert!(!xml.contains("ProcessType"));
         assert!(!xml.contains("Background"));
         assert!(!xml.contains("LowPriorityIO"));
 
         // Reject relative paths and XML-illegal control bytes.
-        assert!(render_plist(Path::new("relative/targetwarden"), home).is_err());
-        assert!(render_plist(Path::new("/usr/bin/bad\x07exe"), home).is_err());
+        assert!(render_plist(Path::new("relative/targetwarden"), home, false).is_err());
+        assert!(render_plist(Path::new("/usr/bin/bad\x07exe"), home, false).is_err());
     }
 
     #[test]
@@ -413,7 +428,7 @@ mod tests {
         let exe = PathBuf::from("/usr/local/bin/targetwarden");
         let platform = FakePlatform::new(501, vec![]);
 
-        let outcome = install(&exe, home, true, &platform).unwrap();
+        let outcome = install(&exe, home, true, false, &platform).unwrap();
         assert_eq!(outcome.label, LAUNCHAGENT_LABEL);
         assert_eq!(outcome.domain, "gui/501");
         assert!(!outcome.plist_path.exists());
@@ -443,7 +458,7 @@ mod tests {
             ],
         );
 
-        let installed = install(&exe, home, false, &platform).unwrap();
+        let installed = install(&exe, home, false, false, &platform).unwrap();
         assert!(installed.plist_path.exists());
         assert!(home.join("Library/Logs").is_dir());
         let written = fs::read_to_string(&installed.plist_path).unwrap();
@@ -489,7 +504,7 @@ mod tests {
 
         let root_plat = FakePlatform::new(0, vec![]);
         assert!(matches!(
-            install(&exe, tmp.path(), false, &root_plat),
+            install(&exe, tmp.path(), false, false, &root_plat),
             Err(AppError::RunningAsRoot)
         ));
         assert!(matches!(
@@ -506,7 +521,7 @@ mod tests {
             ],
         );
         assert!(matches!(
-            install(&exe, tmp.path(), false, &fail_boot),
+            install(&exe, tmp.path(), false, false, &fail_boot),
             Err(AppError::CommandFailed {
                 program: "launchctl",
                 ..

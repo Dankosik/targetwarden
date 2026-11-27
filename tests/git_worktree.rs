@@ -431,8 +431,150 @@ fn concurrent_run_lock_contention_fails_closed_after_retry_budget() {
     holder.unlock().unwrap();
     drop(holder);
 
-    assert_eq!(out.status.code(), Some(1));
+    assert!(out.status.code() == Some(1));
     assert!(out.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("run.lock"));
+}
+
+#[test]
+fn stale_rebase_head_main_merge_head_and_sweep_then_evict_never_deadlock() {
+    let home = tempfile::tempdir().unwrap();
+    let cfg_path = write_calm_config(home.path());
+    let state_dir = home.path().join("state");
+    let projects = home.path().join("Projects");
+    let main_repo = projects.join("main_repo");
+    fs::create_dir_all(&main_repo).unwrap();
+
+    git(&main_repo, &["init", "-b", "main"]);
+    fs::write(main_repo.join(".gitignore"), "/target\n").unwrap();
+    fs::write(main_repo.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+    git(&main_repo, &["add", ".gitignore", "Cargo.toml"]);
+    git(&main_repo, &["commit", "-m", "initial"]);
+    create_cargo_target(&main_repo, Duration::from_secs(48 * 3600));
+
+    // Simulate an active merge in `main_repo/.git/MERGE_HEAD` — must protect `main_repo` ONLY,
+    // NOT linked worktrees!
+    fs::write(main_repo.join(".git/MERGE_HEAD"), b"deadbeef\n").unwrap();
+
+    // Linked worktree with:
+    //  1) Stale `REBASE_HEAD` (no `rebase-merge/`) -> must NOT falsely mark `git_op`!
+    //  2) Swept V2 duplicate + pruned incremental session before full eviction ->
+    //     must NOT reset target age or fail `EvictTarget` with `mtime_advanced`!
+    let wt = projects.join("wt_sweep_then_evict");
+    git(
+        &main_repo,
+        &["worktree", "add", "-b", "feat/done", wt.to_str().unwrap()],
+    );
+    create_cargo_target(&wt, Duration::from_secs(5 * 3600));
+
+    // Add an incomplete V2 unit and an old incremental session so `sweep-only` mutates both
+    // `target/` (via internal staging) and `incremental/<crate>/` (via session removal)!
+    let wt_target = wt.join("target");
+    fs::create_dir_all(wt_target.join("debug/build/aborted/2222222222222222")).unwrap();
+    let inc_crate = wt_target.join("debug/incremental/demo-abc1234567890");
+    fs::create_dir_all(inc_crate.join("s-002-new-final")).unwrap();
+    fs::create_dir_all(inc_crate.join("s-001-old-final")).unwrap();
+    fs::write(inc_crate.join("s-002-new-final/dep.bin"), b"new").unwrap();
+    fs::write(inc_crate.join("s-001-old-final/dep.bin"), b"old").unwrap();
+    fs::write(inc_crate.join("s-002-new.lock"), b"").unwrap();
+    fs::write(inc_crate.join("s-001-old.lock"), b"").unwrap();
+
+    // Backdate everything inside `wt/target` to > 5h ago (with s-002 newer than s-001)
+    let age_5h = std::time::SystemTime::now() - Duration::from_secs(5 * 3600);
+    let age_8h = std::time::SystemTime::now() - Duration::from_secs(8 * 3600);
+    for entry in walkdir::WalkDir::new(&wt_target)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            let ts = if entry.path().to_string_lossy().contains("s-001-old") {
+                age_8h
+            } else {
+                age_5h
+            };
+            if let Ok(f) = fs::OpenOptions::new().write(true).open(entry.path()) {
+                let _ = f.set_modified(ts);
+            }
+        }
+    }
+    let mut dirs: Vec<_> = walkdir::WalkDir::new(&wt_target)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_type().is_dir())
+        .map(|e| e.into_path())
+        .collect();
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    for d in dirs {
+        let _ = StdCommand::new("/usr/bin/touch")
+            .args(["-m", "-d", "2020-01-01T00:00:00Z"])
+            .arg(&d)
+            .output();
+    }
+
+    // Plant stale `REBASE_HEAD` inside the worktree's git dir (without `rebase-merge/`)
+    let gitdir_out = StdCommand::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    let wt_gitdir = std::path::PathBuf::from(
+        String::from_utf8(gitdir_out.stdout)
+            .unwrap()
+            .trim()
+            .to_owned(),
+    );
+    fs::write(wt_gitdir.join("REBASE_HEAD"), b"0123456789abcdef\n").unwrap();
+
+    // Step 1: status sees `main_repo` as `protected` (`git_op`) and `wt` as `eligible`!
+    let status = cli(home.path(), &state_dir, &cfg_path)
+        .args(["status", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let targets = status_json["targets"].as_array().unwrap();
+    let main_entry = targets
+        .iter()
+        .find(|t| t["root"].as_str().unwrap().contains("main_repo"))
+        .unwrap();
+    let wt_entry = targets
+        .iter()
+        .find(|t| t["root"].as_str().unwrap().contains("wt_sweep_then_evict"))
+        .unwrap();
+    assert_eq!(main_entry["verdict"], "protected");
+    assert_eq!(wt_entry["verdict"], "eligible", "wt={wt_entry}");
+
+    // Step 2: run `reclaim --profile sweep-only` (bumps `target/` and `incremental/<crate>/` mtimes to NOW!)
+    let sweep = cli(home.path(), &state_dir, &cfg_path)
+        .args(["reclaim", "--profile", "sweep-only", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(sweep.status.success());
+    let sweep_json: serde_json::Value = serde_json::from_slice(&sweep.stdout).unwrap();
+    assert!(
+        sweep_json["summary"]["applied_actions"].as_u64().unwrap() >= 2,
+        "expected both R2 and R3 to apply: {sweep_json}"
+    );
+    assert!(!wt_target.join("debug/build/aborted").exists());
+    assert!(!inc_crate.join("s-001-old-final").exists());
+    assert!(inc_crate.join("s-002-new-final").exists());
+
+    // Step 3: immediately run `reclaim --profile full` -> MUST NOT deadlock with `mtime_advanced`
+    //         and MUST NOT have reset age to 0! `R1` MUST evict `wt/target` cleanly!
+    let evict = cli(home.path(), &state_dir, &cfg_path)
+        .args(["reclaim", "--profile", "full", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(evict.status.success());
+    let evict_json: serde_json::Value = serde_json::from_slice(&evict.stdout).unwrap();
+    assert_eq!(
+        evict_json["summary"]["applied_actions"], 1,
+        "evict={evict_json}"
+    );
+    assert_eq!(evict_json["receipts"][0]["rule"], "r1_dead_worktree");
+    assert!(!wt_target.exists());
+    assert!(wt.join("Cargo.toml").exists());
 }

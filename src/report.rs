@@ -860,6 +860,7 @@ mod tests {
             doc_dir: None,
             root_lock_file: None,
             root_locked_now: false,
+            root_mtime_unix: 1000,
             allocated_bytes: 2 * GIB,
             last_activity_unix: 1000,
         };

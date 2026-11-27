@@ -342,6 +342,18 @@ pub(crate) fn scan<P: Platform + Sync>(
         );
     }
 
+    for target in &mut final_targets {
+        for profile in &mut target.profiles {
+            if profile.last_activity_unix == 0 {
+                profile.last_activity_unix = profile.profile_mtime_unix;
+            }
+            target.last_activity_unix = target.last_activity_unix.max(profile.last_activity_unix);
+        }
+        if target.last_activity_unix == 0 {
+            target.last_activity_unix = target.root_mtime_unix;
+        }
+    }
+
     final_targets.sort_by(|a, b| a.root.cmp(&b.root));
     leftover_staging.sort_by(|a, b| a.staging_dir.cmp(&b.staging_dir));
 
@@ -830,6 +842,9 @@ fn push_candidate(
 enum MtimePolicy {
     None,
     UpToDepth(usize),
+    /// Track `s-*.lock` files (depth 1) and `s-*` session dirs/files (depth 1..=2) inside
+    /// `incremental/<crate>-<base36>/` without folding depth-0 `<crate>/` directory mtime.
+    IncrementalCrateDir,
     V2PkgDir,
     #[cfg_attr(not(unix), allow(dead_code))]
     V2UnitFingerprint {
@@ -1173,6 +1188,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             return;
         };
         let (dev_id, ino) = file_identity(target_root, &lmeta);
+        let root_mtime_unix = meta_mtime_unix(&lmeta);
         let target_key = (dev_id, ino);
         if !self.visited_targets.insert(target_key) {
             return;
@@ -1208,6 +1224,43 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             }
         } else {
             false
+        };
+
+        let git = inspect_git_for_target(target_root, self.platform, &mut self.git_repo_cache);
+        let worktree_kind = match &git {
+            GitDiscovery::Inspected(info) => info.worktree_kind,
+            GitDiscovery::NotInGitRepo | GitDiscovery::Failed(_) => WorktreeKind::NonGit,
+        };
+        let project_dir = match &git {
+            GitDiscovery::Inspected(info) => Some(info.worktree_root.clone()),
+            GitDiscovery::NotInGitRepo | GitDiscovery::Failed(_) => {
+                infer_non_git_project_dir(target_root)
+                    .or_else(|| parent_project_dir.map(Path::to_path_buf))
+            }
+        };
+        if let Some(proj) = &project_dir
+            && pin_marker_present_fail_closed(&proj.join(PIN_MARKER_FILE))
+        {
+            has_pin_marker = true;
+        }
+        let child_project_dir = project_dir.clone();
+
+        // Skip expensive single-threaded `fingerprint/*.json` & `s-*.lock` parsing when the
+        // target is already unconditionally `Protected` by fast barriers.
+        let target_hard_blocked = symlink_or_mount_boundary
+            || root_locked_now
+            || has_pin_marker
+            || match &git {
+                GitDiscovery::Failed(_) => true,
+                GitDiscovery::Inspected(info) => {
+                    info.git_op_in_progress || info.has_tracked_files_in_target
+                }
+                GitDiscovery::NotInGitRepo => false,
+            };
+        let effective_detail = if target_hard_blocked {
+            ScanDetail::Inventory
+        } else {
+            self.detail
         };
 
         // Fail closed when `target_root` cannot be read: never classify an unreadable
@@ -1268,7 +1321,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                     let info = inspect_doc_dir(
                         &entry_path,
                         self.platform,
-                        self.detail,
+                        effective_detail,
                         target_key,
                         &mut seen_hardlinks,
                         &mut self.account_chunks,
@@ -1279,7 +1332,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                     continue;
                 }
                 if name == "tmp" || name == "package" {
-                    if self.detail == ScanDetail::Inventory {
+                    if effective_detail == ScanDetail::Inventory {
                         self.account_chunks.push(AccountChunk {
                             target_key,
                             dest: AccountDest::TargetOnly,
@@ -1303,7 +1356,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                         &entry_path,
                         has_legacy_root_lock.then_some(legacy_root_lock.as_path()),
                         self.platform,
-                        self.detail,
+                        effective_detail,
                         target_key,
                         &mut seen_hardlinks,
                         &mut self.account_chunks,
@@ -1324,7 +1377,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                             &full,
                             has_legacy_root_lock.then_some(legacy_root_lock.as_path()),
                             self.platform,
-                            self.detail,
+                            effective_detail,
                             target_key,
                             &mut seen_hardlinks,
                             &mut self.account_chunks,
@@ -1342,7 +1395,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                 has_unverified_top_entries = true;
             }
             if ft.is_dir() && !ft.is_symlink() {
-                if self.detail == ScanDetail::Inventory {
+                if effective_detail == ScanDetail::Inventory {
                     self.account_chunks.push(AccountChunk {
                         target_key,
                         dest: AccountDest::TargetOnly,
@@ -1359,32 +1412,10 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
             }
         }
 
-        if last_activity_unix == 0 {
-            last_activity_unix = meta_mtime_unix(&lmeta);
-        }
-
         profiles.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         nested_target_roots.sort();
 
         let layout = classify_target_layout(&profiles);
-        let git = inspect_git_for_target(target_root, self.platform, &mut self.git_repo_cache);
-        let worktree_kind = match &git {
-            GitDiscovery::Inspected(info) => info.worktree_kind,
-            GitDiscovery::NotInGitRepo | GitDiscovery::Failed(_) => WorktreeKind::NonGit,
-        };
-        let project_dir = match &git {
-            GitDiscovery::Inspected(info) => Some(info.worktree_root.clone()),
-            GitDiscovery::NotInGitRepo | GitDiscovery::Failed(_) => {
-                infer_non_git_project_dir(target_root)
-                    .or_else(|| parent_project_dir.map(Path::to_path_buf))
-            }
-        };
-        if let Some(proj) = &project_dir
-            && pin_marker_present_fail_closed(&proj.join(PIN_MARKER_FILE))
-        {
-            has_pin_marker = true;
-        }
-        let child_project_dir = project_dir.clone();
 
         self.targets.push((
             CargoTarget {
@@ -1405,6 +1436,7 @@ impl<'a, P: Platform> WorkerContext<'a, P> {
                 doc_dir,
                 root_lock_file,
                 root_locked_now,
+                root_mtime_unix,
                 allocated_bytes,
                 last_activity_unix,
             },
@@ -1555,13 +1587,27 @@ fn inspect_profile_dir(
     let has_v1_deps_dir = fs::symlink_metadata(&deps_root).is_ok_and(|m| m.file_type().is_dir());
     let has_build_dir = fs::symlink_metadata(&build_root).is_ok_and(|m| m.file_type().is_dir());
     let has_inc_dir = fs::symlink_metadata(&inc_root).is_ok_and(|m| m.file_type().is_dir());
+    let profile_mtime_unix = fs::symlink_metadata(profile_path)
+        .map(|m| meta_mtime_unix(&m))
+        .unwrap_or(0);
+    let inc_root_mtime_unix = if has_inc_dir {
+        fs::symlink_metadata(&inc_root)
+            .map(|m| meta_mtime_unix(&m))
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
-    if detail == ScanDetail::Inventory {
+    // Skip deep `fingerprint/*.json` & `s-*.lock` parsing for Inventory scans AND for profiles
+    // currently locked by an active Cargo build (which `safety.rs` unconditionally protects).
+    if detail == ScanDetail::Inventory || locked_now {
         return inspect_profile_inventory(
             rel_path,
             profile_path,
             lock_files,
             locked_now,
+            profile_mtime_unix,
+            inc_root_mtime_unix,
             has_v1_fp_dir,
             has_v1_deps_dir,
             has_build_dir,
@@ -1577,12 +1623,19 @@ fn inspect_profile_dir(
     let mut v2_units: Vec<BuildUnit> = Vec::new();
     let mut incremental_dirs: Vec<IncrementalDir> = Vec::new();
     let mut allocated_bytes: u64 = 0;
-    let mut last_activity_unix: u64 = fs::symlink_metadata(profile_path)
-        .map(|m| meta_mtime_unix(&m))
-        .unwrap_or(0);
+    let mut last_activity_unix: u64 = 0;
+
+    struct OrphanV1Accumulator {
+        pkg_group: CompactString,
+        build_dir: Option<CompactString>,
+        dep_entries: Vec<CompactString>,
+        allocated_bytes: u64,
+        mtime_unix: u64,
+    }
 
     let mut v1_fp_index_by_name: HashMap<CompactString, usize> = HashMap::new();
     let mut v1_hash_to_indices: HashMap<CompactString, SmallVec<[usize; 2]>> = HashMap::new();
+    let mut orphan_v1_by_hash: HashMap<CompactString, OrphanV1Accumulator> = HashMap::new();
 
     // 1. V1 `.fingerprint/<pkg>-<16hex>/`
     if has_v1_fp_dir {
@@ -1625,7 +1678,7 @@ fn inspect_profile_dir(
                         .push(idx);
                     v1_units.push(BuildUnit {
                         id: BuildUnitId::V1 {
-                            fingerprint_dir: dir_name,
+                            fingerprint_dir: Some(dir_name),
                             unit_hash,
                         },
                         pkg_group,
@@ -1642,7 +1695,8 @@ fn inspect_profile_dir(
         }
     }
 
-    // 2. V1 `deps/` (match files and `.dSYM` directories to unique V1 unit_hash)
+    // 2. V1 `deps/` (match files and `.dSYM` directories to unique V1 unit_hash, or record
+    //    orphaned `deps/*-<16hex>*` entries whose `.fingerprint/` dir is already absent)
     if has_v1_deps_dir {
         match fs::read_dir(&deps_root) {
             Ok(entries) => {
@@ -1660,12 +1714,28 @@ fn inspect_profile_dir(
 
                     if let Some(name) = entry.file_name().to_str()
                         && let Some(hash) = extract_16hex_from_dep_name(name)
-                        && let Some(indices) = v1_hash_to_indices.get(hash)
-                        && indices.len() == 1
                     {
-                        let unit = &mut v1_units[indices[0]];
-                        unit.v1_dep_entries.push(CompactString::from(name));
-                        unit.allocated_bytes = unit.allocated_bytes.saturating_add(bytes);
+                        if let Some(indices) = v1_hash_to_indices.get(hash) {
+                            if indices.len() == 1 {
+                                let unit = &mut v1_units[indices[0]];
+                                unit.v1_dep_entries.push(CompactString::from(name));
+                                unit.allocated_bytes = unit.allocated_bytes.saturating_add(bytes);
+                            }
+                        } else if has_v1_fp_dir && !fingerprint_corrupt {
+                            let entry_mtime = meta_mtime_unix(&emeta);
+                            let slot = orphan_v1_by_hash
+                                .entry(CompactString::from(hash))
+                                .or_insert_with(|| OrphanV1Accumulator {
+                                    pkg_group: CompactString::new("orphan"),
+                                    build_dir: None,
+                                    dep_entries: Vec::new(),
+                                    allocated_bytes: 0,
+                                    mtime_unix: 0,
+                                });
+                            slot.dep_entries.push(CompactString::from(name));
+                            slot.allocated_bytes = slot.allocated_bytes.saturating_add(bytes);
+                            slot.mtime_unix = slot.mtime_unix.max(entry_mtime);
+                        }
                     }
                 }
             }
@@ -1705,6 +1775,7 @@ fn inspect_profile_dir(
                     }
 
                     let mut non_v2_sibling_bytes: u64 = 0;
+                    let mut found_v2_child = false;
                     match fs::read_dir(&entry_path) {
                         Ok(children) => {
                             for child in children.flatten() {
@@ -1737,6 +1808,7 @@ fn inspect_profile_dir(
                                     continue;
                                 }
 
+                                found_v2_child = true;
                                 let unit_hash = CompactString::from(child_name);
                                 let fp_sub = child_path.join("fingerprint");
                                 let parsed = if fs::symlink_metadata(&fp_sub)
@@ -1785,6 +1857,33 @@ fn inspect_profile_dir(
                         }
                     }
 
+                    // Orphaned V1 `build/<pkg>-<16hex>/` whose `.fingerprint/` dir is absent.
+                    if !found_v2_child
+                        && has_v1_fp_dir
+                        && !fingerprint_corrupt
+                        && let Some((pkg_group, hash)) = split_pkg_and_16hex(&name)
+                        && !v1_hash_to_indices.contains_key(&hash)
+                    {
+                        let build_mtime = fs::symlink_metadata(&entry_path)
+                            .map(|m| meta_mtime_unix(&m))
+                            .unwrap_or(0);
+                        let slot =
+                            orphan_v1_by_hash
+                                .entry(hash)
+                                .or_insert_with(|| OrphanV1Accumulator {
+                                    pkg_group: pkg_group.clone(),
+                                    build_dir: None,
+                                    dep_entries: Vec::new(),
+                                    allocated_bytes: 0,
+                                    mtime_unix: 0,
+                                });
+                        slot.pkg_group = pkg_group;
+                        slot.build_dir = Some(name);
+                        slot.allocated_bytes =
+                            slot.allocated_bytes.saturating_add(non_v2_sibling_bytes);
+                        slot.mtime_unix = slot.mtime_unix.max(build_mtime);
+                    }
+
                     allocated_bytes = allocated_bytes.saturating_add(non_v2_sibling_bytes);
                 }
             }
@@ -1794,33 +1893,46 @@ fn inspect_profile_dir(
         }
     }
 
-    // 4. `incremental/`
-    if has_inc_dir {
-        if let Ok(inc_meta) = fs::symlink_metadata(&inc_root) {
-            last_activity_unix = last_activity_unix.max(meta_mtime_unix(&inc_meta));
+    if !fingerprint_corrupt {
+        for (unit_hash, orphan) in orphan_v1_by_hash {
+            v1_units.push(BuildUnit {
+                id: BuildUnitId::V1 {
+                    fingerprint_dir: None,
+                    unit_hash,
+                },
+                pkg_group: orphan.pkg_group,
+                metadata: UnitMetadata::Incomplete {
+                    mtime_unix: orphan.mtime_unix,
+                },
+                v1_build_dir: orphan.build_dir,
+                v1_dep_entries: orphan.dep_entries,
+                allocated_bytes: orphan.allocated_bytes,
+            });
         }
-        if let Ok(entries) = fs::read_dir(&inc_root) {
-            for entry in entries.flatten() {
-                let entry_path = entry.path();
-                let Ok(ft) = entry.file_type() else {
-                    continue;
-                };
-                if !ft.is_dir() || ft.is_symlink() {
-                    if let Ok(meta) = fs::symlink_metadata(&entry_path) {
-                        allocated_bytes = allocated_bytes
-                            .saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
-                    }
-                    continue;
+    }
+
+    // 4. `incremental/` (never fold `inc_root` dir mtime into `last_activity_unix`, because
+    //    R3 removals bump `incremental/`'s mtime and would otherwise reset R4/R5 aging!)
+    if has_inc_dir && let Ok(entries) = fs::read_dir(&inc_root) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() || ft.is_symlink() {
+                if let Ok(meta) = fs::symlink_metadata(&entry_path) {
+                    allocated_bytes = allocated_bytes
+                        .saturating_add(entry_allocated_bytes(&meta, seen_hardlinks));
                 }
-                let Some(dir_name) = entry.file_name().to_str().map(CompactString::from) else {
-                    continue;
-                };
-                let inc_dir =
-                    inspect_incremental_dir(&entry_path, dir_name, platform, seen_hardlinks);
-                last_activity_unix = last_activity_unix.max(inc_dir.latest_mtime_unix);
-                allocated_bytes = allocated_bytes.saturating_add(inc_dir.allocated_bytes);
-                incremental_dirs.push(inc_dir);
+                continue;
             }
+            let Some(dir_name) = entry.file_name().to_str().map(CompactString::from) else {
+                continue;
+            };
+            let inc_dir = inspect_incremental_dir(&entry_path, dir_name, platform, seen_hardlinks);
+            last_activity_unix = last_activity_unix.max(inc_dir.latest_mtime_unix);
+            allocated_bytes = allocated_bytes.saturating_add(inc_dir.allocated_bytes);
+            incremental_dirs.push(inc_dir);
         }
     }
 
@@ -1851,6 +1963,10 @@ fn inspect_profile_dir(
         }
     }
 
+    if last_activity_unix == 0 {
+        last_activity_unix = profile_mtime_unix;
+    }
+
     let has_v2 = !v2_units.is_empty();
     let has_v1 = !v1_units.is_empty() || has_v1_fp_dir || has_v1_deps_dir;
     let layout = classify_profile_layout(has_v2, has_v1, has_build_dir, has_inc_dir);
@@ -1868,6 +1984,8 @@ fn inspect_profile_dir(
         v2_units,
         v1_units,
         incremental_dirs,
+        profile_mtime_unix,
+        inc_root_mtime_unix,
         allocated_bytes,
         last_activity_unix,
     }
@@ -1879,6 +1997,8 @@ fn inspect_profile_inventory(
     profile_path: &Path,
     lock_files: SmallVec<[PathBuf; 4]>,
     locked_now: bool,
+    profile_mtime_unix: u64,
+    inc_root_mtime_unix: u64,
     has_v1_fp_dir: bool,
     has_v1_deps_dir: bool,
     has_build_dir: bool,
@@ -1893,9 +2013,7 @@ fn inspect_profile_inventory(
     let mut v2_unit_count = 0usize;
     let mut incremental_dir_count = 0usize;
     let mut allocated_bytes: u64 = 0;
-    let mut last_activity_unix: u64 = fs::symlink_metadata(profile_path)
-        .map(|m| meta_mtime_unix(&m))
-        .unwrap_or(0);
+    let mut last_activity_unix: u64 = 0;
 
     // 1. `.fingerprint/` (V1): single pass for counting + deferred byte/mtime accounting.
     if has_v1_fp_dir && let Ok(entries) = fs::read_dir(profile_path.join(".fingerprint")) {
@@ -1992,12 +2110,10 @@ fn inspect_profile_inventory(
         }
     }
 
-    // 4. `incremental/`: single pass for counting + parallel chunks with `s-*.lock`/`s-*` mtime.
+    // 4. `incremental/`: single pass for counting + parallel chunks with `s-*.lock`/`s-*` mtime
+    //    (excluding `incremental/` and depth-0 `<crate>/` dir mtimes so R3 pruning never resets age).
     if has_inc_dir {
         let inc_root = profile_path.join("incremental");
-        if let Ok(inc_meta) = fs::symlink_metadata(&inc_root) {
-            last_activity_unix = last_activity_unix.max(meta_mtime_unix(&inc_meta));
-        }
         if let Ok(entries) = fs::read_dir(&inc_root) {
             for entry in entries.flatten() {
                 let entry_path = entry.path();
@@ -2013,7 +2129,7 @@ fn inspect_profile_inventory(
                         target_key,
                         dest: dest.clone(),
                         path: entry_path,
-                        mtime_policy: MtimePolicy::UpToDepth(2),
+                        mtime_policy: MtimePolicy::IncrementalCrateDir,
                     });
                 } else if let Ok(meta) = fs::symlink_metadata(&entry_path) {
                     allocated_bytes = allocated_bytes
@@ -2071,6 +2187,8 @@ fn inspect_profile_inventory(
         v2_units: Vec::new(),
         v1_units: Vec::new(),
         incremental_dirs: Vec::new(),
+        profile_mtime_unix,
+        inc_root_mtime_unix,
         allocated_bytes,
         last_activity_unix,
     }
@@ -2278,9 +2396,12 @@ fn inspect_incremental_dir(
     let mut lock_status: HashMap<CompactString, bool> = HashMap::new();
     let mut lock_mtimes: HashMap<CompactString, u64> = HashMap::new();
     let mut allocated_bytes: u64 = 0;
-    let mut latest_mtime_unix: u64 = fs::symlink_metadata(dir_path)
+    let dir_mtime_unix: u64 = fs::symlink_metadata(dir_path)
         .map(|m| meta_mtime_unix(&m))
         .unwrap_or(0);
+    // Compute freshness strictly from `s-*.lock` files and `s-*` session contents so pruning
+    // an older session (which bumps `dir_path` mtime) never resets target age or top-M rank.
+    let mut latest_mtime_unix: u64 = 0;
 
     // Fail closed when an incremental crate directory is unreadable: mark `any_locked = true`
     // so `R3` never treats it as an empty unlocked `WorkingOnly` directory and schedules removal.
@@ -2367,11 +2488,16 @@ fn inspect_incremental_dir(
         });
     }
 
+    if latest_mtime_unix == 0 {
+        latest_mtime_unix = dir_mtime_unix;
+    }
+
     IncrementalDir {
         dir_name,
         crate_name,
         sessions,
         any_locked,
+        dir_mtime_unix,
         latest_mtime_unix,
         allocated_bytes,
     }
@@ -2595,7 +2721,9 @@ fn inspect_repo_git(
     };
 
     let worktree_dir_missing = !worktree_root.exists();
-    let git_op_in_progress = has_git_op_markers(&git_dir) || has_git_op_markers(&repo_common_dir);
+    // Each linked worktree maintains its own `git_dir` (`.git/worktrees/<name>/`); checking
+    // `repo_common_dir` would falsely propagate an operation in the main checkout to every worktree.
+    let git_op_in_progress = has_git_op_markers(&git_dir);
     let worktree_locked =
         worktree_kind == WorktreeKind::LinkedWorktree && git_dir.join("locked").exists();
 
@@ -2658,10 +2786,12 @@ fn resolve_git_path(base: &Path, raw: &Path) -> PathBuf {
 }
 
 fn has_git_op_markers(git_dir: &Path) -> bool {
+    // Note: standalone `REBASE_HEAD` is intentionally omitted — Git can leave `REBASE_HEAD`
+    // behind after rebase completes or resets, whereas active rebases always hold
+    // `rebase-merge/` or `rebase-apply/`.
     const MARKERS: &[&str] = &[
         "index.lock",
         "MERGE_HEAD",
-        "REBASE_HEAD",
         "CHERRY_PICK_HEAD",
         "REVERT_HEAD",
         "BISECT_LOG",
@@ -2781,6 +2911,7 @@ fn account_tree(
                 let track_mtime = match mtime_policy {
                     MtimePolicy::None => false,
                     MtimePolicy::UpToDepth(max_d) => entry.depth() <= max_d,
+                    MtimePolicy::IncrementalCrateDir => entry.depth() >= 1 && entry.depth() <= 2,
                     MtimePolicy::V2PkgDir => entry.depth() <= 3,
                     MtimePolicy::V2UnitFingerprint { unit_depth } => {
                         entry.depth() <= unit_depth + 2
@@ -2836,7 +2967,7 @@ fn sum_dir_fd_recursive(
     };
 
     let stat_self_dir = match mtime_policy {
-        MtimePolicy::None | MtimePolicy::V2PkgDir => false,
+        MtimePolicy::None | MtimePolicy::IncrementalCrateDir | MtimePolicy::V2PkgDir => false,
         MtimePolicy::UpToDepth(max_d) => depth <= max_d,
         MtimePolicy::V2UnitFingerprint { unit_depth } => depth == unit_depth,
     };
@@ -2847,6 +2978,7 @@ fn sum_dir_fd_recursive(
 
     let track_child_file_mtime = match mtime_policy {
         MtimePolicy::None | MtimePolicy::V2PkgDir | MtimePolicy::V2UnitFingerprint { .. } => false,
+        MtimePolicy::IncrementalCrateDir => depth == 0,
         MtimePolicy::UpToDepth(max_d) => depth < max_d,
     };
 
@@ -2895,6 +3027,7 @@ fn sum_dir_fd_recursive(
         };
         let child_policy = match mtime_policy {
             MtimePolicy::None => MtimePolicy::None,
+            MtimePolicy::IncrementalCrateDir => MtimePolicy::UpToDepth(2),
             MtimePolicy::UpToDepth(max_d) => {
                 if depth < max_d {
                     MtimePolicy::UpToDepth(max_d)
@@ -3842,5 +3975,138 @@ mod tests {
             assert_eq!(bad_snap.targets.len(), 1);
             assert!(matches!(bad_snap.targets[0].git, GitDiscovery::Failed(_)));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_mtime_bumps_do_not_reset_activity_and_v1_orphans_are_discovered() {
+        use rustix::fs::{AtFlags, Timespec, Timestamps, utimensat};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let target = base.join("proj/target");
+        let debug = target.join("debug");
+        write_cargo_tag(&target);
+
+        let inc_root = debug.join("incremental");
+        let inc_crate = inc_root.join("demo-abc1234567890");
+        let inc_sess = inc_crate.join("s-1-aaa-final");
+        let inc_lock = inc_crate.join("s-1-aaa.lock");
+        fs::create_dir_all(&inc_sess).unwrap();
+        fs::write(&inc_lock, b"").unwrap();
+        fs::write(inc_sess.join("dep-graph.bin"), b"graph").unwrap();
+
+        // V1 `.fingerprint/` with one live unit + orphaned `deps/` and `build/` without fingerprint
+        let fp_live = debug.join(".fingerprint/live-1111111111111111");
+        fs::create_dir_all(&fp_live).unwrap();
+        fs::write(fp_live.join("lib-live.json"), r#"{"rustc":42,"deps":[]}"#).unwrap();
+        fs::create_dir_all(debug.join("deps")).unwrap();
+        fs::write(debug.join("deps/liblive-1111111111111111.rlib"), b"live").unwrap();
+        fs::write(
+            debug.join("deps/liborphan-aaaaaaaaaaaaaaaa.rlib"),
+            b"orphan_rlib",
+        )
+        .unwrap();
+        fs::create_dir_all(debug.join("build/orphan-bbbbbbbbbbbbbbbb/out")).unwrap();
+        fs::write(
+            debug.join("build/orphan-bbbbbbbbbbbbbbbb/out/gen.rs"),
+            b"gen",
+        )
+        .unwrap();
+
+        let old_ts = 1_700_000_000i64;
+        let bumped_dir_ts = 1_799_000_000i64;
+        let set_mtime = |p: &Path, sec: i64| {
+            let ts = Timespec {
+                tv_sec: sec,
+                tv_nsec: 0,
+            };
+            utimensat(
+                rustix::fs::CWD,
+                p,
+                &Timestamps {
+                    last_access: ts,
+                    last_modification: ts,
+                },
+                AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+        };
+
+        // Backdate every file and dir inside `target/` to `old_ts`
+        let mut all_paths: Vec<PathBuf> = walkdir::WalkDir::new(&target)
+            .follow_links(false)
+            .into_iter()
+            .flatten()
+            .map(|e| e.into_path())
+            .collect();
+        all_paths.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for p in &all_paths {
+            set_mtime(p, old_ts);
+        }
+
+        // Now simulate R2/R3 staging/removal bumping directory mtimes (`target/`, `incremental/`, `<crate>/`)
+        set_mtime(&inc_crate, bumped_dir_ts);
+        set_mtime(&inc_root, bumped_dir_ts);
+        set_mtime(&target, bumped_dir_ts);
+
+        let platform = TestPlatform::new(1_800_000_000);
+        let cfg = Config::default();
+
+        for detail in [ScanDetail::Full, ScanDetail::Inventory] {
+            let req = ScanRequest::with_default_volume(vec![], vec![target.clone()], false, detail);
+            let snap = scan(&platform, &cfg, &req).unwrap();
+            assert_eq!(snap.targets.len(), 1);
+            let t = &snap.targets[0];
+            assert_eq!(
+                t.root_mtime_unix, bumped_dir_ts as u64,
+                "root_mtime_unix must track target dir mtime ({detail:?})"
+            );
+            assert_eq!(
+                t.last_activity_unix, old_ts as u64,
+                "target dir / incremental dir mtime bumps must NOT reset last_activity_unix ({detail:?})"
+            );
+            let p = &t.profiles[0];
+            assert_eq!(p.inc_root_mtime_unix, bumped_dir_ts as u64);
+            assert_eq!(p.last_activity_unix, old_ts as u64);
+
+            if detail == ScanDetail::Full {
+                assert_eq!(p.incremental_dirs.len(), 1);
+                assert_eq!(p.incremental_dirs[0].dir_mtime_unix, bumped_dir_ts as u64);
+                assert_eq!(p.incremental_dirs[0].latest_mtime_unix, old_ts as u64);
+
+                let orphan_count = p
+                    .v1_units
+                    .iter()
+                    .filter(|u| {
+                        matches!(
+                            &u.id,
+                            crate::model::BuildUnitId::V1 {
+                                fingerprint_dir: None,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                assert_eq!(
+                    orphan_count, 2,
+                    "expected both orphaned V1 deps and build units"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn git_op_markers_ignore_stale_rebase_head_but_detect_active_rebase_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_dir = tmp.path();
+
+        // Stale REBASE_HEAD alone must NOT trigger git_op_in_progress
+        fs::write(git_dir.join("REBASE_HEAD"), b"0123456789abcdef\n").unwrap();
+        assert!(!super::has_git_op_markers(git_dir));
+
+        // Actual in-progress rebase directory MUST trigger git_op_in_progress
+        fs::create_dir(git_dir.join("rebase-merge")).unwrap();
+        assert!(super::has_git_op_markers(git_dir));
     }
 }

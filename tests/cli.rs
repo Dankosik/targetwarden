@@ -553,6 +553,22 @@ fn install_dry_run_renders_plist_without_touching_disk_or_launchd() {
     assert!(text.contains("io.github.dankosik.targetwarden"));
     assert!(text.contains("launchctl bootstrap"));
     assert!(!home.path().join("Library").exists());
+
+    // `--watch-dry-run` configures LaunchAgent with `watch --dry-run` for 48h field soak
+    let dry_daemon = command(home.path())
+        .args([
+            "install",
+            "--dry-run",
+            "--watch-dry-run",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(dry_daemon.status.success());
+    let dry_json: serde_json::Value = serde_json::from_slice(&dry_daemon.stdout).unwrap();
+    let dry_xml = dry_json["plist_xml"].as_str().unwrap();
+    assert!(dry_xml.contains("<string>watch</string>\n        <string>--dry-run</string>"));
 }
 
 #[cfg(target_os = "macos")]

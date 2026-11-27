@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::error::AppError;
-use crate::model::{DiskPressure, GIB};
+use crate::model::{DiskPressure, GIB, UnitTargetKind};
 
 pub(crate) const DEFAULT_ROOT_NAMES: &[&str] = &["Projects", "Developer", "src", "work"];
 
@@ -146,6 +146,22 @@ pub(crate) struct SweepConfig {
     pub mixed_stale_high_secs: u64,
     pub doc_prune_calm_secs: u64,
     pub doc_prune_high_secs: u64,
+    /// Stale leaf-target (`Test`/`Example`/`Bench`/`Doc`) anchor expiry relative to profile `max_mtime`.
+    pub stale_leaf_anchor_calm_secs: u64,
+    pub stale_leaf_anchor_elevated_secs: u64,
+    pub stale_leaf_anchor_high_secs: u64,
+    pub stale_leaf_anchor_critical_secs: u64,
+    /// Stale core-target (`Lib`/`Bin`/build-script) anchor expiry relative to profile `max_mtime`.
+    /// Live dependencies remain 100% protected by BFS from fresh anchors regardless of age.
+    pub stale_core_anchor_calm_secs: u64,
+    pub stale_core_anchor_elevated_secs: u64,
+    pub stale_core_anchor_high_secs: u64,
+    pub stale_core_anchor_critical_secs: u64,
+    /// Stale finalized `incremental/<crate>-<base36>/` expiry relative to profile `max_inc_mtime`.
+    pub inc_stale_crate_calm_secs: u64,
+    pub inc_stale_crate_elevated_secs: u64,
+    pub inc_stale_crate_high_secs: u64,
+    pub inc_stale_crate_critical_secs: u64,
 }
 
 impl Default for SweepConfig {
@@ -165,6 +181,18 @@ impl Default for SweepConfig {
             mixed_stale_high_secs: 2 * 3600,
             doc_prune_calm_secs: 7 * 86_400,
             doc_prune_high_secs: 86_400,
+            stale_leaf_anchor_calm_secs: 7 * 86_400,
+            stale_leaf_anchor_elevated_secs: 3 * 86_400,
+            stale_leaf_anchor_high_secs: 86_400,
+            stale_leaf_anchor_critical_secs: 6 * 3600,
+            stale_core_anchor_calm_secs: 14 * 86_400,
+            stale_core_anchor_elevated_secs: 7 * 86_400,
+            stale_core_anchor_high_secs: 2 * 86_400,
+            stale_core_anchor_critical_secs: 86_400,
+            inc_stale_crate_calm_secs: 14 * 86_400,
+            inc_stale_crate_elevated_secs: 7 * 86_400,
+            inc_stale_crate_high_secs: 2 * 86_400,
+            inc_stale_crate_critical_secs: 86_400,
         }
     }
 }
@@ -214,6 +242,40 @@ impl SweepConfig {
         match pressure {
             DiskPressure::Calm | DiskPressure::Elevated => self.doc_prune_calm_secs,
             DiskPressure::High | DiskPressure::Critical => self.doc_prune_high_secs,
+        }
+    }
+
+    pub fn stale_anchor_secs(self, kind: UnitTargetKind, pressure: DiskPressure) -> u64 {
+        let is_leaf = matches!(
+            kind,
+            UnitTargetKind::Test
+                | UnitTargetKind::Example
+                | UnitTargetKind::Bench
+                | UnitTargetKind::Doc
+        );
+        if is_leaf {
+            match pressure {
+                DiskPressure::Calm => self.stale_leaf_anchor_calm_secs,
+                DiskPressure::Elevated => self.stale_leaf_anchor_elevated_secs,
+                DiskPressure::High => self.stale_leaf_anchor_high_secs,
+                DiskPressure::Critical => self.stale_leaf_anchor_critical_secs,
+            }
+        } else {
+            match pressure {
+                DiskPressure::Calm => self.stale_core_anchor_calm_secs,
+                DiskPressure::Elevated => self.stale_core_anchor_elevated_secs,
+                DiskPressure::High => self.stale_core_anchor_high_secs,
+                DiskPressure::Critical => self.stale_core_anchor_critical_secs,
+            }
+        }
+    }
+
+    pub fn inc_stale_crate_secs(self, pressure: DiskPressure) -> u64 {
+        match pressure {
+            DiskPressure::Calm => self.inc_stale_crate_calm_secs,
+            DiskPressure::Elevated => self.inc_stale_crate_elevated_secs,
+            DiskPressure::High => self.inc_stale_crate_high_secs,
+            DiskPressure::Critical => self.inc_stale_crate_critical_secs,
         }
     }
 }
