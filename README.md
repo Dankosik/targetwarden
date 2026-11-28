@@ -1,8 +1,26 @@
-# targetwarden
+<p align="center">
+  <img src="https://raw.githubusercontent.com/Dankosik/targetwarden/main/.github/assets/logo.png" alt="targetwarden logo" width="180" />
+</p>
 
-Automatic safe Cargo `target/` disk reclaimer for macOS workstations running parallel AI coding agents and `git worktree`s.
+<h1 align="center">targetwarden</h1>
 
-[Specification](specs/targetwarden/README.md) · [Empirical Research](specs/targetwarden/research.md) · [Implementation Plan](specs/targetwarden/plan.md) · [Architecture](docs/architecture.md)
+<p align="center">
+  <strong>Automatic safe Cargo <code>target/</code> disk reclaimer for macOS workstations running parallel AI coding agents and <code>git worktree</code>s.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Dankosik/targetwarden/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Dankosik/targetwarden/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/Dankosik/targetwarden/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/Dankosik/targetwarden?sort=semver"></a>
+  <a href="#install"><img alt="Platform: macOS" src="https://img.shields.io/badge/platform-macOS-lightgrey"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+</p>
+
+<p align="center">
+  <a href="specs/targetwarden/README.md">Specification</a> ·
+  <a href="specs/targetwarden/research.md">Empirical Research</a> ·
+  <a href="specs/targetwarden/plan.md">Implementation Plan</a> ·
+  <a href="docs/architecture.md">Architecture</a>
+</p>
 
 > **Status:** `v0.1.0` ready for macOS (`aarch64-apple-darwin` and `x86_64-apple-darwin`) — `status`, `scan`, `reclaim`, `watch`, `pin`, `unpin`, `history`, `install`, `uninstall`, and `completions`.
 
