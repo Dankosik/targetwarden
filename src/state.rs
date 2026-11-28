@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    ActionOutcome, ActionReceipt, CargoTarget, DiskPressure, KnownTargetEntry, PinEntry, PinScope,
-    ReclaimHoldState, SCHEMA_VERSION, TargetLayout,
+    ActionOutcome, ActionReceipt, CachedProfileInventory, CachedTargetInventory, CargoTarget,
+    DiskPressure, KnownTargetEntry, PinEntry, PinScope, ReclaimHoldState, SCHEMA_VERSION,
+    TargetLayout,
 };
 
 /// Compact per-target summary extracted before dropping `ScanSnapshot` ahead of plan execution.
@@ -20,15 +21,46 @@ pub(crate) struct TargetScanSummary {
     pub layout: TargetLayout,
     pub allocated_bytes: u64,
     pub last_activity_unix: u64,
+    pub inventory_cache: Option<CachedTargetInventory>,
 }
 
 impl From<&CargoTarget> for TargetScanSummary {
     fn from(target: &CargoTarget) -> Self {
+        let inventory_cache = if target.inventory_stamp != 0
+            && target.inventory_computed_at_unix > 0
+            && !target.symlink_or_mount_boundary
+        {
+            Some(CachedTargetInventory {
+                stamp: target.inventory_stamp,
+                computed_at_unix: target.inventory_computed_at_unix,
+                allocated_bytes: target.allocated_bytes,
+                last_activity_unix: target.last_activity_unix,
+                has_doc_dir: target.doc_dir.is_some(),
+                doc_allocated_bytes: target.doc_dir.as_ref().map_or(0, |d| d.allocated_bytes),
+                doc_last_activity_unix: target.doc_dir.as_ref().map_or(0, |d| d.last_activity_unix),
+                profiles: target
+                    .profiles
+                    .iter()
+                    .map(|p| CachedProfileInventory {
+                        rel_path: p.rel_path.clone(),
+                        layout: p.layout,
+                        allocated_bytes: p.allocated_bytes,
+                        last_activity_unix: p.last_activity_unix,
+                        v2_unit_count: p.v2_unit_count,
+                        v1_unit_count: p.v1_unit_count,
+                        incremental_dir_count: p.incremental_dir_count,
+                    })
+                    .collect(),
+            })
+        } else {
+            None
+        };
         Self {
             root: target.root.clone(),
             layout: target.layout,
             allocated_bytes: target.allocated_bytes,
             last_activity_unix: target.last_activity_unix,
+            inventory_cache,
         }
     }
 }
@@ -114,6 +146,7 @@ impl State {
                     last_layout: target.layout,
                     last_allocated_bytes: target.allocated_bytes,
                     last_activity_unix: target.last_activity_unix,
+                    inventory_cache: target.inventory_cache.clone(),
                 },
             );
         }
@@ -154,7 +187,13 @@ impl State {
                 ) {
                     self.known_targets
                         .retain(|path, _| !path.starts_with(&receipt.target_root));
+                } else if let Some(entry) = self.known_targets.get_mut(&receipt.target_root) {
+                    entry.inventory_cache = None;
                 }
+            } else if matches!(receipt.outcome, ActionOutcome::Failed { .. })
+                && let Some(entry) = self.known_targets.get_mut(&receipt.target_root)
+            {
+                entry.inventory_cache = None;
             }
         }
     }
@@ -272,6 +311,8 @@ mod tests {
             root_mtime_unix: 500,
             allocated_bytes: 1024,
             last_activity_unix: 500,
+            inventory_stamp: 0,
+            inventory_computed_at_unix: 0,
         };
 
         let mut state = State::new_default();
@@ -297,5 +338,117 @@ mod tests {
             1000
         );
         assert_eq!(state.last_full_walk_unix, Some(1200));
+    }
+
+    #[test]
+    fn state_inventory_cache_is_backward_compatible_and_invalidated_by_applied_sweep() {
+        use compact_str::CompactString;
+
+        use crate::model::{ActionOutcome, ActionReceipt, RuleId};
+
+        // Old v1 state.json without `inventory_cache` deserializes cleanly.
+        let legacy_json = r#"{
+            "schema_version": 1,
+            "pressure": "calm",
+            "known_targets": {
+                "/a/target": {
+                    "first_seen_unix": 100,
+                    "last_seen_unix": 200,
+                    "last_layout": "build_dir_v2",
+                    "last_allocated_bytes": 4096,
+                    "last_activity_unix": 150
+                }
+            }
+        }"#;
+        let mut parsed: State = serde_json::from_str(legacy_json).unwrap();
+        assert!(
+            parsed.known_targets[Path::new("/a/target")]
+                .inventory_cache
+                .is_none()
+        );
+
+        // Recording a target with a non-zero stamp persists `inventory_cache`.
+        let target = CargoTarget {
+            root: PathBuf::from("/a/target"),
+            dev_id: 1,
+            ino: 1,
+            origin: TargetOrigin::VerifiedCargoTag,
+            layout: TargetLayout::BuildDirV2,
+            symlink_or_mount_boundary: false,
+            has_unverified_top_entries: false,
+            has_pin_marker: false,
+            parent_target: None,
+            nested_target_roots: vec![],
+            worktree_kind: WorktreeKind::NonGit,
+            git: GitDiscovery::NotInGitRepo,
+            project_dir: None,
+            profiles: vec![],
+            doc_dir: None,
+            root_lock_file: None,
+            root_locked_now: false,
+            root_mtime_unix: 500,
+            allocated_bytes: 8192,
+            last_activity_unix: 500,
+            inventory_stamp: 0xdead_beef,
+            inventory_computed_at_unix: 1000,
+        };
+        parsed.record_scan_targets(std::slice::from_ref(&target), 1000, true, false);
+        assert_eq!(
+            parsed.known_targets[Path::new("/a/target")]
+                .inventory_cache
+                .as_ref()
+                .map(|c| (c.stamp, c.computed_at_unix)),
+            Some((0xdead_beef, 1000))
+        );
+
+        // An applied sweep receipt invalidates `inventory_cache` so the next scan walks fresh.
+        parsed.apply_receipts(&[ActionReceipt {
+            ts_unix: 1005,
+            rule: RuleId::R2BuildSweep,
+            target_root: PathBuf::from("/a/target"),
+            profile_rel: Some(PathBuf::from("debug")),
+            outcome: ActionOutcome::Applied,
+            units_removed: 3,
+            allocated_bytes: 4096,
+            free_before_bytes: 100,
+            free_after_bytes: 4196,
+            duration_ms: 10,
+            pressure: DiskPressure::Calm,
+            reason: CompactString::new("test"),
+        }]);
+        assert!(
+            parsed.known_targets[Path::new("/a/target")]
+                .inventory_cache
+                .is_none()
+        );
+
+        // A failed receipt (potentially after partial mutation) also invalidates `inventory_cache`.
+        parsed.record_scan_targets(&[target], 1010, true, false);
+        assert!(
+            parsed.known_targets[Path::new("/a/target")]
+                .inventory_cache
+                .is_some()
+        );
+        parsed.apply_receipts(&[ActionReceipt {
+            ts_unix: 1015,
+            rule: RuleId::R2BuildSweep,
+            target_root: PathBuf::from("/a/target"),
+            profile_rel: Some(PathBuf::from("debug")),
+            outcome: ActionOutcome::Failed {
+                error: CompactString::new("partial failure"),
+            },
+            units_removed: 1,
+            allocated_bytes: 1024,
+            free_before_bytes: 100,
+            free_after_bytes: 1124,
+            duration_ms: 10,
+            pressure: DiskPressure::Calm,
+            reason: CompactString::new("test"),
+        }]);
+        assert!(
+            parsed.known_targets[Path::new("/a/target")]
+                .inventory_cache
+                .is_none()
+        );
     }
 }

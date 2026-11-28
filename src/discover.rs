@@ -21,11 +21,12 @@ use walkdir::WalkDir;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::model::{
-    BuildUnit, BuildUnitId, CargoTarget, DocDirInfo, FastU64BuildHasher, GitDiscovery,
-    GitInspection, IncrementalDir, IncrementalSession, LeftoverStaging, MountEntry, PathPrefix,
-    ProcessEntry, ProcessSnapshot, ProfileDir, ScanSnapshot, SessionState, TargetLayout,
-    TargetOrigin, UnitMetadata, UnitTargetAnchor, UnitTargetKind, V1UnitExtras, WorktreeKind,
-    extract_16hex_from_dep_name, format_16_lower_hex, is_16_lower_hex, parse_16_lower_hex_u64,
+    BuildUnit, BuildUnitId, CachedTargetInventory, CargoTarget, DocDirInfo, FastU64BuildHasher,
+    GitDiscovery, GitInspection, IncrementalDir, IncrementalSession, LeftoverStaging, MountEntry,
+    PathPrefix, ProcessEntry, ProcessSnapshot, ProfileDir, ScanSnapshot, SessionState,
+    TargetLayout, TargetOrigin, UnitMetadata, UnitTargetAnchor, UnitTargetKind, V1UnitExtras,
+    WorktreeKind, extract_16hex_from_dep_name, format_16_lower_hex, is_16_lower_hex,
+    parse_16_lower_hex_u64,
 };
 use crate::platform::{
     DEFAULT_VOLUME_MOUNT, LockProbe, Platform, crosses_mount_boundary, has_symlink_boundary,
@@ -172,6 +173,7 @@ pub(crate) struct ScanRequest {
     pub full_walk: bool,
     pub detail: ScanDetail,
     pub volume_mount: PathBuf,
+    pub inventory_cache: HashMap<PathBuf, CachedTargetInventory>,
 }
 
 impl ScanRequest {
@@ -192,7 +194,16 @@ impl ScanRequest {
             full_walk,
             detail,
             volume_mount,
+            inventory_cache: HashMap::new(),
         }
+    }
+
+    pub(crate) fn with_inventory_cache(
+        mut self,
+        inventory_cache: HashMap<PathBuf, CachedTargetInventory>,
+    ) -> Self {
+        self.inventory_cache = inventory_cache;
+        self
     }
 }
 
@@ -297,9 +308,12 @@ pub(crate) fn scan<P: Platform + Sync>(
     let preinspected_git = preinspect_git_for_candidates(&walk_result.candidates, platform);
     let mut session = ScanSession::new(
         platform,
+        captured_at_unix,
+        config.cooling.sweep_cooling_secs,
         mounts.as_deref(),
         processes.as_ref(),
         request.detail,
+        &request.inventory_cache,
         walk_result.leftover_staging,
         walk_result.seen_staging,
         preinspected_git,
@@ -1018,10 +1032,13 @@ struct PreinspectedGit {
 
 struct ScanSession<'a, P: Platform + Sync> {
     platform: &'a P,
+    captured_at_unix: u64,
+    sweep_cooling_secs: u64,
     mounts: Option<&'a [MountEntry]>,
     processes: Option<&'a ProcessSnapshot>,
     classified_procs: Vec<ClassifiedProc<'a>>,
     detail: ScanDetail,
+    inventory_cache: &'a HashMap<PathBuf, CachedTargetInventory>,
     visited_targets: HashSet<(u64, u64)>,
     target_idx_by_id: HashMap<(u64, u64), usize>,
     targets: Vec<CargoTarget>,
@@ -1035,11 +1052,15 @@ struct ScanSession<'a, P: Platform + Sync> {
 }
 
 impl<'a, P: Platform + Sync> ScanSession<'a, P> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         platform: &'a P,
+        captured_at_unix: u64,
+        sweep_cooling_secs: u64,
         mounts: Option<&'a [MountEntry]>,
         processes: Option<&'a ProcessSnapshot>,
         detail: ScanDetail,
+        inventory_cache: &'a HashMap<PathBuf, CachedTargetInventory>,
         leftover_staging: Vec<LeftoverStaging>,
         seen_staging: HashSet<(u64, u64)>,
         preinspected_git: PreinspectedGit,
@@ -1049,7 +1070,7 @@ impl<'a, P: Platform + Sync> ScanSession<'a, P> {
                 proc_snap
                     .processes
                     .iter()
-                    .filter(|p| proc_snap.self_pid == 0 || p.pid != proc_snap.self_pid)
+                    .filter(|p| !proc_snap.is_self_or_sibling(p))
                     .map(|entry| ClassifiedProc {
                         entry,
                         is_proc_macro_srv: proc_snap.is_rust_analyzer_proc_macro_srv(entry),
@@ -1060,10 +1081,13 @@ impl<'a, P: Platform + Sync> ScanSession<'a, P> {
             .unwrap_or_default();
         Self {
             platform,
+            captured_at_unix,
+            sweep_cooling_secs,
             mounts,
             processes,
             classified_procs,
             detail,
+            inventory_cache,
             visited_targets: HashSet::new(),
             target_idx_by_id: HashMap::new(),
             targets: Vec::new(),
@@ -1075,6 +1099,17 @@ impl<'a, P: Platform + Sync> ScanSession<'a, P> {
             hardlinks: HardlinkSet::new(),
             scratch: DirScratch::default(),
         }
+    }
+
+    fn lookup_inventory_cache(&self, target_root: &Path) -> Option<&'a CachedTargetInventory> {
+        if let Some(hit) = self.inventory_cache.get(target_root) {
+            return Some(hit);
+        }
+        let norm = normalize_macos_system_symlinks_cow(target_root);
+        if norm.as_ref() != target_root {
+            return self.inventory_cache.get(norm.as_ref());
+        }
+        None
     }
 
     fn process_hard_blocks_target(&self, target_root: &Path, worktree_root: Option<&Path>) -> bool {
@@ -1327,10 +1362,13 @@ impl<'a, P: Platform + Sync> ScanSession<'a, P> {
 
         profile_probes.sort_by(|a, b| a.profile.rel_path.cmp(&b.profile.rel_path));
         nested_target_roots.sort();
+        top_account_dirs.sort();
 
         // Downgrade to fast Inventory mode when fast barriers already guarantee `Protected`.
         let any_profile_locked = profile_probes.iter().any(|p| p.profile.locked_now);
         let doc_locked = doc_dir.as_ref().is_some_and(|d| d.locked_now);
+        let guaranteed_cooling = last_activity_unix > 0
+            && self.captured_at_unix.saturating_sub(last_activity_unix) < self.sweep_cooling_secs;
         let target_hard_blocked = self.processes.is_none()
             || self.mounts.is_none()
             || symlink_or_mount_boundary
@@ -1339,6 +1377,7 @@ impl<'a, P: Platform + Sync> ScanSession<'a, P> {
             || any_profile_locked
             || doc_locked
             || has_pin_marker
+            || guaranteed_cooling
             || match &git {
                 GitDiscovery::Failed(_) => true,
                 GitDiscovery::Inspected(info) => {
@@ -1354,52 +1393,108 @@ impl<'a, P: Platform + Sync> ScanSession<'a, P> {
             self.detail
         };
 
-        // Stream all target subdirectories single-threaded on the main thread:
-        // avoids APFS kernel vnode/B-tree lock contention (~2.8x sys CPU savings),
-        // eliminates per-target thread spawns and cross-thread `libmalloc` magazine retention,
-        // and guarantees 100% deterministic hardlink attribution.
-        if let Some(doc) = &mut doc_dir {
-            let res = account_tree(
-                &doc.path,
-                MtimePolicy::UpToDepth(2),
-                None,
-                &mut self.hardlinks,
-                &mut self.scratch,
-            );
-            doc.allocated_bytes = doc.allocated_bytes.saturating_add(res.bytes);
-            if res.max_mtime > 0 {
-                doc.last_activity_unix = doc.last_activity_unix.max(res.max_mtime);
-                last_activity_unix = last_activity_unix.max(res.max_mtime);
-            }
-            allocated_bytes = allocated_bytes.saturating_add(res.bytes);
-        }
-        for dir_path in top_account_dirs {
-            let res = account_tree(
-                &dir_path,
-                MtimePolicy::None,
-                None,
-                &mut self.hardlinks,
-                &mut self.scratch,
-            );
-            allocated_bytes = allocated_bytes.saturating_add(res.bytes);
-        }
+        let inventory_stamp = if !symlink_or_mount_boundary {
+            compute_target_inventory_stamp(
+                target_root,
+                &lmeta,
+                doc_dir.as_ref(),
+                &profile_probes,
+                &top_account_dirs,
+            )
+        } else {
+            0
+        };
+
+        let cached_hit = if effective_detail == ScanDetail::Inventory && inventory_stamp != 0 {
+            self.lookup_inventory_cache(target_root).filter(|cached| {
+                cached.stamp == inventory_stamp
+                    && cached.has_doc_dir == doc_dir.is_some()
+                    && cached.profiles.len() == profile_probes.len()
+                    && cached
+                        .profiles
+                        .iter()
+                        .zip(profile_probes.iter())
+                        .all(|(c, p)| c.rel_path == p.profile.rel_path)
+            })
+        } else {
+            None
+        };
 
         let mut profiles = Vec::with_capacity(profile_probes.len());
-        for probe in profile_probes {
-            let profile_detail = if probe.profile.locked_now {
-                ScanDetail::Inventory
+        let inventory_computed_at_unix = if let Some(cached) = cached_hit {
+            if let Some(doc) = &mut doc_dir {
+                doc.allocated_bytes = cached.doc_allocated_bytes;
+                doc.last_activity_unix = doc.last_activity_unix.max(cached.doc_last_activity_unix);
+            }
+            for (mut probe, cprof) in profile_probes.into_iter().zip(&cached.profiles) {
+                probe.profile.layout = cprof.layout;
+                probe.profile.allocated_bytes = cprof.allocated_bytes;
+                probe.profile.last_activity_unix = cprof.last_activity_unix;
+                probe.profile.v2_unit_count = cprof.v2_unit_count;
+                probe.profile.v1_unit_count = cprof.v1_unit_count;
+                probe.profile.incremental_dir_count = cprof.incremental_dir_count;
+                profiles.push(probe.profile);
+            }
+            allocated_bytes = cached.allocated_bytes;
+            last_activity_unix = last_activity_unix.max(cached.last_activity_unix);
+            cached.computed_at_unix
+        } else {
+            // Stream all target subdirectories single-threaded on the main thread:
+            // avoids APFS kernel vnode/B-tree lock contention (~2.8x sys CPU savings),
+            // eliminates per-target thread spawns and cross-thread `libmalloc` magazine retention,
+            // and guarantees 100% deterministic hardlink attribution.
+            if let Some(doc) = &mut doc_dir {
+                let res = account_tree(
+                    &doc.path,
+                    MtimePolicy::UpToDepth(2),
+                    None,
+                    &mut self.hardlinks,
+                    &mut self.scratch,
+                );
+                doc.allocated_bytes = doc.allocated_bytes.saturating_add(res.bytes);
+                if res.max_mtime > 0 {
+                    doc.last_activity_unix = doc.last_activity_unix.max(res.max_mtime);
+                    last_activity_unix = last_activity_unix.max(res.max_mtime);
+                }
+                allocated_bytes = allocated_bytes.saturating_add(res.bytes);
+            }
+            for dir_path in top_account_dirs {
+                let res = account_tree(
+                    &dir_path,
+                    MtimePolicy::None,
+                    None,
+                    &mut self.hardlinks,
+                    &mut self.scratch,
+                );
+                allocated_bytes = allocated_bytes.saturating_add(res.bytes);
+            }
+
+            for probe in profile_probes {
+                let profile_detail = if probe.profile.locked_now {
+                    ScanDetail::Inventory
+                } else {
+                    effective_detail
+                };
+                let profile = if profile_detail == ScanDetail::Inventory {
+                    inspect_profile_inventory(probe, &mut self.hardlinks, &mut self.scratch)
+                } else {
+                    inspect_profile_full(
+                        probe,
+                        self.platform,
+                        &mut self.hardlinks,
+                        &mut self.scratch,
+                    )
+                };
+                allocated_bytes = allocated_bytes.saturating_add(profile.allocated_bytes);
+                last_activity_unix = last_activity_unix.max(profile.last_activity_unix);
+                profiles.push(profile);
+            }
+            if inventory_stamp != 0 {
+                self.captured_at_unix
             } else {
-                effective_detail
-            };
-            let profile = if profile_detail == ScanDetail::Inventory {
-                inspect_profile_inventory(probe, &mut self.hardlinks, &mut self.scratch)
-            } else {
-                inspect_profile_full(probe, self.platform, &mut self.hardlinks, &mut self.scratch)
-            };
-            allocated_bytes = allocated_bytes.saturating_add(profile.allocated_bytes);
-            last_activity_unix = last_activity_unix.max(profile.last_activity_unix);
-            profiles.push(profile);
-        }
+                0
+            }
+        };
 
         if last_activity_unix == 0 {
             last_activity_unix = root_mtime_unix;
@@ -1429,6 +1524,8 @@ impl<'a, P: Platform + Sync> ScanSession<'a, P> {
             root_mtime_unix,
             allocated_bytes,
             last_activity_unix,
+            inventory_stamp,
+            inventory_computed_at_unix,
         });
 
         for (nested_path, nested_origin) in nested_to_inspect {
@@ -5130,6 +5227,140 @@ fn meta_mtime_unix(meta: &fs::Metadata) -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+#[cfg(unix)]
+fn meta_mtime_pair(meta: &fs::Metadata) -> (u64, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let sec = u64::try_from(meta.mtime()).unwrap_or(0);
+    let nsec = u32::try_from(meta.mtime_nsec()).unwrap_or(0);
+    (sec, nsec)
+}
+
+#[cfg(not(unix))]
+fn meta_mtime_pair(meta: &fs::Metadata) -> (u64, u32) {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or((0, 0), |d| (d.as_secs(), d.subsec_nanos()))
+}
+
+struct StampHasher(u64);
+
+impl StampHasher {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+
+    #[inline]
+    fn write_bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.write_bytes(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_meta(&mut self, path: &Path, meta: &fs::Metadata) {
+        let (dev, ino) = file_identity(path, meta);
+        let (sec, nsec) = meta_mtime_pair(meta);
+        self.write_u64(dev);
+        self.write_u64(ino);
+        self.write_u64(sec);
+        self.write_u64(u64::from(nsec));
+        self.write_u64(meta.len());
+    }
+
+    fn hash_shallow_dir(&mut self, dir_path: &Path, stat_children: bool) {
+        let Ok(meta) = fs::symlink_metadata(dir_path) else {
+            self.write_u64(0);
+            return;
+        };
+        self.write_meta(dir_path, &meta);
+        if !stat_children {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(dir_path) else {
+            self.write_u64(u64::MAX);
+            return;
+        };
+        let mut count: u64 = 0;
+        let mut xor_acc: u64 = 0;
+        let mut sum_acc: u64 = 0;
+        for entry in rd.flatten() {
+            count = count.saturating_add(1);
+            let mut eh = StampHasher::new();
+            eh.write_bytes(entry.file_name().as_encoded_bytes());
+            let path = entry.path();
+            if let Ok(emeta) = fs::symlink_metadata(&path) {
+                eh.write_meta(&path, &emeta);
+            }
+            let h = eh.finish();
+            xor_acc ^= h;
+            sum_acc = sum_acc.wrapping_add(h);
+        }
+        self.write_u64(count);
+        self.write_u64(xor_acc);
+        self.write_u64(sum_acc);
+    }
+
+    #[inline]
+    fn finish(self) -> u64 {
+        if self.0 == 0 { 1 } else { self.0 }
+    }
+}
+
+/// Compute a fast shallow filesystem stamp for a `target/` directory (~50–400 shallow `lstat`s
+/// instead of walking 100k+ files) so unchanged read-only `Inventory` scans can reuse cached
+/// byte/unit summaries without thrashing the macOS kernel vnode cache.
+fn compute_target_inventory_stamp(
+    target_root: &Path,
+    root_meta: &fs::Metadata,
+    doc_dir: Option<&DocDirInfo>,
+    profile_probes: &[ProfileProbe],
+    top_account_dirs: &[PathBuf],
+) -> u64 {
+    let mut h = StampHasher::new();
+    h.write_meta(target_root, root_meta);
+    h.hash_shallow_dir(target_root, true);
+
+    if let Some(doc) = doc_dir {
+        h.write_u64(1);
+        h.hash_shallow_dir(&doc.path, true);
+    } else {
+        h.write_u64(0);
+    }
+
+    h.write_u64(u64::try_from(top_account_dirs.len()).unwrap_or(u64::MAX));
+    for dir_path in top_account_dirs {
+        h.write_bytes(dir_path.as_os_str().as_encoded_bytes());
+        h.hash_shallow_dir(dir_path, true);
+    }
+
+    h.write_u64(u64::try_from(profile_probes.len()).unwrap_or(u64::MAX));
+    for probe in profile_probes {
+        h.write_bytes(probe.profile.rel_path.as_os_str().as_encoded_bytes());
+        h.hash_shallow_dir(&probe.full_path, true);
+        if probe.has_v1_fp_dir {
+            h.hash_shallow_dir(&probe.full_path.join(".fingerprint"), false);
+        }
+        if probe.has_v1_deps_dir {
+            h.hash_shallow_dir(&probe.full_path.join("deps"), false);
+        }
+        if probe.has_build_dir {
+            h.hash_shallow_dir(&probe.full_path.join("build"), true);
+        }
+        if probe.has_inc_dir {
+            h.hash_shallow_dir(&probe.full_path.join("incremental"), true);
+        }
+    }
+
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -6521,6 +6752,196 @@ mod tests {
         assert_eq!(
             no_mounts_snap.targets[0].allocated_bytes,
             full_snap.targets[0].allocated_bytes
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inventory_cache_hits_when_stamp_matches_invalidates_on_mutation_and_bypasses_in_full_mode() {
+        use std::collections::HashMap;
+
+        use crate::model::{CachedProfileInventory, CachedTargetInventory};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let debug = target.join("debug");
+        let deps = debug.join("deps");
+        let v2_build_pkg = debug.join("build/mycrate");
+        let v2_build_unit = v2_build_pkg.join("0123456789abcdef");
+        let inc_crate = debug.join("incremental/mycrate-1abc");
+        let inc_sess = inc_crate.join("s-1111111111-aaaa");
+        let doc = target.join("doc");
+        fs::create_dir_all(&deps).unwrap();
+        fs::create_dir_all(v2_build_unit.join("out")).unwrap();
+        fs::create_dir_all(v2_build_unit.join("fingerprint")).unwrap();
+        fs::create_dir_all(&inc_sess).unwrap();
+        fs::create_dir_all(&doc).unwrap();
+        fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo\n",
+        )
+        .unwrap();
+        fs::write(deps.join("libfoo-0123456789abcdef.rlib"), vec![b'a'; 8192]).unwrap();
+        fs::write(v2_build_unit.join("out/libmycrate.rlib"), vec![b'f'; 4096]).unwrap();
+        fs::write(
+            v2_build_unit.join("fingerprint/invoked.timestamp"),
+            vec![b't'; 64],
+        )
+        .unwrap();
+        fs::write(inc_sess.join("dep-graph.bin"), vec![b'b'; 4096]).unwrap();
+        fs::write(doc.join("search-index.js"), vec![b'c'; 2048]).unwrap();
+
+        let cfg = Config::default();
+        // Use a timestamp far after file mtimes so target is not cooling.
+        let platform = TestPlatform::new(2_500_000_000);
+
+        let first = scan(
+            &platform,
+            &cfg,
+            &ScanRequest::with_default_volume(
+                vec![],
+                vec![target.clone()],
+                false,
+                ScanDetail::Inventory,
+            ),
+        )
+        .unwrap();
+        assert_eq!(first.targets.len(), 1);
+        let t0 = &first.targets[0];
+        assert_ne!(t0.inventory_stamp, 0);
+        assert_eq!(t0.inventory_computed_at_unix, 2_500_000_000);
+        let real_bytes = t0.allocated_bytes;
+        assert!(real_bytes > 0);
+
+        // Build a cached inventory with a sentinel byte count and matching stamp to prove
+        // `ScanDetail::Inventory` actually hits the cache without re-walking, and preserves
+        // the original `computed_at_unix` even when scanned at a later timestamp.
+        let sentinel_bytes = real_bytes + 123_456;
+        let mut cache = HashMap::new();
+        cache.insert(
+            t0.root.clone(),
+            CachedTargetInventory {
+                stamp: t0.inventory_stamp,
+                computed_at_unix: 2_500_000_000,
+                allocated_bytes: sentinel_bytes,
+                last_activity_unix: t0.last_activity_unix,
+                has_doc_dir: t0.doc_dir.is_some(),
+                doc_allocated_bytes: 99_999,
+                doc_last_activity_unix: t0.last_activity_unix,
+                profiles: t0
+                    .profiles
+                    .iter()
+                    .map(|p| CachedProfileInventory {
+                        rel_path: p.rel_path.clone(),
+                        layout: p.layout,
+                        allocated_bytes: sentinel_bytes,
+                        last_activity_unix: p.last_activity_unix,
+                        v2_unit_count: 7,
+                        v1_unit_count: 3,
+                        incremental_dir_count: 2,
+                    })
+                    .collect(),
+            },
+        );
+
+        let later_platform = TestPlatform::new(2_500_000_600);
+        let cached_hit = scan(
+            &later_platform,
+            &cfg,
+            &ScanRequest::with_default_volume(
+                vec![],
+                vec![target.clone()],
+                false,
+                ScanDetail::Inventory,
+            )
+            .with_inventory_cache(cache.clone()),
+        )
+        .unwrap();
+        assert_eq!(cached_hit.targets[0].allocated_bytes, sentinel_bytes);
+        assert_eq!(
+            cached_hit.targets[0].inventory_computed_at_unix,
+            2_500_000_000
+        );
+        assert_eq!(cached_hit.targets[0].profiles[0].v2_unit_count, 7);
+        assert_eq!(
+            cached_hit.targets[0]
+                .doc_dir
+                .as_ref()
+                .unwrap()
+                .allocated_bytes,
+            99_999
+        );
+
+        // `ScanDetail::Full` on an eligible (non-blocked, non-cooling) target MUST bypass the cache
+        // and update `inventory_computed_at_unix` to the fresh scan timestamp.
+        let full_bypass = scan(
+            &later_platform,
+            &cfg,
+            &ScanRequest::with_default_volume(
+                vec![],
+                vec![target.clone()],
+                false,
+                ScanDetail::Full,
+            )
+            .with_inventory_cache(cache.clone()),
+        )
+        .unwrap();
+        assert_eq!(full_bypass.targets[0].allocated_bytes, real_bytes);
+        assert_eq!(
+            full_bypass.targets[0].inventory_computed_at_unix,
+            2_500_000_600
+        );
+        assert_eq!(full_bypass.targets[0].profiles[0].incremental_dirs.len(), 1);
+
+        // Mutating Cargo v2 `build/<pkg>/` by creating a new unit hash dir MUST change the stamp
+        // even though `build/`'s own directory mtime is untouched.
+        let v2_new_unit = v2_build_pkg.join("fedcba9876543210");
+        fs::create_dir_all(v2_new_unit.join("out")).unwrap();
+        fs::create_dir_all(v2_new_unit.join("fingerprint")).unwrap();
+        fs::write(v2_new_unit.join("out/libmycrate.rlib"), vec![b'g'; 8192]).unwrap();
+
+        let after_v2_mutation = scan(
+            &later_platform,
+            &cfg,
+            &ScanRequest::with_default_volume(
+                vec![],
+                vec![target.clone()],
+                false,
+                ScanDetail::Inventory,
+            )
+            .with_inventory_cache(cache.clone()),
+        )
+        .unwrap();
+        assert_ne!(
+            after_v2_mutation.targets[0].inventory_stamp,
+            t0.inventory_stamp
+        );
+        assert_ne!(after_v2_mutation.targets[0].allocated_bytes, sentinel_bytes);
+        assert!(after_v2_mutation.targets[0].allocated_bytes > real_bytes);
+        assert_eq!(
+            after_v2_mutation.targets[0].inventory_computed_at_unix,
+            2_500_000_600
+        );
+
+        // Mutating `incremental/<crate>/` by creating a new session dir MUST also change the stamp.
+        let new_sess = inc_crate.join("s-2222222222-bbbb");
+        fs::create_dir_all(&new_sess).unwrap();
+        fs::write(new_sess.join("dep-graph.bin"), vec![b'd'; 16_384]).unwrap();
+
+        let after_mutation = scan(
+            &later_platform,
+            &cfg,
+            &ScanRequest::with_default_volume(vec![], vec![target], false, ScanDetail::Inventory)
+                .with_inventory_cache(cache),
+        )
+        .unwrap();
+        assert_ne!(
+            after_mutation.targets[0].inventory_stamp,
+            after_v2_mutation.targets[0].inventory_stamp
+        );
+        assert!(
+            after_mutation.targets[0].allocated_bytes
+                > after_v2_mutation.targets[0].allocated_bytes
         );
     }
 }

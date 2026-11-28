@@ -426,7 +426,7 @@ fn collect_target_locks(target: &CargoTarget, out: &mut Vec<PathBuf>) {
 fn any_process_inside(snapshot: &ProcessSnapshot, dir: &Path) -> bool {
     let prefix = PathPrefix::new(dir);
     snapshot.processes.iter().any(|proc_entry| {
-        if snapshot.self_pid != 0 && proc_entry.pid == snapshot.self_pid {
+        if snapshot.is_self_or_sibling(proc_entry) {
             return false;
         }
         snapshot.cwd_has_prefix(proc_entry, &prefix)
@@ -518,6 +518,8 @@ mod tests {
             root_mtime_unix: NOW - age_secs,
             allocated_bytes: bytes,
             last_activity_unix: NOW - age_secs,
+            inventory_stamp: 0,
+            inventory_computed_at_unix: 0,
         }
     }
 

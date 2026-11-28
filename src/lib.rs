@@ -16,6 +16,7 @@ mod state;
 mod store;
 mod sweep;
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -29,7 +30,9 @@ use crate::cli::{Cli, Command};
 use crate::config::Config;
 use crate::discover::{ScanDetail, ScanRequest, ScanRoot};
 use crate::error::AppError;
-use crate::model::{ActionOutcome, DiskPressure, PinScope, PlanMode, ReclaimProfile};
+use crate::model::{
+    ActionOutcome, CachedTargetInventory, DiskPressure, PinScope, PlanMode, ReclaimProfile,
+};
 use crate::platform::{DEFAULT_VOLUME_MOUNT, Platform, SignalWatcher, default_platform};
 use crate::state::{State, TargetScanSummary};
 use crate::store::{CLI_RUN_LOCK_RETRY_TIMEOUT, StateCache};
@@ -38,6 +41,7 @@ const EXIT_PARTIAL: u8 = 3;
 const WATCH_CALM_INTERVAL: Duration = Duration::from_secs(180);
 const WATCH_PRESSURE_INTERVAL: Duration = Duration::from_secs(60);
 const WATCH_FULL_WALK_TTL_SECS: u64 = 10 * 60;
+const INVENTORY_CACHE_MAX_AGE_SECS: u64 = 3600;
 
 /// Parse CLI arguments, run the requested command once (or loop in `watch`), and map exit status.
 pub fn run() -> ExitCode {
@@ -120,7 +124,9 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                 cargo_target_dir.as_deref(),
             )?;
             let known: Vec<PathBuf> = state.known_targets.keys().cloned().collect();
-            let req = ScanRequest::with_default_volume(roots, known, true, ScanDetail::Inventory);
+            let inv_cache = build_inventory_cache(&state, platform.now_unix());
+            let req = ScanRequest::with_default_volume(roots, known, true, ScanDetail::Inventory)
+                .with_inventory_cache(inv_cache);
             let snapshot = discover::scan(&platform, &config, &req)?;
             let current_pressure = pressure::evaluate_pressure(
                 state.pressure,
@@ -179,7 +185,9 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                 }
                 explicit
             };
-            let req = ScanRequest::with_default_volume(roots, vec![], true, ScanDetail::Inventory);
+            let inv_cache = build_inventory_cache(&state, platform.now_unix());
+            let req = ScanRequest::with_default_volume(roots, vec![], true, ScanDetail::Inventory)
+                .with_inventory_cache(inv_cache);
             let snapshot = discover::scan(&platform, &config, &req)?;
             let current_pressure = pressure::evaluate_pressure(
                 state.pressure,
@@ -241,7 +249,9 @@ fn dispatch(cli: Cli, stdout: &mut impl Write) -> Result<ExitCode, AppError> {
                 cargo_target_dir.as_deref(),
             )?;
             let known: Vec<PathBuf> = state.known_targets.keys().cloned().collect();
-            let req = ScanRequest::with_default_volume(roots, known, true, ScanDetail::Full);
+            let inv_cache = build_inventory_cache(&state, platform.now_unix());
+            let req = ScanRequest::with_default_volume(roots, known, true, ScanDetail::Full)
+                .with_inventory_cache(inv_cache);
             let snapshot = discover::scan(&platform, &config, &req)?;
 
             if snapshot.processes.is_none() {
@@ -570,12 +580,14 @@ where
                 match roots_res {
                     Ok(roots) => {
                         let known: Vec<PathBuf> = state.known_targets.keys().cloned().collect();
+                        let inv_cache = build_inventory_cache(&state, platform.now_unix());
                         let req = ScanRequest {
                             roots,
                             known_targets: known,
                             full_walk,
                             detail: ScanDetail::Full,
                             volume_mount,
+                            inventory_cache: inv_cache,
                         };
                         match discover::scan(platform, config, &req) {
                             Ok(snapshot) => {
@@ -737,6 +749,19 @@ fn should_run_full_walk(state: &State, now_unix: u64, entered_high: bool) -> boo
         || state
             .last_full_walk_unix
             .is_none_or(|last| now_unix.saturating_sub(last) >= WATCH_FULL_WALK_TTL_SECS)
+}
+
+fn build_inventory_cache(state: &State, now_unix: u64) -> HashMap<PathBuf, CachedTargetInventory> {
+    let mut cache = HashMap::new();
+    for (root, entry) in &state.known_targets {
+        if let Some(cached) = &entry.inventory_cache
+            && cached.computed_at_unix > 0
+            && now_unix.abs_diff(cached.computed_at_unix) <= INVENTORY_CACHE_MAX_AGE_SECS
+        {
+            cache.insert(root.clone(), cached.clone());
+        }
+    }
+    cache
 }
 
 fn default_volume_mount() -> PathBuf {
@@ -986,5 +1011,42 @@ mod tests {
         let final_state = cache.load().unwrap();
         assert_eq!(final_state.pressure, DiskPressure::High);
         assert_eq!(final_state.known_targets.len(), 2);
+    }
+
+    #[test]
+    fn build_inventory_cache_expires_by_computed_at_even_when_last_seen_is_refreshed() {
+        use super::build_inventory_cache;
+        use crate::model::{CachedTargetInventory, KnownTargetEntry, TargetLayout};
+
+        let mut state = State::new_default();
+        let root = PathBuf::from("/Users/dev/ws/target");
+        state.known_targets.insert(
+            root.clone(),
+            KnownTargetEntry {
+                first_seen_unix: 1_000,
+                // Repeated watch ticks refreshed `last_seen_unix` recently,
+                // but the underlying disk walk happened > 1 hour ago.
+                last_seen_unix: 5_000,
+                last_layout: TargetLayout::BuildDirV2,
+                last_allocated_bytes: 8_192,
+                last_activity_unix: 1_000,
+                inventory_cache: Some(CachedTargetInventory {
+                    stamp: 0x1234,
+                    computed_at_unix: 1_000,
+                    allocated_bytes: 8_192,
+                    last_activity_unix: 1_000,
+                    has_doc_dir: false,
+                    doc_allocated_bytes: 0,
+                    doc_last_activity_unix: 0,
+                    profiles: vec![],
+                }),
+            },
+        );
+
+        // Within 1h of `computed_at_unix` (4600 - 1000 = 3600): cache hit.
+        assert!(build_inventory_cache(&state, 4_600).contains_key(&root));
+        // Past 1h of `computed_at_unix` (4601 - 1000 = 3601), even though `last_seen_unix` is 5000:
+        // cache MUST expire.
+        assert!(!build_inventory_cache(&state, 4_601).contains_key(&root));
     }
 }

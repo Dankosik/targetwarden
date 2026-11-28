@@ -876,6 +876,8 @@ mod tests {
             root_mtime_unix: 1000,
             allocated_bytes: 2 * GIB,
             last_activity_unix: 1000,
+            inventory_stamp: 0,
+            inventory_computed_at_unix: 0,
         };
         let snapshot = ScanSnapshot {
             captured_at_unix: 5000,

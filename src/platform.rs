@@ -21,7 +21,7 @@ use crate::model::{
 pub(crate) const DEFAULT_VOLUME_MOUNT: &str = "/System/Volumes/Data";
 
 #[cfg(target_os = "macos")]
-const LSOF_TIMEOUT_SECS: u64 = 10;
+const LSOF_TIMEOUT_SECS: u64 = 20;
 #[cfg(target_os = "macos")]
 const LSOF_STDOUT_CAP: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "macos")]
@@ -144,7 +144,7 @@ impl Platform for MacPlatform {
         let mut parser = LsofStreamParser::new();
         let (status_code, stderr) = run_bounded_command_streaming(
             "/usr/sbin/lsof",
-            &["-n", "-P", "-F0pcftn"],
+            &["-l", "-S", "2", "-n", "-P", "-F0pcftn"],
             Some(Path::new("/")),
             &[],
             std::time::Duration::from_secs(LSOF_TIMEOUT_SECS),
@@ -168,7 +168,11 @@ impl Platform for MacPlatform {
             )));
         }
 
-        parser.finish(unix_now(), std::process::id())
+        let self_exe_path = std::env::current_exe().ok().map(|exe| {
+            let canon = std::fs::canonicalize(&exe).unwrap_or(exe);
+            normalize_macos_system_symlinks(&canon)
+        });
+        parser.finish(unix_now(), std::process::id(), self_exe_path)
     }
 
     fn mount_table(&self) -> Result<Vec<MountEntry>, AppError> {
@@ -593,7 +597,7 @@ pub(crate) fn parse_lsof_output(
 ) -> Result<ProcessSnapshot, AppError> {
     let mut parser = LsofStreamParser::new();
     parser.feed(raw);
-    parser.finish(captured_at_unix, self_pid)
+    parser.finish(captured_at_unix, self_pid, None)
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -665,7 +669,12 @@ impl LsofStreamParser {
         }
     }
 
-    fn finish(mut self, captured_at_unix: u64, self_pid: u32) -> Result<ProcessSnapshot, AppError> {
+    fn finish(
+        mut self,
+        captured_at_unix: u64,
+        self_pid: u32,
+        self_exe_path: Option<PathBuf>,
+    ) -> Result<ProcessSnapshot, AppError> {
         if let Some(err) = self.error {
             return Err(err);
         }
@@ -684,6 +693,7 @@ impl LsofStreamParser {
         Ok(ProcessSnapshot {
             captured_at_unix,
             self_pid,
+            self_exe_path,
             processes: self.processes,
             open_path_refs: self.open_path_refs,
             path_pool: self.path_pool,
@@ -1620,7 +1630,7 @@ com.apple.os.update-ZZZ
             for chunk in sample.chunks(chunk_size) {
                 parser.feed(chunk);
             }
-            let streamed = parser.finish(1234, 999).unwrap();
+            let streamed = parser.finish(1234, 999, None).unwrap();
             assert_eq!(streamed, reference, "chunk_size={chunk_size} diverged");
         }
 

@@ -868,7 +868,7 @@ fn has_any_process_for_eviction(
     let target_prefix = PathPrefix::new(target_root);
     let wt_prefix = worktree_root.map(PathPrefix::new);
     for proc_entry in &proc_snap.processes {
-        if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
+        if proc_snap.is_self_or_sibling(proc_entry) {
             continue;
         }
         if proc_snap.cwd_has_prefix(proc_entry, &target_prefix)
@@ -1032,7 +1032,7 @@ fn has_blocking_process_for_sweep(
     let target_prefix = PathPrefix::new(target_root);
     let wt_prefix = worktree_root.map(PathPrefix::new);
     for proc_entry in &proc_snap.processes {
-        if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
+        if proc_snap.is_self_or_sibling(proc_entry) {
             continue;
         }
         let is_pm_srv = proc_snap.is_rust_analyzer_proc_macro_srv(proc_entry);
@@ -1082,7 +1082,7 @@ fn has_hard_blocked_process_for_target(
     let action_prefix = PathPrefix::new(action_dir);
     let wt_prefix = worktree_root.map(PathPrefix::new);
     for proc_entry in &proc_snap.processes {
-        if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
+        if proc_snap.is_self_or_sibling(proc_entry) {
             continue;
         }
         let is_pm_srv = proc_snap.is_rust_analyzer_proc_macro_srv(proc_entry);
@@ -1185,7 +1185,7 @@ fn path_hits_swept_unit(path: &Path, profile_dir: &Path, ops: &SweepOps) -> bool
 fn any_process_in_dir(proc_snap: &ProcessSnapshot, dir: &Path) -> bool {
     let prefix = PathPrefix::new(dir);
     proc_snap.processes.iter().any(|proc_entry| {
-        if proc_snap.self_pid != 0 && proc_entry.pid == proc_snap.self_pid {
+        if proc_snap.is_self_or_sibling(proc_entry) {
             return false;
         }
         proc_snap.cwd_has_prefix(proc_entry, &prefix)

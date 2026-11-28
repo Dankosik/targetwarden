@@ -7,6 +7,28 @@ section of the tagged version as its release notes.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-28
+
+### Changed
+
+- Persist a shallow-stamped, backward-compatible `inventory_cache` (with a 1-hour
+  `computed_at_unix` TTL and Cargo v2 `build/<pkg>` directory hashing) in
+  `state.json` so read-only `status` and `scan` skip redundant full directory
+  walks across unchanged `target/` trees while `reclaim` and `watch`
+  (`ScanDetail::Full`) continue walking live disk state.
+- Pass `-l` and `-S 2` to `/usr/sbin/lsof` and raise `LSOF_TIMEOUT_SECS` from
+  `10s` to `20s` to reduce spurious fail-closed timeouts under heavy load while
+  preserving strict status and stderr validation.
+
+### Fixed
+
+- Identify sibling `targetwarden` processes by canonicalized `current_exe()`
+  path in `ProcessSnapshot::is_self_or_sibling` so concurrent `status`/`scan`
+  runs no longer trigger false `process_open_in_target:targetwarden` skips
+  while spoofed binaries with the same process name still hard-block.
+- Invalidate cached target inventory on both `Applied` and `Failed` reclaim
+  receipts.
+
 ## [0.1.1] - 2026-11-28
 
 ### Changed
@@ -61,6 +83,7 @@ section of the tagged version as its release notes.
 - Native macOS release archives (`aarch64-apple-darwin`, `x86_64-apple-darwin`),
   `SHA256SUMS`, build provenance attestations, and `install.sh`.
 
-[Unreleased]: https://github.com/Dankosik/targetwarden/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Dankosik/targetwarden/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Dankosik/targetwarden/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Dankosik/targetwarden/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Dankosik/targetwarden/releases/tag/v0.1.0
