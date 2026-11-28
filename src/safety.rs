@@ -41,7 +41,7 @@ pub(crate) fn evaluate_all(
             proc_snap
                 .processes
                 .iter()
-                .filter(|p| proc_snap.self_pid == 0 || p.pid != proc_snap.self_pid)
+                .filter(|p| !proc_snap.is_self_or_sibling(p))
                 .map(|entry| ClassifiedProcess {
                     entry,
                     is_proc_macro_srv: proc_snap.is_rust_analyzer_proc_macro_srv(entry),
@@ -485,6 +485,8 @@ mod tests {
             root_mtime_unix: NOW - age_secs,
             allocated_bytes: GIB,
             last_activity_unix: NOW - age_secs,
+            inventory_stamp: 0,
+            inventory_computed_at_unix: 0,
         }
     }
 
@@ -859,6 +861,68 @@ mod tests {
             &v_ra[0],
             SafetyVerdict::SweepOnly { reasons, .. }
                 if reasons.contains(&SweepOnlyReason::IdleRustAnalyzer { pid: 555 })
+        ));
+    }
+
+    #[test]
+    fn sibling_targetwarden_same_exe_does_not_hard_block_but_spoofed_exe_does() {
+        let cfg = Config::default();
+        let target = base_target(
+            "/Users/dev/ws/main/target",
+            WorktreeKind::MainCheckout,
+            3600,
+        );
+
+        let mut snap = base_snapshot(
+            vec![target.clone()],
+            Some(vec![ProcessEntry {
+                pid: 777,
+                comm: CompactString::new("targetwarden"),
+                exe_path: Some(PathBuf::from("/Users/dev/.local/bin/targetwarden")),
+                cwd: Some(PathBuf::from("/Users/dev")),
+                open_paths: vec![PathBuf::from("/Users/dev/ws/main/target/debug")],
+            }]),
+        );
+        snap.processes.as_mut().unwrap().self_exe_path =
+            Some(PathBuf::from("/Users/dev/.local/bin/targetwarden"));
+        let verdicts = evaluate_all(
+            &snap,
+            &State::new_default(),
+            &cfg,
+            DiskPressure::Calm,
+            false,
+        );
+        assert!(
+            !matches!(&verdicts[0], SafetyVerdict::Protected(_)),
+            "same-exe sibling targetwarden must not hard-block: {:?}",
+            verdicts[0]
+        );
+
+        let mut spoofed = base_snapshot(
+            vec![target],
+            Some(vec![ProcessEntry {
+                pid: 888,
+                comm: CompactString::new("targetwarden"),
+                exe_path: Some(PathBuf::from(
+                    "/Users/dev/ws/main/target/debug/targetwarden",
+                )),
+                cwd: Some(PathBuf::from("/Users/dev")),
+                open_paths: vec![PathBuf::from("/Users/dev/ws/main/target/debug")],
+            }]),
+        );
+        spoofed.processes.as_mut().unwrap().self_exe_path =
+            Some(PathBuf::from("/Users/dev/.local/bin/targetwarden"));
+        let v_spoofed = evaluate_all(
+            &spoofed,
+            &State::new_default(),
+            &cfg,
+            DiskPressure::Calm,
+            false,
+        );
+        assert!(matches!(
+            &v_spoofed[0],
+            SafetyVerdict::Protected(reasons)
+                if reasons.iter().any(|r| matches!(r, ProtectedReason::HardBlockedProcess { pid: 888, .. }))
         ));
     }
 }

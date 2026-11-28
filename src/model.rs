@@ -408,6 +408,7 @@ pub(crate) struct TestProcessEntry {
 pub(crate) struct ProcessSnapshot {
     pub captured_at_unix: u64,
     pub self_pid: u32,
+    pub self_exe_path: Option<PathBuf>,
     pub processes: Vec<ProcessEntry>,
     pub open_path_refs: Vec<PathRef>,
     pub path_pool: PathPool,
@@ -419,6 +420,7 @@ impl ProcessSnapshot {
         Self {
             captured_at_unix,
             self_pid,
+            self_exe_path: None,
             processes: Vec::new(),
             open_path_refs: Vec::new(),
             path_pool: PathPool::new(),
@@ -454,10 +456,24 @@ impl ProcessSnapshot {
         Self {
             captured_at_unix,
             self_pid,
+            self_exe_path: None,
             processes,
             open_path_refs,
             path_pool,
         }
+    }
+
+    /// True when `entry` is this process or another instance of the exact same `targetwarden`
+    /// binary (which can only be read-only `status`/`scan`/`--dry-run` while `run.lock` is held).
+    #[inline]
+    pub(crate) fn is_self_or_sibling(&self, entry: &ProcessEntry) -> bool {
+        if self.self_pid != 0 && entry.pid == self.self_pid {
+            return true;
+        }
+        if let (Some(self_exe), Some(exe_ref)) = (self.self_exe_path.as_deref(), entry.exe_path) {
+            return self.path(exe_ref) == self_exe;
+        }
+        false
     }
 
     #[inline]
@@ -633,6 +649,8 @@ pub(crate) struct CargoTarget {
     pub root_mtime_unix: u64,
     pub allocated_bytes: u64,
     pub last_activity_unix: u64,
+    pub inventory_stamp: u64,
+    pub inventory_computed_at_unix: u64,
 }
 
 impl CargoTarget {
@@ -1174,12 +1192,39 @@ pub(crate) struct PinEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedProfileInventory {
+    pub rel_path: PathBuf,
+    pub layout: TargetLayout,
+    pub allocated_bytes: u64,
+    pub last_activity_unix: u64,
+    pub v2_unit_count: usize,
+    pub v1_unit_count: usize,
+    pub incremental_dir_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CachedTargetInventory {
+    pub stamp: u64,
+    #[serde(default)]
+    pub computed_at_unix: u64,
+    pub allocated_bytes: u64,
+    pub last_activity_unix: u64,
+    pub has_doc_dir: bool,
+    pub doc_allocated_bytes: u64,
+    pub doc_last_activity_unix: u64,
+    #[serde(default)]
+    pub profiles: Vec<CachedProfileInventory>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct KnownTargetEntry {
     pub first_seen_unix: u64,
     pub last_seen_unix: u64,
     pub last_layout: TargetLayout,
     pub last_allocated_bytes: u64,
     pub last_activity_unix: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_cache: Option<CachedTargetInventory>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1332,5 +1377,61 @@ mod tests {
             Some("7a40948c2737c8c4")
         );
         assert_eq!(extract_16hex_from_dep_name("nohash.rlib"), None);
+    }
+
+    #[test]
+    fn is_self_or_sibling_matches_own_pid_or_exact_exe_only() {
+        use std::path::PathBuf;
+
+        use compact_str::CompactString;
+
+        use super::{ProcessSnapshot, TestProcessEntry};
+
+        let mut snap = ProcessSnapshot::from_test_entries(
+            1000,
+            42,
+            vec![
+                TestProcessEntry {
+                    pid: 42,
+                    comm: CompactString::new("targetwarden"),
+                    exe_path: Some(PathBuf::from("/Users/dev/.local/bin/targetwarden")),
+                    cwd: None,
+                    open_paths: vec![],
+                },
+                TestProcessEntry {
+                    pid: 99,
+                    comm: CompactString::new("targetwarden"),
+                    exe_path: Some(PathBuf::from("/Users/dev/.local/bin/targetwarden")),
+                    cwd: None,
+                    open_paths: vec![],
+                },
+                TestProcessEntry {
+                    pid: 100,
+                    comm: CompactString::new("targetwarden"),
+                    exe_path: Some(PathBuf::from("/tmp/repo/target/debug/targetwarden")),
+                    cwd: None,
+                    open_paths: vec![],
+                },
+                TestProcessEntry {
+                    pid: 101,
+                    comm: CompactString::new("cargo"),
+                    exe_path: Some(PathBuf::from("/Users/dev/.cargo/bin/cargo")),
+                    cwd: None,
+                    open_paths: vec![],
+                },
+            ],
+        );
+        // Without self_exe_path, only self_pid matches
+        assert!(snap.is_self_or_sibling(&snap.processes[0]));
+        assert!(!snap.is_self_or_sibling(&snap.processes[1]));
+        assert!(!snap.is_self_or_sibling(&snap.processes[2]));
+        assert!(!snap.is_self_or_sibling(&snap.processes[3]));
+
+        // With self_exe_path, exact sibling binary matches, but differently located binary does NOT
+        snap.self_exe_path = Some(PathBuf::from("/Users/dev/.local/bin/targetwarden"));
+        assert!(snap.is_self_or_sibling(&snap.processes[0]));
+        assert!(snap.is_self_or_sibling(&snap.processes[1]));
+        assert!(!snap.is_self_or_sibling(&snap.processes[2]));
+        assert!(!snap.is_self_or_sibling(&snap.processes[3]));
     }
 }

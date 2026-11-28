@@ -690,6 +690,8 @@ mod tests {
             root_mtime_unix: NOW - 3 * HOUR,
             allocated_bytes: 10_000_000,
             last_activity_unix: NOW - 3 * HOUR,
+            inventory_stamp: 0,
+            inventory_computed_at_unix: 0,
         }
     }
 
