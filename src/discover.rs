@@ -6755,6 +6755,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn inventory_cache_hits_when_stamp_matches_invalidates_on_mutation_and_bypasses_in_full_mode() {
         use std::collections::HashMap;
